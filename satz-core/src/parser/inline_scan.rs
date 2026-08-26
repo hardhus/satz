@@ -1,0 +1,250 @@
+use crate::model::link::{Link, LinkKind};
+use crate::model::range::ByteRange;
+use crate::model::tag::Tag;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct InlineScanOutput {
+    pub wiki_links: Vec<Link>,
+    pub tags: Vec<Tag>,
+}
+
+/// Scans for wikilinks (`[[...]]`), embeds (`![[...]]`), and tags (`#tag`)
+/// in non-code regions of the source text.
+pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
+    let mut output = InlineScanOutput::default();
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    let is_in_code =
+        |offset: usize| -> bool { code_spans.iter().any(|span| span.contains(offset)) };
+
+    while i < len {
+        // Skip code spans quickly
+        if let Some(span) = code_spans.iter().find(|s| s.contains(i)) {
+            i = span.end;
+            continue;
+        }
+
+        // 1. Check for Embed `![[` or WikiLink `[[`
+        if bytes[i] == b'!' && i + 2 < len && bytes[i + 1] == b'[' && bytes[i + 2] == b'[' {
+            let start = i;
+            if let Some((link, next_i)) = parse_wikilink(source, start, true) {
+                if !code_spans.iter().any(|s| s.overlaps(&link.range)) {
+                    output.wiki_links.push(link);
+                }
+                i = next_i;
+                continue;
+            }
+        } else if bytes[i] == b'[' && i + 1 < len && bytes[i + 1] == b'[' {
+            let start = i;
+            if let Some((link, next_i)) = parse_wikilink(source, start, false) {
+                if !code_spans.iter().any(|s| s.overlaps(&link.range)) {
+                    output.wiki_links.push(link);
+                }
+                i = next_i;
+                continue;
+            }
+        }
+
+        // 2. Check for Tag `#tag`
+        if bytes[i] == b'#' {
+            let start = i;
+            // Ensure `#` is not part of heading marker at start of line or after `\n` followed by space
+            // And check preceding boundary
+            let prev_char = if i > 0 {
+                source[..i].chars().next_back()
+            } else {
+                None
+            };
+
+            let valid_prefix = match prev_char {
+                None => true,
+                Some(c) => {
+                    c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\'' | '<' | '—' | '–')
+                }
+            };
+
+            if valid_prefix && !is_in_code(start) {
+                let tag_opt = parse_tag(source, start);
+                if let Some((tag, next_i)) = tag_opt {
+                    if !code_spans.iter().any(|s| s.overlaps(&tag.range)) {
+                        output.tags.push(tag);
+                    }
+                    i = next_i;
+                    continue;
+                }
+            }
+        }
+
+        // Advance by next char
+        if let Some(c) = source[i..].chars().next() {
+            i += c.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+
+    output
+}
+
+/// Attempts to parse a wikilink starting at `start`.
+/// Returns `(Link, next_index)`.
+fn parse_wikilink(source: &str, start: usize, is_embed: bool) -> Option<(Link, usize)> {
+    let prefix_len = if is_embed { 3 } else { 2 };
+    let inner_start = start + prefix_len;
+
+    // Find closing `]]` on the same line
+    let rest = &source[inner_start..];
+    let end_bracket = rest.find("]]")?;
+
+    // Must not span multiple lines
+    let inner_slice = &rest[..end_bracket];
+    if inner_slice.contains('\n') || inner_slice.contains('\r') {
+        return None;
+    }
+
+    let full_end = inner_start + end_bracket + 2;
+    let range = ByteRange::new(start, full_end);
+    let kind = if is_embed {
+        LinkKind::Embed
+    } else {
+        LinkKind::WikiLink
+    };
+
+    // Parse target and display
+    let (target_raw, display) = if let Some((target, disp)) = inner_slice.split_once('|') {
+        (target.trim(), Some(disp.trim().to_string()))
+    } else {
+        (inner_slice.trim(), None)
+    };
+
+    // Parse heading or block anchor inside target_raw
+    let (target_doc, target_heading, target_block) =
+        if let Some((doc, block)) = target_raw.split_once("#^") {
+            (doc.trim().to_string(), None, Some(block.trim().to_string()))
+        } else if let Some((doc, heading)) = target_raw.split_once('#') {
+            (
+                doc.trim().to_string(),
+                Some(heading.trim().to_string()),
+                None,
+            )
+        } else {
+            (target_raw.to_string(), None, None)
+        };
+
+    Some((
+        Link::new(
+            kind,
+            target_doc,
+            target_heading,
+            target_block,
+            display,
+            range,
+        ),
+        full_end,
+    ))
+}
+
+/// Attempts to parse a `#tag` starting at `start` where `source[start] == '#'`.
+fn parse_tag(source: &str, start: usize) -> Option<(Tag, usize)> {
+    let after_hash = start + 1;
+    if after_hash >= source.len() {
+        return None;
+    }
+
+    let mut end = after_hash;
+    let mut has_alphabetic = false;
+    for (idx, c) in source[after_hash..].char_indices() {
+        if c.is_alphabetic() {
+            has_alphabetic = true;
+            end = after_hash + idx + c.len_utf8();
+        } else if c.is_numeric() || c == '_' || c == '-' || c == '/' {
+            end = after_hash + idx + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    // Must have at least one alphabetic character (disallows pure numbers like #123)
+    if !has_alphabetic {
+        return None;
+    }
+
+    let tag_name = source[after_hash..end]
+        .trim_end_matches(['/', '-', '_'])
+        .to_string();
+    if tag_name.is_empty() {
+        return None;
+    }
+
+    let final_end = after_hash + tag_name.len();
+    Some((
+        Tag::new(tag_name, ByteRange::new(start, final_end)),
+        final_end,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wikilinks_scan() {
+        let text = "Check [[note]] and [[doc#heading]] and [[doc#^block]] and [[doc|alias]].";
+        let output = scan_inline(text, &[]);
+        assert_eq!(output.wiki_links.len(), 4);
+
+        assert_eq!(output.wiki_links[0].kind, LinkKind::WikiLink);
+        assert_eq!(output.wiki_links[0].target_doc, "note");
+        assert_eq!(output.wiki_links[0].target_heading, None);
+        assert_eq!(output.wiki_links[0].display, None);
+
+        assert_eq!(output.wiki_links[1].target_doc, "doc");
+        assert_eq!(
+            output.wiki_links[1].target_heading.as_deref(),
+            Some("heading")
+        );
+
+        assert_eq!(output.wiki_links[2].target_doc, "doc");
+        assert_eq!(output.wiki_links[2].target_block.as_deref(), Some("block"));
+
+        assert_eq!(output.wiki_links[3].target_doc, "doc");
+        assert_eq!(output.wiki_links[3].display.as_deref(), Some("alias"));
+    }
+
+    #[test]
+    fn test_embed_scan() {
+        let text = "Here is ![[image.png]] embedded.";
+        let output = scan_inline(text, &[]);
+        assert_eq!(output.wiki_links.len(), 1);
+        assert_eq!(output.wiki_links[0].kind, LinkKind::Embed);
+        assert_eq!(output.wiki_links[0].target_doc, "image.png");
+    }
+
+    #[test]
+    fn test_tags_scan() {
+        let text = "Tags: #felsefe #wittgenstein/tractatus #test_123 (#nested) but not #123 and not word#notatag.";
+        let output = scan_inline(text, &[]);
+        let names: Vec<&str> = output.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["felsefe", "wittgenstein/tractatus", "test_123", "nested"]
+        );
+    }
+
+    #[test]
+    fn test_ignore_code_spans() {
+        let text = "Real [[link]] and `inline [[fake-link]]` and #real-tag and `#fake-tag`.";
+        let code_spans = vec![
+            ByteRange::new(18, 40), // `inline [[fake-link]]`
+            ByteRange::new(59, 70), // `#fake-tag`
+        ];
+        let output = scan_inline(text, &code_spans);
+        assert_eq!(output.wiki_links.len(), 1);
+        assert_eq!(output.wiki_links[0].target_doc, "link");
+
+        assert_eq!(output.tags.len(), 1);
+        assert_eq!(output.tags[0].name, "real-tag");
+    }
+}

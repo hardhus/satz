@@ -1,0 +1,205 @@
+---
+source: satz-core/tests/parse_test.rs
+expression: doc
+---
+id: tests/edge_case.md
+path: tests/edge_case.md
+title: Edge Case Testi ığüşçö
+frontmatter:
+  title: Edge Case Testi ığüşçö
+  aliases:
+    - tekil-alias
+  tags:
+    - unicode-test
+  date: 2024-03-20
+  extra:
+    custom_field: 42
+headings:
+  - level: 1
+    text: Kenar Durumları ığüşçö 😀
+    slug: kenar-durumları-ığüşçö
+    range:
+      start: 121
+      end: 158
+  - level: 2
+    text: Kod İçinde Sahte Linkler
+    slug: kod-i̇çinde-sahte-linkler
+    range:
+      start: 200
+      end: 230
+  - level: 2
+    text: Inline Code
+    slug: inline-code
+    range:
+      start: 374
+      end: 389
+  - level: 2
+    text: Türkçe ve Emoji
+    slug: türkçe-ve-emoji
+    range:
+      start: 495
+      end: 516
+  - level: 2
+    text: Boş ve Garip Linkler
+    slug: boş-ve-garip-linkler
+    range:
+      start: 609
+      end: 634
+  - level: 2
+    text: Footnote Test
+    slug: footnote-test
+    range:
+      start: 725
+      end: 742
+links:
+  - kind: WikiLink
+    target_doc: gerçek-link
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 356
+      end: 372
+  - kind: WikiLink
+    target_doc: türkçe-not
+    target_heading: bölüm-başlığı
+    target_block: ~
+    display: ~
+    range:
+      start: 555
+      end: 591
+  - kind: WikiLink
+    target_doc: ""
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 635
+      end: 639
+  - kind: WikiLink
+    target_doc: ""
+    target_heading: ""
+    target_block: ~
+    display: ~
+    range:
+      start: 640
+      end: 645
+  - kind: WikiLink
+    target_doc: ""
+    target_heading: ~
+    target_block: ~
+    display: sadece-display
+    range:
+      start: 646
+      end: 665
+  - kind: WikiLink
+    target_doc: normal-link
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 666
+      end: 681
+  - kind: Embed
+    target_doc: embed-dosya
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 682
+      end: 698
+  - kind: WikiLink
+    target_doc: dosya
+    target_heading: ~
+    target_block: block-ref-123
+    display: ~
+    range:
+      start: 699
+      end: 723
+  - kind: Footnote
+    target_doc: ""
+    target_heading: ~
+    target_block: ~
+    display: dipnot1
+    range:
+      start: 758
+      end: 768
+  - kind: Footnote
+    target_doc: ""
+    target_heading: ~
+    target_block: ~
+    display: dipnot2
+    range:
+      start: 777
+      end: 787
+tags:
+  - name: unicode-test
+    range:
+      start: 0
+      end: 119
+  - name: gerçek-tag
+    range:
+      start: 472
+      end: 484
+footnotes:
+  definitions:
+    - label: dipnot1
+      range:
+        start: 790
+        end: 824
+    - label: dipnot2
+      range:
+        start: 824
+        end: 861
+line_index:
+  line_starts:
+    - 0
+    - 4
+    - 42
+    - 61
+    - 80
+    - 99
+    - 116
+    - 120
+    - 121
+    - 158
+    - 159
+    - 199
+    - 200
+    - 230
+    - 231
+    - 241
+    - 278
+    - 304
+    - 335
+    - 339
+    - 340
+    - 373
+    - 374
+    - 389
+    - 390
+    - 464
+    - 465
+    - 494
+    - 495
+    - 516
+    - 517
+    - 608
+    - 609
+    - 634
+    - 635
+    - 640
+    - 646
+    - 666
+    - 682
+    - 699
+    - 724
+    - 725
+    - 742
+    - 743
+    - 789
+    - 790
+    - 824
+    - 861
+  source: "---\ntitle: \"Edge Case Testi ığüşçö\"\nalias: tekil-alias\ntags: unicode-test\ndate: \"2024-03-20\"\ncustom_field: 42\n---\n\n# Kenar Durumları ığüşçö 😀\n\nBu dosya tüm edge case'leri test eder.\n\n## Kod İçinde Sahte Linkler\n\n```python\n# Bu bir link DEĞİL: [[fake-link]]\nx = \"[[also-not-a-link]]\"\n# Bu da tag değil: #not-a-tag\n```\n\nAma bu gerçek: [[gerçek-link]]\n\n## Inline Code\n\nBu `[[inline-code-link]]` de link değil. Ve `#inline-tag` de tag değil.\n\nAma bu #gerçek-tag bir tag.\n\n## Türkçe ve Emoji\n\nİğneyle kuyu kazıyorum 😀🎉 ve [[türkçe-not#bölüm-başlığı]] referansı var.\n\n## Boş ve Garip Linkler\n\n[[]]\n[[#]]\n[[|sadece-display]]\n[[normal-link]]\n![[embed-dosya]]\n[[dosya#^block-ref-123]]\n\n## Footnote Test\n\nBu bir referans[^dipnot1] ve bu da[^dipnot2].\n\n[^dipnot1]: İlk dipnot tanımı.\n[^dipnot2]: İkinci dipnot tanımı.\n"
+content_hash: 710398648999963065

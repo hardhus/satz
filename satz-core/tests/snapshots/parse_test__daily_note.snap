@@ -1,0 +1,101 @@
+---
+source: satz-core/tests/parse_test.rs
+expression: doc
+---
+id: daily/2024-01-15.md
+path: daily/2024-01-15.md
+title: 2024-01-15
+frontmatter:
+  title: 2024-01-15
+  tags:
+    - daily
+    - log
+  date: 2024-01-15
+headings:
+  - level: 1
+    text: Günlük
+    slug: günlük
+    range:
+      start: 67
+      end: 78
+  - level: 2
+    text: Notlar
+    slug: notlar
+    range:
+      start: 180
+      end: 190
+links:
+  - kind: WikiLink
+    target_doc: proje-alfa
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 86
+      end: 100
+  - kind: WikiLink
+    target_doc: proje-alfa
+    target_heading: mimari
+    target_block: ~
+    display: ~
+    range:
+      start: 140
+      end: 161
+  - kind: Markdown
+    target_doc: kaynaklar/makale.md
+    target_heading: ~
+    target_block: ~
+    display: Makale
+    range:
+      start: 240
+      end: 269
+  - kind: Footnote
+    target_doc: ""
+    target_heading: ~
+    target_block: ~
+    display: "1"
+    range:
+      start: 319
+      end: 323
+tags:
+  - name: daily
+    range:
+      start: 0
+      end: 65
+  - name: log
+    range:
+      start: 0
+      end: 65
+  - name: fikir
+    range:
+      start: 193
+      end: 199
+footnotes:
+  definitions:
+    - label: "1"
+      range:
+        start: 271
+        end: 302
+line_index:
+  line_starts:
+    - 0
+    - 4
+    - 24
+    - 43
+    - 62
+    - 66
+    - 67
+    - 78
+    - 79
+    - 179
+    - 180
+    - 190
+    - 191
+    - 228
+    - 270
+    - 271
+    - 301
+    - 302
+    - 325
+  source: "---\ntitle: \"2024-01-15\"\ntags: [daily, log]\ndate: \"2024-01-15\"\n---\n\n# Günlük\n\nBugün [[proje-alfa]] üzerinde çalıştım. Detaylar için [[proje-alfa#mimari]] bölümüne bak.\n\n## Notlar\n\n- #fikir yeni bir yaklaşım denedim\n- Referans: [Makale](kaynaklar/makale.md)\n\n[^1]: Bu bir dipnot tanımı.\n\nBunu da not ettim[^1].\n"
+content_hash: 1187208743764516697

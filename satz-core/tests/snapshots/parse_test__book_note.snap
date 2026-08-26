@@ -1,0 +1,138 @@
+---
+source: satz-core/tests/parse_test.rs
+expression: doc
+---
+id: books/tractatus.md
+path: books/tractatus.md
+title: Tractatus Logico-Philosophicus
+frontmatter:
+  title: Tractatus Logico-Philosophicus
+  aliases:
+    - TLP
+    - Tractatus
+  tags:
+    - felsefe
+    - wittgenstein
+    - mantık
+  extra:
+    author: Ludwig Wittgenstein
+    status: reading
+    year: 1921
+headings:
+  - level: 1
+    text: Tractatus Logico-Philosophicus
+    slug: tractatus-logico-philosophicus
+    range:
+      start: 176
+      end: 209
+  - level: 2
+    text: Temel Tezler
+    slug: temel-tezler
+    range:
+      start: 210
+      end: 226
+  - level: 2
+    text: Alıntılar
+    slug: alıntılar
+    range:
+      start: 311
+      end: 326
+  - level: 2
+    text: İlgili Notlar
+    slug: i̇lgili-notlar
+    range:
+      start: 418
+      end: 436
+links:
+  - kind: WikiLink
+    target_doc: felsefe/mantık
+    target_heading: önerme-teorisi
+    target_block: ~
+    display: ~
+    range:
+      start: 273
+      end: 308
+  - kind: Embed
+    target_doc: wittgenstein-portre
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 392
+      end: 416
+  - kind: WikiLink
+    target_doc: vienna-circle
+    target_heading: ~
+    target_block: ~
+    display: Viyana Çevresi
+    range:
+      start: 439
+      end: 472
+  - kind: WikiLink
+    target_doc: russell
+    target_heading: mantıkçı-atomculuk
+    target_block: ~
+    display: ~
+    range:
+      start: 475
+      end: 508
+  - kind: Markdown
+    target_doc: "https://plato.stanford.edu"
+    target_heading: ~
+    target_block: ~
+    display: Harici kaynak
+    range:
+      start: 511
+      end: 554
+tags:
+  - name: felsefe
+    range:
+      start: 0
+      end: 174
+  - name: wittgenstein
+    range:
+      start: 0
+      end: 174
+  - name: mantık
+    range:
+      start: 0
+      end: 174
+  - name: alıntı
+    range:
+      start: 381
+      end: 390
+footnotes:
+  definitions: []
+line_index:
+  line_starts:
+    - 0
+    - 4
+    - 44
+    - 53
+    - 61
+    - 75
+    - 114
+    - 144
+    - 155
+    - 171
+    - 175
+    - 176
+    - 209
+    - 210
+    - 226
+    - 227
+    - 310
+    - 311
+    - 326
+    - 327
+    - 391
+    - 392
+    - 417
+    - 418
+    - 436
+    - 437
+    - 473
+    - 509
+    - 555
+  source: "---\ntitle: \"Tractatus Logico-Philosophicus\"\naliases:\n  - TLP\n  - Tractatus\ntags: [felsefe, wittgenstein, mantık]\nauthor: \"Ludwig Wittgenstein\"\nyear: 1921\nstatus: reading\n---\n\n# Tractatus Logico-Philosophicus\n\n## Temel Tezler\n\nWittgenstein'ın yedi ana önermesi var. Bkz. [[felsefe/mantık#önerme-teorisi]].\n\n## Alıntılar\n\n> \"Dilimin sınırları dünyamın sınırlarıdır.\" #alıntı\n\n![[wittgenstein-portre]]\n\n## İlgili Notlar\n\n- [[vienna-circle|Viyana Çevresi]]\n- [[russell#mantıkçı-atomculuk]]\n- [Harici kaynak](https://plato.stanford.edu)\n"
+content_hash: 3341452228882431812

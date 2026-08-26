@@ -1,0 +1,85 @@
+---
+source: satz-core/tests/parse_test.rs
+expression: doc
+---
+id: tractatus/1.1.md
+path: tractatus/1.1.md
+title: 1.1 — Dünya olgular bütünüdür
+frontmatter:
+  title: 1.1 — Dünya olgular bütünüdür
+  aliases:
+    - "1.1"
+  tags:
+    - tractatus
+    - ontoloji
+headings:
+  - level: 1
+    text: 1.1 — Dünya olgular bütünüdür
+    slug: 1-1-dünya-olgular-bütünüdür
+    range:
+      start: 100
+      end: 139
+  - level: 2
+    text: "1.11"
+    slug: 1-11
+    range:
+      start: 218
+      end: 226
+links:
+  - kind: WikiLink
+    target_doc: "1"
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 198
+      end: 203
+  - kind: WikiLink
+    target_doc: "1.11"
+    target_heading: ~
+    target_block: ~
+    display: ~
+    range:
+      start: 207
+      end: 215
+tags:
+  - name: tractatus
+    range:
+      start: 0
+      end: 98
+  - name: ontoloji
+    range:
+      start: 0
+      end: 98
+  - name: ontoloji
+    range:
+      start: 315
+      end: 324
+  - name: tractatus/temel
+    range:
+      start: 325
+      end: 341
+footnotes:
+  definitions: []
+line_index:
+  line_starts:
+    - 0
+    - 4
+    - 50
+    - 67
+    - 95
+    - 99
+    - 100
+    - 139
+    - 140
+    - 192
+    - 193
+    - 217
+    - 218
+    - 226
+    - 227
+    - 314
+    - 315
+    - 342
+  source: "---\ntitle: \"1.1 — Dünya olgular bütünüdür\"\naliases: [\"1.1\"]\ntags: [tractatus, ontoloji]\n---\n\n# 1.1 — Dünya olgular bütünüdür\n\nDünya, şeylerin değil, olguların bütünüdür.\n\nBkz. [[1]] ve [[1.11]].\n\n## 1.11\n\nDünya olgular tarafından belirlenir ve bunların _tüm_ olgular olması tarafından.\n\n#ontoloji #tractatus/temel\n"
+content_hash: 3258886568569385429

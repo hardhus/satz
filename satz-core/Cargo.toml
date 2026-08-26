@@ -9,9 +9,11 @@ petgraph.workspace = true
 pulldown-cmark.workspace = true
 rayon.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde-saphyr.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-insta.workspace = true
+insta = { workspace = true, features = ["yaml"] }
+
