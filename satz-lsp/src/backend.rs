@@ -130,8 +130,13 @@ impl LanguageServer for Backend {
                         work_done_progress_options: WorkDoneProgressOptions::default(),
                     },
                 )),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
+
             server_info: Some(ServerInfo {
                 name: "satz-lsp".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -198,5 +203,33 @@ impl LanguageServer for Backend {
             state.close_document(&uri);
         }
         self.client.publish_diagnostics(lsp_uri, vec![], None).await;
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::definition::goto_definition(params, &state))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::references::find_references(params, &state))
+    }
+
+    async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::hover::hover(params, &state))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> jsonrpc::Result<Option<DocumentSymbolResponse>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::document_symbol::document_symbol(
+            params, &state,
+        ))
     }
 }
