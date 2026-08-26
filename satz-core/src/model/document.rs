@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::model::block::BlockAnchor;
 use crate::model::footnote::FootnoteTable;
 use crate::model::frontmatter::Frontmatter;
 use crate::model::heading::Heading;
@@ -38,6 +39,7 @@ pub struct Document {
     pub links: Vec<Link>,
     pub tags: Vec<Tag>,
     pub footnotes: FootnoteTable,
+    pub blocks: Vec<BlockAnchor>,
     pub line_index: LineIndex,
     pub content_hash: u64,
 }

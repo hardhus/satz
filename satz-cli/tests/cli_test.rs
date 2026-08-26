@@ -92,3 +92,25 @@ fn test_satz_resolve_command() {
     let stderr = String::from_utf8_lossy(&fail_output.stderr);
     assert!(stderr.contains("not found"));
 }
+
+#[test]
+fn test_satz_daily_command() {
+    let temp_dir = std::env::temp_dir().join(format!("satz_daily_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(["daily", temp_dir.to_str().unwrap()])
+        .output()
+        .expect("satz binary should execute");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = std::path::PathBuf::from(stdout.trim());
+    assert!(path.exists());
+    assert!(path.to_string_lossy().ends_with(".md"));
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.contains("---"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

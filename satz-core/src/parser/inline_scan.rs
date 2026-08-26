@@ -1,3 +1,4 @@
+use crate::model::block::BlockAnchor;
 use crate::model::link::{Link, LinkKind};
 use crate::model::range::ByteRange;
 use crate::model::tag::Tag;
@@ -6,6 +7,7 @@ use crate::model::tag::Tag;
 pub struct InlineScanOutput {
     pub wiki_links: Vec<Link>,
     pub tags: Vec<Tag>,
+    pub blocks: Vec<BlockAnchor>,
 }
 
 /// Scans for wikilinks (`[[...]]`), embeds (`![[...]]`), and tags (`#tag`)
@@ -74,6 +76,32 @@ pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
                     i = next_i;
                     continue;
                 }
+            }
+        }
+
+        // 3. Check for Block Anchor `^block-id`
+        if bytes[i] == b'^' {
+            let start = i;
+            let prev_char = if i > 0 {
+                source[..i].chars().next_back()
+            } else {
+                None
+            };
+
+            let valid_prefix = match prev_char {
+                None => true,
+                Some(c) => c.is_whitespace(),
+            };
+
+            if valid_prefix
+                && !is_in_code(start)
+                && let Some((block, next_i)) = parse_block_anchor(source, start)
+            {
+                if !code_spans.iter().any(|s| s.overlaps(&block.range)) {
+                    output.blocks.push(block);
+                }
+                i = next_i;
+                continue;
             }
         }
 
@@ -185,6 +213,42 @@ fn parse_tag(source: &str, start: usize) -> Option<(Tag, usize)> {
     ))
 }
 
+/// Attempts to parse a block anchor `^block-id` starting at `start`.
+/// Valid characters in block-id are alphanumeric and hyphens `[a-zA-Z0-9-]`.
+/// Must be followed by whitespace, newline, punctuation, or end of string.
+fn parse_block_anchor(source: &str, start: usize) -> Option<(BlockAnchor, usize)> {
+    let rest = &source[start + 1..];
+    let mut end = 0;
+
+    for (idx, ch) in rest.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    if end == 0 {
+        return None;
+    }
+
+    let id = &rest[..end];
+    let full_end = start + 1 + end;
+
+    // Check trailing character: must be end of string, whitespace, or punctuation
+    if let Some(next_ch) = source[full_end..].chars().next()
+        && !next_ch.is_whitespace()
+        && !matches!(next_ch, '.' | ',' | ';' | ':' | ')' | ']' | '}')
+    {
+        return None;
+    }
+
+    Some((
+        BlockAnchor::new(id, ByteRange::new(start, full_end)),
+        full_end,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,11 +298,21 @@ mod tests {
     }
 
     #[test]
+    fn test_block_anchor_scan() {
+        let text = "This is a paragraph with a block reference. ^p1-ref\n\nAnother one ^my-block.";
+        let output = scan_inline(text, &[]);
+        assert_eq!(output.blocks.len(), 2);
+        assert_eq!(output.blocks[0].id, "p1-ref");
+        assert_eq!(output.blocks[1].id, "my-block");
+    }
+
+    #[test]
     fn test_ignore_code_spans() {
-        let text = "Real [[link]] and `inline [[fake-link]]` and #real-tag and `#fake-tag`.";
+        let text = "Real [[link]] and `inline [[fake-link]]` and #real-tag and `#fake-tag` and `^fake-block` ^real-block.";
         let code_spans = vec![
             ByteRange::new(18, 40), // `inline [[fake-link]]`
             ByteRange::new(59, 70), // `#fake-tag`
+            ByteRange::new(75, 89), // `^fake-block`
         ];
         let output = scan_inline(text, &code_spans);
         assert_eq!(output.wiki_links.len(), 1);
@@ -246,5 +320,8 @@ mod tests {
 
         assert_eq!(output.tags.len(), 1);
         assert_eq!(output.tags[0].name, "real-tag");
+
+        assert_eq!(output.blocks.len(), 1);
+        assert_eq!(output.blocks[0].id, "real-block");
     }
 }

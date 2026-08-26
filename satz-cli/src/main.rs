@@ -17,6 +17,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Open or create today's daily note
+    Daily(commands::daily_cmd::DailyArgs),
     /// Index vault and show summary
     Index(commands::index_cmd::IndexArgs),
     /// List documents by tag, orphan status, or broken links
@@ -38,6 +40,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Daily(args) => commands::daily_cmd::run(args),
         Commands::Index(args) => commands::index_cmd::run(args),
         Commands::List(args) => commands::list_cmd::run(args),
         Commands::Resolve(args) => commands::resolve_cmd::run(args),

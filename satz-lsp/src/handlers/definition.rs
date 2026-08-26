@@ -71,6 +71,10 @@ pub fn goto_definition(
         {
             target_range = byte_range_to_lsp(h.range, &target_doc.line_index);
         }
+    } else if let Some(block_id) = &link.target_block {
+        if let Some(b) = target_doc.blocks.iter().find(|b| b.id == *block_id) {
+            target_range = byte_range_to_lsp(b.range, &target_doc.line_index);
+        }
     }
 
     Some(GotoDefinitionResponse::Scalar(Location::new(

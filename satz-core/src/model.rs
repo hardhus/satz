@@ -1,3 +1,4 @@
+pub mod block;
 pub mod document;
 pub mod footnote;
 pub mod frontmatter;
@@ -6,6 +7,7 @@ pub mod link;
 pub mod range;
 pub mod tag;
 
+pub use block::BlockAnchor;
 pub use document::{DocId, Document};
 pub use footnote::{FootnoteDef, FootnoteTable};
 pub use frontmatter::Frontmatter;

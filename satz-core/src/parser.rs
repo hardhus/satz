@@ -65,6 +65,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         footnotes: FootnoteTable {
             definitions: structure.footnote_defs,
         },
+        blocks: inline.blocks,
         line_index,
         content_hash,
     }
