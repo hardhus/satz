@@ -1,40 +1,24 @@
-use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::*;
-use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::{LspService, Server};
+use tracing_subscriber::EnvFilter;
 
-#[derive(Debug)]
-struct Backend {
-    #[allow(dead_code)]
-    client: Client,
-}
+mod backend;
+mod convert;
+mod handlers;
+mod state;
 
-impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
-        Ok(InitializeResult {
-            capabilities: ServerCapabilities::default(),
-            server_info: Some(ServerInfo {
-                name: "satz-lsp".to_string(),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            }),
-            offset_encoding: None,
-        })
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
-    }
-}
+use backend::Backend;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::WARN.into()))
         .init();
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend { client });
+    let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
 
     Ok(())

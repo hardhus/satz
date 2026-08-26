@@ -180,4 +180,27 @@ mod tests {
         // Both A and B are orphans since nothing links to them
         assert_eq!(orphans.len(), 2);
     }
+
+    #[test]
+    fn test_replace_doc_updates_state() {
+        let doc_v1 = parse_document(
+            "---\ntitle: Old Title\ntags: [rust]\n---\n# Old Title",
+            Path::new("test.md"),
+        );
+        let mut index = Index::build(vec![doc_v1]);
+
+        assert!(index.resolve_link("Old Title").is_some());
+        assert_eq!(index.docs_with_tag("rust").count(), 1);
+
+        let doc_v2 = parse_document(
+            "---\ntitle: New Title\ntags: [python]\n---\n# New Title",
+            Path::new("test.md"),
+        );
+        index.replace_doc(doc_v2);
+
+        assert!(index.resolve_link("Old Title").is_none());
+        assert!(index.resolve_link("New Title").is_some());
+        assert_eq!(index.docs_with_tag("rust").count(), 0);
+        assert_eq!(index.docs_with_tag("python").count(), 1);
+    }
 }

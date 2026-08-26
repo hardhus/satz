@@ -120,6 +120,103 @@ impl Index {
         })
     }
 
+    /// Replaces or inserts a document in the index, updating paths, title/aliases, and tags.
+    pub fn replace_doc(&mut self, new_doc: Document) {
+        let id = new_doc.id.clone();
+
+        // If old doc exists, clean up old references
+        if let Some(old_doc) = self.docs.get(&id) {
+            // Remove old tags
+            for tag in &old_doc.tags {
+                let tag_key = tag.name.trim_start_matches('#').to_lowercase();
+                if let Some(set) = self.tags.get_mut(&tag_key) {
+                    set.remove(&id);
+                    if set.is_empty() {
+                        self.tags.remove(&tag_key);
+                    }
+                }
+            }
+
+            // Remove old title and aliases from by_title_alias if pointing to this doc
+            let old_title_key = old_doc.title.to_lowercase();
+            if self.by_title_alias.get(&old_title_key) == Some(&id) {
+                self.by_title_alias.remove(&old_title_key);
+            }
+            for alias in &old_doc.frontmatter.aliases {
+                let alias_key = alias.to_lowercase();
+                if self.by_title_alias.get(&alias_key) == Some(&id) {
+                    self.by_title_alias.remove(&alias_key);
+                }
+            }
+
+            // Remove old path
+            let old_normalized = PathBuf::from(old_doc.path.to_string_lossy().replace('\\', "/"));
+            if self.by_path.get(&old_normalized) == Some(&id) {
+                self.by_path.remove(&old_normalized);
+            }
+            if self.by_path.get(&old_doc.path) == Some(&id) {
+                self.by_path.remove(&old_doc.path);
+            }
+        }
+
+        // Insert new path
+        let normalized_path = PathBuf::from(new_doc.path.to_string_lossy().replace('\\', "/"));
+        self.by_path.insert(normalized_path, id.clone());
+        self.by_path.insert(new_doc.path.clone(), id.clone());
+
+        // Insert new title and aliases
+        let title_key = new_doc.title.to_lowercase();
+        self.by_title_alias.insert(title_key, id.clone());
+        for alias in &new_doc.frontmatter.aliases {
+            let alias_key = alias.to_lowercase();
+            self.by_title_alias.insert(alias_key, id.clone());
+        }
+
+        // Insert new tags
+        for tag in &new_doc.tags {
+            let tag_key = tag.name.trim_start_matches('#').to_lowercase();
+            self.tags.entry(tag_key).or_default().insert(id.clone());
+        }
+
+        self.docs.insert(id, new_doc);
+    }
+
+    /// Removes a document from the index.
+    pub fn remove_doc(&mut self, id: &DocId) {
+        if let Some(old_doc) = self.docs.remove(id) {
+            for tag in &old_doc.tags {
+                let tag_key = tag.name.trim_start_matches('#').to_lowercase();
+                if let Some(set) = self.tags.get_mut(&tag_key) {
+                    set.remove(id);
+                    if set.is_empty() {
+                        self.tags.remove(&tag_key);
+                    }
+                }
+            }
+
+            let old_title_key = old_doc.title.to_lowercase();
+            if self.by_title_alias.get(&old_title_key) == Some(id) {
+                self.by_title_alias.remove(&old_title_key);
+            }
+            for alias in &old_doc.frontmatter.aliases {
+                let alias_key = alias.to_lowercase();
+                if self.by_title_alias.get(&alias_key) == Some(id) {
+                    self.by_title_alias.remove(&alias_key);
+                }
+            }
+
+            let old_normalized = PathBuf::from(old_doc.path.to_string_lossy().replace('\\', "/"));
+            if self.by_path.get(&old_normalized) == Some(id) {
+                self.by_path.remove(&old_normalized);
+            }
+            if self.by_path.get(&old_doc.path) == Some(id) {
+                self.by_path.remove(&old_doc.path);
+            }
+
+            self.backlinks.remove(id);
+        }
+    }
+
     /// Generates summary statistics of the indexed vault.
     pub fn stats(&self) -> IndexStats {
         let total_headings = self.docs.values().map(|d| d.headings.len()).sum();

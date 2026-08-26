@@ -910,6 +910,7 @@ dependencies = [
  "nucleo-matcher",
  "ropey",
  "satz-core",
+ "serde_json",
  "tokio",
  "tower-lsp-server",
  "tracing",
