@@ -322,12 +322,12 @@ mod tests {
 
         state.open_docs.insert(
             uri_a_str.to_string(),
-            crate::state::OpenDocument {
-                uri: uri_a_str.to_string(),
-                path: abs_a.to_path_buf(),
-                content: "# Old Heading\n\nSome text".to_string(),
-                version: 1,
-            },
+            crate::state::OpenDocument::new(
+                uri_a_str,
+                abs_a.to_path_buf(),
+                "# Old Heading\n\nSome text",
+                1,
+            ),
         );
 
         let params = RenameParams {
@@ -387,12 +387,12 @@ mod tests {
 
         state.open_docs.insert(
             uri_b_str.to_string(),
-            crate::state::OpenDocument {
-                uri: uri_b_str.to_string(),
-                path: abs_b.to_path_buf(),
-                content: "# Doc B\n\nLink to [[doc-a]] here".to_string(),
-                version: 1,
-            },
+            crate::state::OpenDocument::new(
+                uri_b_str,
+                abs_b.to_path_buf(),
+                "# Doc B\n\nLink to [[doc-a]] here",
+                1,
+            ),
         );
 
         let params = RenameParams {

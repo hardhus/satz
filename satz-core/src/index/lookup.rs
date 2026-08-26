@@ -120,7 +120,7 @@ impl Index {
         })
     }
 
-    /// Replaces or inserts a document in the index, updating paths, title/aliases, and tags.
+    /// Replaces or inserts a document in the index, updating paths, title/aliases, tags, and backlinks.
     pub fn replace_doc(&mut self, new_doc: Document) {
         let id = new_doc.id.clone();
 
@@ -157,6 +157,24 @@ impl Index {
             if self.by_path.get(&old_doc.path) == Some(&id) {
                 self.by_path.remove(&old_doc.path);
             }
+
+            // Remove outgoing backlinks from old_doc
+            for link in &old_doc.links {
+                if matches!(
+                    link.kind,
+                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
+                ) && !link.target_doc.is_empty()
+                    && !link.target_doc.starts_with("http://")
+                    && !link.target_doc.starts_with("https://")
+                    && let Some(target_id) = self.resolve_link(&link.target_doc).cloned()
+                    && let Some(set) = self.backlinks.get_mut(&target_id)
+                {
+                    set.remove(&id);
+                    if set.is_empty() {
+                        self.backlinks.remove(&target_id);
+                    }
+                }
+            }
         }
 
         // Insert new path
@@ -176,6 +194,23 @@ impl Index {
         for tag in &new_doc.tags {
             let tag_key = tag.name.trim_start_matches('#').to_lowercase();
             self.tags.entry(tag_key).or_default().insert(id.clone());
+        }
+
+        // Insert new outgoing backlinks
+        for link in &new_doc.links {
+            if matches!(
+                link.kind,
+                LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
+            ) && !link.target_doc.is_empty()
+                && !link.target_doc.starts_with("http://")
+                && !link.target_doc.starts_with("https://")
+                && let Some(target_id) = self.resolve_link(&link.target_doc).cloned()
+            {
+                self.backlinks
+                    .entry(target_id)
+                    .or_default()
+                    .insert(id.clone());
+            }
         }
 
         self.docs.insert(id, new_doc);
@@ -211,6 +246,24 @@ impl Index {
             }
             if self.by_path.get(&old_doc.path) == Some(id) {
                 self.by_path.remove(&old_doc.path);
+            }
+
+            // Remove outgoing backlinks
+            for link in &old_doc.links {
+                if matches!(
+                    link.kind,
+                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
+                ) && !link.target_doc.is_empty()
+                    && !link.target_doc.starts_with("http://")
+                    && !link.target_doc.starts_with("https://")
+                    && let Some(target_id) = self.resolve_link(&link.target_doc).cloned()
+                    && let Some(set) = self.backlinks.get_mut(&target_id)
+                {
+                    set.remove(id);
+                    if set.is_empty() {
+                        self.backlinks.remove(&target_id);
+                    }
+                }
             }
 
             self.backlinks.remove(id);

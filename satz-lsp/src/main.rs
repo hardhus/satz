@@ -6,6 +6,8 @@ mod convert;
 mod handlers;
 mod rank;
 mod state;
+mod sync;
+mod watcher;
 
 use backend::Backend;
 

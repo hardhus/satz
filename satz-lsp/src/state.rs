@@ -1,16 +1,39 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use ropey::Rope;
 use satz_core::{Index, VaultConfig, walk_vault};
+use tower_lsp_server::ls_types::TextDocumentContentChangeEvent;
 
-/// In-memory representation of an open text document.
+/// In-memory representation of an open text document with a Rope buffer.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OpenDocument {
     pub uri: String,
     pub path: PathBuf,
+    pub rope: Rope,
     pub content: String,
     pub version: i32,
+}
+
+#[allow(dead_code)]
+impl OpenDocument {
+    pub fn new(
+        uri: impl Into<String>,
+        path: PathBuf,
+        content: impl Into<String>,
+        version: i32,
+    ) -> Self {
+        let content_str = content.into();
+        let rope = Rope::from_str(&content_str);
+        Self {
+            uri: uri.into(),
+            path,
+            rope,
+            content: content_str,
+            version,
+        }
+    }
 }
 
 /// Global server state.
@@ -49,8 +72,8 @@ impl SatzState {
         })
     }
 
-    /// Re-parses a single document upon changes and updates the index.
-    pub fn reparse_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
+    /// Handles opening a new document.
+    pub fn open_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
         let rel_path = match &self.vault_root {
             Some(root) => path.strip_prefix(root).unwrap_or(path),
             None => path,
@@ -60,14 +83,42 @@ impl SatzState {
 
         self.open_docs.insert(
             uri.to_string(),
-            OpenDocument {
-                uri: uri.to_string(),
-                path: path.to_path_buf(),
-                content: content.to_string(),
-                version,
-            },
+            OpenDocument::new(uri, path.to_path_buf(), content, version),
         );
 
+        self.index.replace_doc(new_doc);
+    }
+
+    /// Re-parses a single document upon changes (full text) and updates the index.
+    #[allow(dead_code)]
+    pub fn reparse_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
+        self.open_document(uri, content, path, version);
+    }
+
+    /// Applies incremental changes to an open document and updates the index.
+    pub fn apply_changes(
+        &mut self,
+        uri: &str,
+        changes: Vec<TextDocumentContentChangeEvent>,
+        version: i32,
+    ) {
+        let Some(open_doc) = self.open_docs.get_mut(uri) else {
+            return;
+        };
+
+        crate::sync::apply_changes_to_rope(&mut open_doc.rope, changes);
+        open_doc.version = version;
+
+        let path = open_doc.path.clone();
+        let content = open_doc.rope.to_string();
+        open_doc.content = content.clone();
+
+        let rel_path = match &self.vault_root {
+            Some(root) => path.strip_prefix(root).unwrap_or(&path),
+            None => &path,
+        };
+
+        let new_doc = satz_core::parse_document(&content, rel_path);
         self.index.replace_doc(new_doc);
     }
 

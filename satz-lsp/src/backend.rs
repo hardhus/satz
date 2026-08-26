@@ -78,15 +78,18 @@ impl LanguageServer for Backend {
             let root_clone = root.clone();
 
             tokio::task::spawn(async move {
-                let result =
-                    tokio::task::spawn_blocking(move || SatzState::initialize_index(root_clone))
-                        .await;
+                let root_for_blocking = root_clone.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    SatzState::initialize_index(root_for_blocking)
+                })
+                .await;
 
                 match result {
                     Ok(Ok(new_state)) => {
                         let doc_count = new_state.index.doc_count();
                         let broken = new_state.index.broken_link_count();
                         *state_arc.write().await = new_state;
+                        crate::watcher::spawn_watcher(root_clone, state_arc);
                         client
                             .log_message(
                                 MessageType::INFO,
@@ -120,7 +123,7 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
@@ -177,7 +180,7 @@ impl LanguageServer for Backend {
 
         {
             let mut state = self.state.write().await;
-            state.reparse_document(&uri, &content, &path, version);
+            state.open_document(&uri, &content, &path, version);
         }
 
         self.publish_diagnostics_for_uri(&uri).await;
@@ -186,17 +189,10 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
-        let Some(change) = params.content_changes.into_iter().last() else {
-            return;
-        };
-        let content = change.text;
-        let Some(path) = uri_to_path(&uri) else {
-            return;
-        };
 
         {
             let mut state = self.state.write().await;
-            state.reparse_document(&uri, &content, &path, version);
+            state.apply_changes(&uri, params.content_changes, version);
         }
 
         self.publish_diagnostics_for_uri(&uri).await;

@@ -180,12 +180,12 @@ mod tests {
 
         state.open_docs.insert(
             uri_a_str.to_string(),
-            crate::state::OpenDocument {
-                uri: uri_a_str.to_string(),
-                path: abs_a.to_path_buf(),
-                content: "# Doc A\n\nSome text with #rust tag.".to_string(),
-                version: 1,
-            },
+            crate::state::OpenDocument::new(
+                uri_a_str,
+                abs_a.to_path_buf(),
+                "# Doc A\n\nSome text with #rust tag.",
+                1,
+            ),
         );
 
         let params = ReferenceParams {

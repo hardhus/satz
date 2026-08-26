@@ -225,12 +225,7 @@ mod tests {
         let uri_str = "file:///doc-a.md";
         state.open_docs.insert(
             uri_str.to_string(),
-            crate::state::OpenDocument {
-                uri: uri_str.to_string(),
-                path: rel_a.to_path_buf(),
-                content: "# Doc A\n\n[[".to_string(),
-                version: 1,
-            },
+            crate::state::OpenDocument::new(uri_str, rel_a.to_path_buf(), "# Doc A\n\n[[", 1),
         );
 
         let params = CompletionParams {
@@ -268,12 +263,7 @@ mod tests {
         let uri_str = "file:///doc-a.md";
         state.open_docs.insert(
             uri_str.to_string(),
-            crate::state::OpenDocument {
-                uri: uri_str.to_string(),
-                path: rel_a.to_path_buf(),
-                content: "# Doc A\n\n[[doc-b#".to_string(),
-                version: 1,
-            },
+            crate::state::OpenDocument::new(uri_str, rel_a.to_path_buf(), "# Doc A\n\n[[doc-b#", 1),
         );
 
         let params = CompletionParams {

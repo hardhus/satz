@@ -203,4 +203,35 @@ mod tests {
         assert_eq!(index.docs_with_tag("rust").count(), 0);
         assert_eq!(index.docs_with_tag("python").count(), 1);
     }
+
+    #[test]
+    fn test_replace_doc_updates_backlinks() {
+        let doc_a_v1 = parse_document("# A\n\nLinks to [[b]] and [[c]].", Path::new("a.md"));
+        let doc_b = parse_document("# B", Path::new("b.md"));
+        let doc_c = parse_document("# C", Path::new("c.md"));
+        let doc_d = parse_document("# D", Path::new("d.md"));
+
+        let mut index = Index::build(vec![doc_a_v1, doc_b, doc_c, doc_d]);
+
+        let b_id = index.resolve_link("b").unwrap().clone();
+        let c_id = index.resolve_link("c").unwrap().clone();
+        let d_id = index.resolve_link("d").unwrap().clone();
+
+        assert_eq!(index.backlinks_of(&b_id).count(), 1);
+        assert_eq!(index.backlinks_of(&c_id).count(), 1);
+        assert_eq!(index.backlinks_of(&d_id).count(), 0);
+
+        // Update A to link to [[d]] instead of [[b]] and [[c]]
+        let doc_a_v2 = parse_document("# A\n\nLinks only to [[d]].", Path::new("a.md"));
+        index.replace_doc(doc_a_v2);
+
+        assert_eq!(index.backlinks_of(&b_id).count(), 0);
+        assert_eq!(index.backlinks_of(&c_id).count(), 0);
+        assert_eq!(index.backlinks_of(&d_id).count(), 1);
+
+        // Remove A completely
+        let a_id = index.resolve_link("a").unwrap().clone();
+        index.remove_doc(&a_id);
+        assert_eq!(index.backlinks_of(&d_id).count(), 0);
+    }
 }
