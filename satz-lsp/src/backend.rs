@@ -140,6 +140,12 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
 
@@ -260,6 +266,29 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<WorkspaceSymbolResponse>> {
         let state = self.state.read().await;
         Ok(crate::handlers::workspace_symbol::workspace_symbol(
+            params, &state,
+        ))
+    }
+
+    async fn rename(&self, params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::rename::rename(params, &state))
+    }
+
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> jsonrpc::Result<Option<CodeActionResponse>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::code_action::code_action(params, &state))
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> jsonrpc::Result<Option<Vec<DocumentLink>>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::document_link::document_link(
             params, &state,
         ))
     }

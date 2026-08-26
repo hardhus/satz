@@ -1,7 +1,10 @@
+pub mod code_action;
 pub mod completion;
 pub mod definition;
 pub mod diagnostics;
+pub mod document_link;
 pub mod document_symbol;
 pub mod hover;
 pub mod references;
+pub mod rename;
 pub mod workspace_symbol;
