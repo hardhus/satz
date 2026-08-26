@@ -134,6 +134,12 @@ impl LanguageServer for Backend {
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(true),
+                    trigger_characters: Some(vec!["[".into(), "#".into(), "^".into()]),
+                    ..Default::default()
+                }),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
 
@@ -229,6 +235,31 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<DocumentSymbolResponse>> {
         let state = self.state.read().await;
         Ok(crate::handlers::document_symbol::document_symbol(
+            params, &state,
+        ))
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> jsonrpc::Result<Option<CompletionResponse>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::completion::completion(params, &state))
+    }
+
+    async fn completion_resolve(&self, params: CompletionItem) -> jsonrpc::Result<CompletionItem> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::completion::completion_resolve(
+            params, &state,
+        ))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> jsonrpc::Result<Option<WorkspaceSymbolResponse>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::workspace_symbol::workspace_symbol(
             params, &state,
         ))
     }

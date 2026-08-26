@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 mod backend;
 mod convert;
 mod handlers;
+mod rank;
 mod state;
 
 use backend::Backend;
