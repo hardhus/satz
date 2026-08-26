@@ -877,12 +877,16 @@ dependencies = [
  "anyhow",
  "clap",
  "satz-core",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "satz-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ignore",
  "insta",
  "petgraph",
@@ -893,6 +897,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+ "tracing",
 ]
 
 [[package]]

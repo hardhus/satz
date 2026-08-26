@@ -1,8 +1,10 @@
 pub mod config;
+pub mod index;
 pub mod model;
 pub mod parser;
 pub mod slug;
 pub mod text;
+pub mod walk;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -10,6 +12,7 @@ pub fn version() -> &'static str {
 
 // Convenience re-exports
 pub use config::VaultConfig;
+pub use index::{IdScheme, Index, IndexStats, PathScheme};
 pub use model::{
     ByteRange, DocId, Document, FootnoteDef, FootnoteTable, Frontmatter, Heading, Link, LinkKind,
     Tag,
@@ -17,6 +20,7 @@ pub use model::{
 pub use parser::parse_document;
 pub use slug::slugify;
 pub use text::{LineIndex, Position};
+pub use walk::walk_vault;
 
 #[cfg(test)]
 mod tests {

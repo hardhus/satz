@@ -1,0 +1,154 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use crate::model::{DocId, Document, Link, LinkKind};
+
+/// In-memory vault index.
+#[derive(Debug, Default)]
+pub struct Index {
+    pub(crate) docs: HashMap<DocId, Document>,
+    pub(crate) by_path: HashMap<PathBuf, DocId>,
+    pub(crate) by_title_alias: HashMap<String, DocId>,
+    pub(crate) backlinks: HashMap<DocId, HashSet<DocId>>,
+    pub(crate) tags: HashMap<String, HashSet<DocId>>,
+    pub(crate) broken_link_count: usize,
+}
+
+impl Index {
+    /// Returns an iterator over all indexed documents.
+    pub fn documents(&self) -> impl Iterator<Item = &Document> {
+        self.docs.values()
+    }
+
+    /// Total number of indexed documents.
+    pub fn doc_count(&self) -> usize {
+        self.docs.len()
+    }
+
+    /// Total number of links across all documents.
+    pub fn total_links(&self) -> usize {
+        self.docs.values().map(|d| d.links.len()).sum()
+    }
+
+    /// Total number of broken internal links (calculated at index build time).
+    pub fn broken_link_count(&self) -> usize {
+        self.broken_link_count
+    }
+
+    /// Resolves a raw link target (e.g. `"file"`, `"folder/file"`, or alias/title) to a `DocId`.
+    ///
+    /// Priority:
+    /// 1. Exact path match (`by_path`)
+    /// 2. Path with `.md` extension appended (`by_path`)
+    /// 3. Lowercase title or alias match (`by_title_alias`)
+    pub fn resolve_link(&self, raw_target: &str) -> Option<&DocId> {
+        let normalized = raw_target.replace('\\', "/");
+        let as_path = PathBuf::from(&normalized);
+        if let Some(id) = self.by_path.get(&as_path) {
+            return Some(id);
+        }
+
+        let with_ext = PathBuf::from(format!("{}.md", normalized));
+        if let Some(id) = self.by_path.get(&with_ext) {
+            return Some(id);
+        }
+
+        self.by_title_alias.get(&raw_target.to_lowercase())
+    }
+
+    /// Retrieves a document by its `DocId`.
+    pub fn get_doc(&self, id: &DocId) -> Option<&Document> {
+        self.docs.get(id)
+    }
+
+    /// Retrieves a document by its vault-relative `Path`.
+    pub fn get_doc_by_path(&self, path: &Path) -> Option<&Document> {
+        self.by_path.get(path).and_then(|id| self.docs.get(id))
+    }
+
+    /// Returns an iterator over all document IDs that link to the given `id`.
+    pub fn backlinks_of(&self, id: &DocId) -> impl Iterator<Item = &DocId> {
+        self.backlinks.get(id).into_iter().flat_map(|s| s.iter())
+    }
+
+    /// Returns an iterator over documents with no incoming backlinks (orphan notes).
+    pub fn orphan_docs(&self) -> impl Iterator<Item = &Document> {
+        self.docs.values().filter(|d| {
+            !self.backlinks.contains_key(&d.id)
+                || self.backlinks.get(&d.id).is_some_and(|s| s.is_empty())
+        })
+    }
+
+    /// Returns an iterator over documents tagged with the specified tag name (case-insensitive).
+    pub fn docs_with_tag<'a>(&'a self, tag: &str) -> impl Iterator<Item = &'a Document> + 'a {
+        let clean = tag.trim_start_matches('#').to_lowercase();
+        self.tags
+            .get(&clean)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| self.docs.get(id))
+    }
+
+    /// Returns a sorted list of all unique tag names in the vault.
+    pub fn all_tags(&self) -> Vec<&str> {
+        let mut tags: Vec<&str> = self.tags.keys().map(|s| s.as_str()).collect();
+        tags.sort_unstable();
+        tags
+    }
+
+    /// Returns an iterator of documents containing broken internal links, along with the broken link items.
+    pub fn docs_with_broken_links(&self) -> impl Iterator<Item = (&Document, Vec<&Link>)> {
+        self.docs.values().filter_map(|doc| {
+            let broken: Vec<&Link> = doc
+                .links
+                .iter()
+                .filter(|l| {
+                    matches!(
+                        l.kind,
+                        LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
+                    ) && !l.target_doc.is_empty()
+                        && !l.target_doc.starts_with("http://")
+                        && !l.target_doc.starts_with("https://")
+                        && self.resolve_link(&l.target_doc).is_none()
+                })
+                .collect();
+            if broken.is_empty() {
+                None
+            } else {
+                Some((doc, broken))
+            }
+        })
+    }
+
+    /// Generates summary statistics of the indexed vault.
+    pub fn stats(&self) -> IndexStats {
+        let total_headings = self.docs.values().map(|d| d.headings.len()).sum();
+        let total_words = self
+            .docs
+            .values()
+            .map(|d| d.line_index.source().split_whitespace().count())
+            .sum();
+
+        IndexStats {
+            doc_count: self.doc_count(),
+            total_links: self.total_links(),
+            broken_links: self.broken_link_count,
+            unique_tags: self.tags.len(),
+            orphan_docs: self.orphan_docs().count(),
+            total_headings,
+            total_words,
+        }
+    }
+}
+
+/// Summary statistics of an indexed vault.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndexStats {
+    pub doc_count: usize,
+    pub total_links: usize,
+    pub broken_links: usize,
+    pub unique_tags: usize,
+    pub orphan_docs: usize,
+    pub total_headings: usize,
+    pub total_words: usize,
+}
