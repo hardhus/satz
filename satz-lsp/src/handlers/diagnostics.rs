@@ -62,6 +62,48 @@ pub fn compute_diagnostics(
         }
     }
 
+    // 3. Duplicate heading slugs
+    let mut seen_slugs = std::collections::HashSet::new();
+    for heading in &doc.headings {
+        if !seen_slugs.insert(&heading.slug) {
+            let range = byte_range_to_lsp(heading.range, &doc.line_index);
+            diagnostics.push(lsp::Diagnostic {
+                range,
+                severity: Some(lsp::DiagnosticSeverity::WARNING),
+                code: Some(lsp::NumberOrString::String("duplicate-heading".to_string())),
+                source: Some("satz".to_string()),
+                message: format!(
+                    "Duplicate heading slug: '{}' (reference targets may be ambiguous)",
+                    heading.slug
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    // 4. Orphan note diagnostic (HINT)
+    if index.backlinks_of(&doc.id).count() == 0
+        && (!doc.links.is_empty() || !doc.headings.is_empty())
+    {
+        diagnostics.push(lsp::Diagnostic {
+            range: lsp::Range {
+                start: lsp::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp::Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            severity: Some(lsp::DiagnosticSeverity::HINT),
+            code: Some(lsp::NumberOrString::String("orphan-note".to_string())),
+            source: Some("satz".to_string()),
+            message: "Orphan note: No incoming backlinks from any document".to_string(),
+            ..Default::default()
+        });
+    }
+
     diagnostics
 }
 
@@ -70,12 +112,22 @@ fn diagnose_wikilink(link: &Link, index: &Index, doc: &Document, out: &mut Vec<l
 
     match index.resolve_link(&link.target_doc) {
         None => {
+            let code = if link.kind == LinkKind::Embed {
+                "broken-embed"
+            } else {
+                "broken-link"
+            };
+            let message = if link.kind == LinkKind::Embed {
+                format!("Broken embed: '{}' could not be resolved", link.target_doc)
+            } else {
+                format!("Broken link: '{}' could not be resolved", link.target_doc)
+            };
             out.push(lsp::Diagnostic {
                 range,
                 severity: Some(lsp::DiagnosticSeverity::WARNING),
-                code: Some(lsp::NumberOrString::String("broken-link".to_string())),
+                code: Some(lsp::NumberOrString::String(code.to_string())),
                 source: Some("satz".to_string()),
-                message: format!("Broken link: '{}' could not be resolved", link.target_doc),
+                message,
                 ..Default::default()
             });
         }
@@ -162,7 +214,7 @@ mod tests {
     #[test]
     fn test_valid_link_no_diagnostics() {
         let doc_a = parse_document("# Doc A\n\n[[doc-b]]", Path::new("doc-a.md"));
-        let doc_b = parse_document("# Doc B\n\nContent", Path::new("doc-b.md"));
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
         let index = Index::build(vec![doc_a.clone(), doc_b]);
         let config = VaultConfig::default();
 
@@ -173,7 +225,8 @@ mod tests {
     #[test]
     fn test_broken_wikilink_diagnostic() {
         let doc_a = parse_document("# Doc A\n\n[[missing-note]]", Path::new("doc-a.md"));
-        let index = Index::build(vec![doc_a.clone()]);
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
         let config = VaultConfig::default();
 
         let diagnostics = compute_diagnostics(&doc_a, &index, &config);
@@ -185,12 +238,60 @@ mod tests {
     }
 
     #[test]
+    fn test_broken_embed_diagnostic() {
+        let doc_a = parse_document("# Doc A\n\n![[missing-image]]", Path::new("doc-a.md"));
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
+        let config = VaultConfig::default();
+
+        let diagnostics = compute_diagnostics(&doc_a, &index, &config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            Some(lsp::NumberOrString::String("broken-embed".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_duplicate_heading_diagnostic() {
+        let doc_a = parse_document("# Introduction\n\n# Introduction", Path::new("doc-a.md"));
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
+        let config = VaultConfig::default();
+
+        let diagnostics = compute_diagnostics(&doc_a, &index, &config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            Some(lsp::NumberOrString::String("duplicate-heading".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_orphan_note_diagnostic() {
+        let doc_a = parse_document("# Orphan Doc", Path::new("doc-a.md"));
+        let index = Index::build(vec![doc_a.clone()]);
+        let config = VaultConfig::default();
+
+        let diagnostics = compute_diagnostics(&doc_a, &index, &config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            Some(lsp::NumberOrString::String("orphan-note".to_string()))
+        );
+        assert_eq!(diagnostics[0].severity, Some(lsp::DiagnosticSeverity::HINT));
+    }
+
+    #[test]
     fn test_broken_heading_ref_diagnostic() {
         let doc_a = parse_document(
             "# Doc A\n\n[[doc-b#missing-heading]]",
             Path::new("doc-a.md"),
         );
-        let doc_b = parse_document("# Doc B\n\n## Existing Heading", Path::new("doc-b.md"));
+        let doc_b = parse_document(
+            "# Doc B\n\n[[doc-a]]\n## Existing Heading",
+            Path::new("doc-b.md"),
+        );
         let index = Index::build(vec![doc_a.clone(), doc_b]);
         let config = VaultConfig::default();
 
@@ -208,7 +309,8 @@ mod tests {
             "# Doc A\n\n[Google](https://google.com)",
             Path::new("doc-a.md"),
         );
-        let index = Index::build(vec![doc_a.clone()]);
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
         let config = VaultConfig::default();
 
         let diagnostics = compute_diagnostics(&doc_a, &index, &config);
@@ -218,7 +320,8 @@ mod tests {
     #[test]
     fn test_missing_required_field_diagnostic() {
         let doc_a = parse_document("# Doc A\n\nNo frontmatter", Path::new("doc-a.md"));
-        let index = Index::build(vec![doc_a.clone()]);
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
         let mut config = VaultConfig::default();
         config.frontmatter.required_fields = vec!["date".to_string(), "author".to_string()];
 

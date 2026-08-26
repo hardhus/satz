@@ -1,10 +1,15 @@
 pub mod code_action;
+pub mod codelens;
 pub mod completion;
 pub mod definition;
 pub mod diagnostics;
 pub mod document_link;
 pub mod document_symbol;
+pub mod folding_range;
+pub mod formatting;
 pub mod hover;
+pub mod inlay_hint;
 pub mod references;
 pub mod rename;
+pub mod semantic_tokens;
 pub mod workspace_symbol;

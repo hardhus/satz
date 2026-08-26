@@ -1,4 +1,5 @@
 pub mod config;
+pub mod formatter;
 pub mod index;
 pub mod model;
 pub mod parser;

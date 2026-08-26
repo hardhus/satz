@@ -149,6 +149,22 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(false),
                     work_done_progress_options: Default::default(),
                 }),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: Default::default(),
+                            legend: crate::handlers::semantic_tokens::semantic_tokens_legend(),
+                            range: None,
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
 
@@ -287,5 +303,43 @@ impl LanguageServer for Backend {
         Ok(crate::handlers::document_link::document_link(
             params, &state,
         ))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> jsonrpc::Result<Option<Vec<FoldingRange>>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::folding_range::folding_range(
+            params, &state,
+        ))
+    }
+
+    async fn code_lens(&self, params: CodeLensParams) -> jsonrpc::Result<Option<Vec<CodeLens>>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::codelens::code_lens(params, &state))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> jsonrpc::Result<Option<Vec<InlayHint>>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::inlay_hint::inlay_hint(params, &state))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::semantic_tokens::semantic_tokens_full(
+            params, &state,
+        ))
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
+        let state = self.state.read().await;
+        Ok(crate::handlers::formatting::formatting(params, &state))
     }
 }
