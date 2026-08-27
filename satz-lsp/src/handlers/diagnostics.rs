@@ -18,9 +18,7 @@ pub fn compute_diagnostics(
                 if link.target_doc.is_empty() {
                     // Intra-document heading reference
                     if let Some(heading_target) = &link.target_heading {
-                        let heading_exists = doc.headings.iter().any(|h| {
-                            h.slug == *heading_target || h.text.eq_ignore_ascii_case(heading_target)
-                        });
+                        let heading_exists = doc.headings.iter().any(|h| h.matches(heading_target));
                         if !heading_exists {
                             let range = byte_range_to_lsp(link.range, &doc.line_index);
                             diagnostics.push(lsp::Diagnostic {
@@ -135,9 +133,10 @@ fn diagnose_wikilink(link: &Link, index: &Index, doc: &Document, out: &mut Vec<l
             if let (Some(heading_target), Some(target_doc)) =
                 (&link.target_heading, index.get_doc(target_id))
             {
-                let heading_exists = target_doc.headings.iter().any(|h| {
-                    h.slug == *heading_target || h.text.eq_ignore_ascii_case(heading_target)
-                });
+                let heading_exists = target_doc
+                    .headings
+                    .iter()
+                    .any(|h| h.matches(heading_target));
                 if !heading_exists {
                     out.push(lsp::Diagnostic {
                         range,
@@ -179,6 +178,8 @@ fn is_missing_frontmatter_field(frontmatter: &Frontmatter, field: &str) -> bool 
     match field {
         "title" => frontmatter.title.is_none(),
         "date" => frontmatter.date.is_none(),
+        "tags" => frontmatter.tags.is_empty(),
+        "aliases" | "alias" => frontmatter.aliases.is_empty(),
         other => !frontmatter.extra.contains_key(other),
     }
 }
@@ -323,9 +324,31 @@ mod tests {
         let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
         let index = Index::build(vec![doc_a.clone(), doc_b]);
         let mut config = VaultConfig::default();
-        config.frontmatter.required_fields = vec!["date".to_string(), "author".to_string()];
+        config.frontmatter.required_fields = vec![
+            "date".to_string(),
+            "author".to_string(),
+            "tags".to_string(),
+            "aliases".to_string(),
+        ];
 
         let diagnostics = compute_diagnostics(&doc_a, &index, &config);
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 4);
+    }
+
+    #[test]
+    fn test_turkish_heading_ref_diagnostic_resolved() {
+        let doc_a = parse_document(
+            "# Doc A\n\n[[doc-b#Günün Özeti]]\n[[doc-b#günün özeti]]",
+            Path::new("doc-a.md"),
+        );
+        let doc_b = parse_document(
+            "# Doc B\n\n[[doc-a]]\n## Günün Özeti",
+            Path::new("doc-b.md"),
+        );
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
+        let config = VaultConfig::default();
+
+        let diagnostics = compute_diagnostics(&doc_a, &index, &config);
+        assert!(diagnostics.is_empty());
     }
 }

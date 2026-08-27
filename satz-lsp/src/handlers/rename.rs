@@ -99,9 +99,11 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> 
             };
             let target_doc = state.index.get_doc(target_id)?;
 
-            if let Some(h) = target_doc.headings.iter().find(|h| {
-                h.slug == *target_heading_str || h.text.eq_ignore_ascii_case(target_heading_str)
-            }) {
+            if let Some(h) = target_doc
+                .headings
+                .iter()
+                .find(|h| h.matches(target_heading_str))
+            {
                 let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
                 // Update heading definition in target document

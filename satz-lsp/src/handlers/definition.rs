@@ -64,11 +64,7 @@ pub fn goto_definition(
 
     // If there's a heading target, find its range
     if let Some(heading_slug) = &link.target_heading {
-        if let Some(h) = target_doc
-            .headings
-            .iter()
-            .find(|h| h.slug == *heading_slug || h.text.eq_ignore_ascii_case(heading_slug))
-        {
+        if let Some(h) = target_doc.headings.iter().find(|h| h.matches(heading_slug)) {
             target_range = byte_range_to_lsp(h.range, &target_doc.line_index);
         }
     } else if let Some(block_id) = &link.target_block {

@@ -57,11 +57,7 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
     // If there's a heading target, start preview from that heading
     let mut preview_start = 0;
     if let Some(heading_slug) = &link.target_heading {
-        if let Some(h) = target_doc
-            .headings
-            .iter()
-            .find(|h| h.slug == *heading_slug || h.text.eq_ignore_ascii_case(heading_slug))
-        {
+        if let Some(h) = target_doc.headings.iter().find(|h| h.matches(heading_slug)) {
             preview_start = h.range.start;
             value.push_str(&format!("*Jump to: {}*\n\n", h.text.trim()));
         }

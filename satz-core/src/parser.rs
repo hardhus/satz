@@ -34,7 +34,11 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         .and_then(|y| frontmatter::parse_frontmatter(y).ok())
         .unwrap_or_default();
 
-    let inline = inline_scan::scan_inline(source, &structure.code_spans);
+    let mut code_spans = structure.code_spans.clone();
+    if let Some(fm_range) = structure.frontmatter_range {
+        code_spans.push(fm_range);
+    }
+    let inline = inline_scan::scan_inline(source, &code_spans);
 
     // Frontmatter tags + body tags
     let fm_range = structure.frontmatter_range.unwrap_or(ByteRange::new(0, 0));

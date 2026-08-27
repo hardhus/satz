@@ -11,9 +11,14 @@ pub fn slugify(text: &str) -> String {
     let mut prev_is_dash = false;
 
     for c in text.chars() {
-        if c.is_alphanumeric() {
+        if c == 'İ' {
+            slug.push('i');
+            prev_is_dash = false;
+        } else if c.is_alphanumeric() {
             for lc in c.to_lowercase() {
-                slug.push(lc);
+                if lc != '\u{0307}' {
+                    slug.push(lc);
+                }
             }
             prev_is_dash = false;
         } else if !prev_is_dash && !slug.is_empty() {
@@ -28,6 +33,11 @@ pub fn slugify(text: &str) -> String {
     }
 
     slug
+}
+
+/// Checks if a link heading target (raw text or slug) matches a heading.
+pub fn heading_matches(link_heading: &str, h: &crate::model::Heading) -> bool {
+    h.matches(link_heading)
 }
 
 #[cfg(test)]

@@ -63,8 +63,10 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                     // Intra-document links inside doc itself
                     if src_id == &doc_id {
                         if let Some(h) = target_heading {
-                            if link.target_heading.as_deref() == Some(&h.slug)
-                                || link.target_heading.as_deref() == Some(&h.text)
+                            if link
+                                .target_heading
+                                .as_deref()
+                                .is_some_and(|th| h.matches(th))
                             {
                                 let src_path = match &state.vault_root {
                                     Some(root) if !src_doc.path.is_absolute() => {
@@ -87,8 +89,9 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                 // If link points to doc_id
                 if state.index.resolve_link(&link.target_doc) == Some(&doc_id) {
                     let matches = if let Some(h) = target_heading {
-                        link.target_heading.as_deref() == Some(&h.slug)
-                            || link.target_heading.as_deref() == Some(&h.text)
+                        link.target_heading
+                            .as_deref()
+                            .is_some_and(|th| h.matches(th))
                     } else {
                         // Just point to the document itself, include all links to the document
                         true

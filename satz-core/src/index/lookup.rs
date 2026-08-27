@@ -8,6 +8,7 @@ use crate::model::{DocId, Document, Link, LinkKind};
 pub struct Index {
     pub(crate) docs: HashMap<DocId, Document>,
     pub(crate) by_path: HashMap<PathBuf, DocId>,
+    pub(crate) by_stem: HashMap<String, DocId>,
     pub(crate) by_title_alias: HashMap<String, DocId>,
     pub(crate) backlinks: HashMap<DocId, HashSet<DocId>>,
     pub(crate) tags: HashMap<String, HashSet<DocId>>,
@@ -40,7 +41,8 @@ impl Index {
     /// Priority:
     /// 1. Exact path match (`by_path`)
     /// 2. Path with `.md` extension appended (`by_path`)
-    /// 3. Lowercase title or alias match (`by_title_alias`)
+    /// 3. Stem match (`by_stem`)
+    /// 4. Lowercase title or alias match (`by_title_alias`)
     pub fn resolve_link(&self, raw_target: &str) -> Option<&DocId> {
         let normalized = raw_target.replace('\\', "/");
         let as_path = PathBuf::from(&normalized);
@@ -51,6 +53,13 @@ impl Index {
         let with_ext = PathBuf::from(format!("{}.md", normalized));
         if let Some(id) = self.by_path.get(&with_ext) {
             return Some(id);
+        }
+
+        if let Some(stem) = as_path.file_stem().and_then(|s| s.to_str()) {
+            let stem_lower = stem.to_lowercase();
+            if let Some(id) = self.by_stem.get(&stem_lower) {
+                return Some(id);
+            }
         }
 
         self.by_title_alias.get(&raw_target.to_lowercase())
@@ -149,6 +158,17 @@ impl Index {
                 }
             }
 
+            // Remove old stem
+            let old_stem_key = old_doc
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !old_stem_key.is_empty() && self.by_stem.get(&old_stem_key) == Some(&id) {
+                self.by_stem.remove(&old_stem_key);
+            }
+
             // Remove old path
             let old_normalized = PathBuf::from(old_doc.path.to_string_lossy().replace('\\', "/"));
             if self.by_path.get(&old_normalized) == Some(&id) {
@@ -181,6 +201,24 @@ impl Index {
         let normalized_path = PathBuf::from(new_doc.path.to_string_lossy().replace('\\', "/"));
         self.by_path.insert(normalized_path, id.clone());
         self.by_path.insert(new_doc.path.clone(), id.clone());
+
+        // Insert new stem
+        let new_stem_key = new_doc
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !new_stem_key.is_empty() {
+            match self.by_stem.entry(new_stem_key) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    tracing::warn!("stem conflict: '{}' (keeping first entry)", e.key());
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(id.clone());
+                }
+            }
+        }
 
         // Insert new title and aliases
         let title_key = new_doc.title.to_lowercase();
@@ -238,6 +276,16 @@ impl Index {
                 if self.by_title_alias.get(&alias_key) == Some(id) {
                     self.by_title_alias.remove(&alias_key);
                 }
+            }
+
+            let old_stem_key = old_doc
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !old_stem_key.is_empty() && self.by_stem.get(&old_stem_key) == Some(id) {
+                self.by_stem.remove(&old_stem_key);
             }
 
             let old_normalized = PathBuf::from(old_doc.path.to_string_lossy().replace('\\', "/"));

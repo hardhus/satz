@@ -18,8 +18,29 @@ impl Index {
             index.by_path.insert(normalized_path, doc.id.clone());
             index.by_path.insert(doc.path.clone(), doc.id.clone());
 
+            let stem_key = doc
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !stem_key.is_empty() {
+                match index.by_stem.entry(stem_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        tracing::warn!("stem conflict: '{}' (keeping first entry)", e.key());
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(doc.id.clone());
+                    }
+                }
+            }
+
             let title_key = doc.title.to_lowercase();
-            if index.by_title_alias.contains_key(&title_key) {
+            if index
+                .by_title_alias
+                .get(&title_key)
+                .is_some_and(|id| id != &doc.id)
+            {
                 tracing::warn!(
                     "title conflict: '{}' (overwriting previous entry)",
                     title_key
@@ -29,7 +50,11 @@ impl Index {
 
             for alias in &doc.frontmatter.aliases {
                 let alias_key = alias.to_lowercase();
-                if index.by_title_alias.contains_key(&alias_key) {
+                if index
+                    .by_title_alias
+                    .get(&alias_key)
+                    .is_some_and(|id| id != &doc.id)
+                {
                     tracing::warn!(
                         "alias conflict: '{}' (overwriting previous entry)",
                         alias_key

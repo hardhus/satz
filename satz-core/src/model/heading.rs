@@ -17,4 +17,9 @@ impl Heading {
             range,
         }
     }
+
+    /// Checks if a link heading target (raw text or slug) matches this heading.
+    pub fn matches(&self, link_heading: &str) -> bool {
+        self.slug == link_heading || self.slug == crate::slug::slugify(link_heading)
+    }
 }
