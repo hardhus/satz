@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tower_lsp_server::jsonrpc;
+use tower_lsp_server::ls_types::request::WorkspaceDiagnosticRefresh;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -16,6 +17,37 @@ pub struct Backend {
     pub state: Arc<RwLock<SatzState>>,
 }
 
+/// Computes diagnostics for the specified open document URI and sends them to the client.
+pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>, uri: &str) {
+    let (diagnostics, uri_obj) = {
+        let state_guard = state.read().await;
+
+        if state_guard.client_supports_pull_diagnostics {
+            return;
+        }
+
+        let Some(open_doc) = state_guard.open_docs.get(uri) else {
+            return;
+        };
+        let rel_path = SatzState::get_rel_path(&open_doc.path, state_guard.vault_root.as_deref());
+        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+        let doc_id = satz_core::DocId::new(&rel_path_str);
+
+        let Some(doc) = state_guard.index.get_doc(&doc_id) else {
+            return;
+        };
+
+        let diags = compute_diagnostics(doc, &state_guard.index, &state_guard.config);
+        let uri_obj = match uri.parse::<Uri>() {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        (diags, uri_obj)
+    };
+
+    client.publish_diagnostics(uri_obj, diagnostics, None).await;
+}
+
 impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
@@ -24,37 +56,8 @@ impl Backend {
         }
     }
 
-    /// Computes diagnostics for the specified open document URI and sends them to the client.
     async fn publish_diagnostics_for_uri(&self, uri: &str) {
-        let (diagnostics, uri_obj) = {
-            let state = self.state.read().await;
-
-            if state.client_supports_pull_diagnostics {
-                return;
-            }
-
-            let Some(open_doc) = state.open_docs.get(uri) else {
-                return;
-            };
-            let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-            let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-            let doc_id = satz_core::DocId::new(&rel_path_str);
-
-            let Some(doc) = state.index.get_doc(&doc_id) else {
-                return;
-            };
-
-            let diags = compute_diagnostics(doc, &state.index, &state.config);
-            let uri_obj = match uri.parse::<Uri>() {
-                Ok(u) => u,
-                Err(_) => return,
-            };
-            (diags, uri_obj)
-        };
-
-        self.client
-            .publish_diagnostics(uri_obj, diagnostics, None)
-            .await;
+        publish_for(&self.client, &self.state, uri).await;
     }
 }
 
@@ -120,7 +123,7 @@ impl LanguageServer for Backend {
                             *current_state = new_state;
                         }
 
-                        crate::watcher::spawn_watcher(root_clone, state_arc);
+                        crate::watcher::spawn_watcher(root_clone, state_arc.clone(), client.clone());
                         client
                             .log_message(
                                 MessageType::INFO,
@@ -130,6 +133,24 @@ impl LanguageServer for Backend {
                                 ),
                             )
                             .await;
+
+                        let (supports_pull, uris) = {
+                            let s = state_arc.read().await;
+                            (
+                                s.client_supports_pull_diagnostics,
+                                s.open_docs.keys().cloned().collect::<Vec<_>>(),
+                            )
+                        };
+
+                        if supports_pull {
+                            let _ = client
+                                .send_request::<WorkspaceDiagnosticRefresh>(())
+                                .await;
+                        } else {
+                            for uri in uris {
+                                publish_for(&client, &state_arc, &uri).await;
+                            }
+                        }
                     }
                     Ok(Err(e)) => {
                         client

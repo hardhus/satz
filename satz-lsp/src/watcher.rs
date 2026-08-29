@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{mpsc, RwLock};
+use tower_lsp_server::ls_types::request::WorkspaceDiagnosticRefresh;
+use tower_lsp_server::Client;
 
 use crate::state::SatzState;
 
 /// Spawns a background task that watches `vault_root` for `.md` file changes.
-pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>) {
+pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client: Client) {
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
 
     // 1. Setup notify watcher
@@ -75,7 +77,7 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>) {
 
                     for path in ready_paths {
                         pending.remove(&path);
-                        process_file_event(&path, &vault_root, &state).await;
+                        process_file_event(&path, &vault_root, &state, &client).await;
                     }
                 }
             }
@@ -83,7 +85,12 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>) {
     });
 }
 
-async fn process_file_event(path: &Path, vault_root: &Path, state: &Arc<RwLock<SatzState>>) {
+async fn process_file_event(
+    path: &Path,
+    vault_root: &Path,
+    state: &Arc<RwLock<SatzState>>,
+    client: &Client,
+) {
     let rel_path = crate::state::SatzState::get_rel_path(path, Some(vault_root));
     let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
     let doc_id = satz_core::DocId::new(&rel_path_str);
@@ -106,6 +113,24 @@ async fn process_file_event(path: &Path, vault_root: &Path, state: &Arc<RwLock<S
             let mut s = state.write().await;
             s.index.replace_doc(new_doc);
             tracing::info!("Watcher: re-indexed {}", doc_id);
+        }
+    }
+
+    let (supports_pull, uris) = {
+        let s = state.read().await;
+        (
+            s.client_supports_pull_diagnostics,
+            s.open_docs.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+
+    if supports_pull {
+        let _ = client
+            .send_request::<WorkspaceDiagnosticRefresh>(())
+            .await;
+    } else {
+        for uri in uris {
+            crate::backend::publish_for(client, state, &uri).await;
         }
     }
 }
