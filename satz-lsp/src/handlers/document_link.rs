@@ -37,28 +37,26 @@ pub fn document_link(params: DocumentLinkParams, state: &SatzState) -> Option<Ve
             l.kind,
             LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
         ) {
-            let target_id = if l.target_doc.is_empty() {
-                &doc_id
-            } else if let Some(resolved) = state.index.resolve_link(&l.target_doc) {
-                resolved
-            } else {
-                continue;
-            };
-
-            if let Some(target_doc) = state.index.get_doc(target_id) {
-                let target_path = match &state.vault_root {
-                    Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
-                    _ => target_doc.path.clone(),
-                };
-
-                if let Some(url) = path_to_uri(&target_path) {
-                    links.push(DocumentLink {
-                        range,
-                        target: Some(url),
-                        tooltip: Some(format!("Go to {}", target_doc.title)),
-                        data: None,
-                    });
+            match state.index.resolve_link_full(l, Some(doc)) {
+                satz_core::LinkResolution::Resolved {
+                    doc: target_doc, ..
                 }
+                | satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
+                    let target_path = match &state.vault_root {
+                        Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
+                        _ => target_doc.path.clone(),
+                    };
+
+                    if let Some(url) = path_to_uri(&target_path) {
+                        links.push(DocumentLink {
+                            range,
+                            target: Some(url),
+                            tooltip: Some(format!("Go to {}", target_doc.title)),
+                            data: None,
+                        });
+                    }
+                }
+                satz_core::LinkResolution::DocMissing => {}
             }
         }
     }

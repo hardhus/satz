@@ -78,7 +78,6 @@ impl Index {
 
         // Pass 2: Resolve links and compute incoming backlinks and broken links
         let all_ids: Vec<_> = index.docs.keys().cloned().collect();
-        let mut broken = 0usize;
 
         for src_id in &all_ids {
             let doc = &index.docs[src_id];
@@ -97,8 +96,6 @@ impl Index {
                                 .entry(target_id)
                                 .or_default()
                                 .insert(src_id.clone());
-                        } else {
-                            broken += 1;
                         }
                     }
                     LinkKind::Markdown => {
@@ -119,8 +116,6 @@ impl Index {
                                 .entry(target_id)
                                 .or_default()
                                 .insert(src_id.clone());
-                        } else {
-                            broken += 1;
                         }
                     }
                     LinkKind::Footnote => {}
@@ -128,7 +123,6 @@ impl Index {
             }
         }
 
-        index.broken_link_count = broken;
         index
     }
 }

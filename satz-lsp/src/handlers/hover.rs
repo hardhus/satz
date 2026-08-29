@@ -43,22 +43,38 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
         return None;
     }
 
-    let target_id = if link.target_doc.is_empty() {
-        &doc_id
-    } else {
-        state.index.resolve_link(&link.target_doc)?
-    };
+    let (target_doc, preview_start, jump_title) =
+        match state.index.resolve_link_full(link, Some(doc)) {
+            satz_core::LinkResolution::Resolved {
+                doc: target_doc,
+                anchor,
+            } => {
+                let (start, title) = if let Some(r) = anchor {
+                    let text = target_doc
+                        .headings
+                        .iter()
+                        .find(|h| h.range == r)
+                        .map(|h| h.text.trim().to_string())
+                        .or_else(|| {
+                            target_doc
+                                .blocks
+                                .iter()
+                                .find(|b| b.range == r)
+                                .map(|b| format!("^{}", b.id))
+                        });
+                    (r.start, text)
+                } else {
+                    (0, None)
+                };
+                (target_doc, start, title)
+            }
+            satz_core::LinkResolution::AnchorMissing { doc: target_doc } => (target_doc, 0, None),
+            satz_core::LinkResolution::DocMissing => return None,
+        };
 
-    let target_doc = state.index.get_doc(target_id)?;
     let mut value = format!("# {}\n\n", target_doc.title);
-
-    // If there's a heading target, start preview from that heading
-    let mut preview_start = 0;
-    if let Some(heading_slug) = &link.target_heading {
-        if let Some(h) = target_doc.headings.iter().find(|h| h.matches(heading_slug)) {
-            preview_start = h.range.start;
-            value.push_str(&format!("*Jump to: {}*\n\n", h.text.trim()));
-        }
+    if let Some(title) = jump_title {
+        value.push_str(&format!("*Jump to: {}*\n\n", title));
     }
 
     let source = target_doc.line_index.source();

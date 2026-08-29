@@ -4,7 +4,7 @@ pub mod lookup;
 use crate::model::DocId;
 use std::path::Path;
 
-pub use lookup::{Index, IndexStats};
+pub use lookup::{Index, IndexStats, LinkResolution};
 
 /// Document identity and resolution scheme.
 pub trait IdScheme: Send + Sync {

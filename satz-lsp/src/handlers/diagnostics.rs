@@ -1,4 +1,4 @@
-use satz_core::{Document, Frontmatter, Index, Link, LinkKind, VaultConfig};
+use satz_core::{Document, Frontmatter, Index, LinkKind, VaultConfig};
 use tower_lsp_server::ls_types as lsp;
 
 use crate::convert::byte_range_to_lsp;
@@ -15,30 +15,67 @@ pub fn compute_diagnostics(
     for link in &doc.links {
         match link.kind {
             LinkKind::WikiLink | LinkKind::Embed => {
-                if link.target_doc.is_empty() {
-                    // Intra-document heading reference
-                    if let Some(heading_target) = &link.target_heading {
-                        let heading_exists = doc.headings.iter().any(|h| h.matches(heading_target));
-                        if !heading_exists {
-                            let range = byte_range_to_lsp(link.range, &doc.line_index);
-                            diagnostics.push(lsp::Diagnostic {
-                                range,
-                                severity: Some(lsp::DiagnosticSeverity::WARNING),
-                                code: Some(lsp::NumberOrString::String(
-                                    "broken-heading".to_string(),
-                                )),
-                                source: Some("satz".to_string()),
-                                message: format!(
-                                    "Broken heading reference: no heading '{}' in current document",
-                                    heading_target
-                                ),
-                                ..Default::default()
-                            });
-                        }
+                let range = byte_range_to_lsp(link.range, &doc.line_index);
+                match index.resolve_link_full(link, Some(doc)) {
+                    satz_core::LinkResolution::DocMissing => {
+                        let code = if link.kind == LinkKind::Embed {
+                            "broken-embed"
+                        } else {
+                            "broken-link"
+                        };
+                        let message = if link.kind == LinkKind::Embed {
+                            format!("Broken embed: '{}' could not be resolved", link.target_doc)
+                        } else {
+                            format!("Broken link: '{}' could not be resolved", link.target_doc)
+                        };
+                        diagnostics.push(lsp::Diagnostic {
+                            range,
+                            severity: Some(lsp::DiagnosticSeverity::WARNING),
+                            code: Some(lsp::NumberOrString::String(code.to_string())),
+                            source: Some("satz".to_string()),
+                            message,
+                            ..Default::default()
+                        });
                     }
-                    continue;
+                    satz_core::LinkResolution::AnchorMissing { .. } => {
+                        let message = if let Some(h) = &link.target_heading {
+                            if link.target_doc.is_empty() {
+                                format!(
+                                    "Broken heading reference: no heading '{}' in current document",
+                                    h
+                                )
+                            } else {
+                                format!(
+                                    "Broken heading reference: '{}' has no heading '{}'",
+                                    link.target_doc, h
+                                )
+                            }
+                        } else if let Some(b) = &link.target_block {
+                            if link.target_doc.is_empty() {
+                                format!(
+                                    "Broken block reference: no block '^{}' in current document",
+                                    b
+                                )
+                            } else {
+                                format!(
+                                    "Broken block reference: '{}' has no block '^{}'",
+                                    link.target_doc, b
+                                )
+                            }
+                        } else {
+                            "Broken reference".to_string()
+                        };
+                        diagnostics.push(lsp::Diagnostic {
+                            range,
+                            severity: Some(lsp::DiagnosticSeverity::WARNING),
+                            code: Some(lsp::NumberOrString::String("broken-heading".to_string())),
+                            source: Some("satz".to_string()),
+                            message,
+                            ..Default::default()
+                        });
+                    }
+                    satz_core::LinkResolution::Resolved { .. } => {}
                 }
-                diagnose_wikilink(link, index, doc, &mut diagnostics);
             }
             LinkKind::Markdown => {
                 if link.target_doc.starts_with("http://")
@@ -47,7 +84,23 @@ pub fn compute_diagnostics(
                 {
                     continue;
                 }
-                diagnose_internal_md_link(link, index, doc, &mut diagnostics);
+                let range = byte_range_to_lsp(link.range, &doc.line_index);
+                if matches!(
+                    index.resolve_link_full(link, Some(doc)),
+                    satz_core::LinkResolution::DocMissing
+                ) {
+                    diagnostics.push(lsp::Diagnostic {
+                        range,
+                        severity: Some(lsp::DiagnosticSeverity::WARNING),
+                        code: Some(lsp::NumberOrString::String("broken-link".to_string())),
+                        source: Some("satz".to_string()),
+                        message: format!(
+                            "Broken link: '{}' could not be resolved",
+                            link.target_doc
+                        ),
+                        ..Default::default()
+                    });
+                }
             }
             LinkKind::Footnote => {}
         }
@@ -107,75 +160,6 @@ pub fn compute_diagnostics(
     }
 
     diagnostics
-}
-
-fn diagnose_wikilink(link: &Link, index: &Index, doc: &Document, out: &mut Vec<lsp::Diagnostic>) {
-    let range = byte_range_to_lsp(link.range, &doc.line_index);
-
-    match index.resolve_link(&link.target_doc) {
-        None => {
-            let code = if link.kind == LinkKind::Embed {
-                "broken-embed"
-            } else {
-                "broken-link"
-            };
-            let message = if link.kind == LinkKind::Embed {
-                format!("Broken embed: '{}' could not be resolved", link.target_doc)
-            } else {
-                format!("Broken link: '{}' could not be resolved", link.target_doc)
-            };
-            out.push(lsp::Diagnostic {
-                range,
-                severity: Some(lsp::DiagnosticSeverity::WARNING),
-                code: Some(lsp::NumberOrString::String(code.to_string())),
-                source: Some("satz".to_string()),
-                message,
-                ..Default::default()
-            });
-        }
-        Some(target_id) => {
-            if let (Some(heading_target), Some(target_doc)) =
-                (&link.target_heading, index.get_doc(target_id))
-            {
-                let heading_exists = target_doc
-                    .headings
-                    .iter()
-                    .any(|h| h.matches(heading_target));
-                if !heading_exists {
-                    out.push(lsp::Diagnostic {
-                        range,
-                        severity: Some(lsp::DiagnosticSeverity::WARNING),
-                        code: Some(lsp::NumberOrString::String("broken-heading".to_string())),
-                        source: Some("satz".to_string()),
-                        message: format!(
-                            "Broken heading reference: '{}' has no heading '{}'",
-                            link.target_doc, heading_target
-                        ),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-}
-
-fn diagnose_internal_md_link(
-    link: &Link,
-    index: &Index,
-    doc: &Document,
-    out: &mut Vec<lsp::Diagnostic>,
-) {
-    if index.resolve_link(&link.target_doc).is_none() {
-        let range = byte_range_to_lsp(link.range, &doc.line_index);
-        out.push(lsp::Diagnostic {
-            range,
-            severity: Some(lsp::DiagnosticSeverity::WARNING),
-            code: Some(lsp::NumberOrString::String("broken-link".to_string())),
-            source: Some("satz".to_string()),
-            message: format!("Broken link: '{}' could not be resolved", link.target_doc),
-            ..Default::default()
-        });
-    }
 }
 
 fn is_missing_frontmatter_field(frontmatter: &Frontmatter, field: &str) -> bool {

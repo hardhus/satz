@@ -32,25 +32,24 @@ pub fn inlay_hint(params: InlayHintParams, state: &SatzState) -> Option<Vec<Inla
                 let range = byte_range_to_lsp(link.range, &doc.line_index);
                 let position = range.end;
 
-                let label_text = match state.index.resolve_link(&link.target_doc) {
-                    Some(target_id) => {
-                        if let Some(target_doc) = state.index.get_doc(target_id) {
-                            if !target_doc.tags.is_empty() {
-                                let tag_str: Vec<String> = target_doc
-                                    .tags
-                                    .iter()
-                                    .take(3)
-                                    .map(|t| format!("#{}", t.name.trim_start_matches('#')))
-                                    .collect();
-                                format!(" {}", tag_str.join(" "))
-                            } else {
-                                format!(" ({})", target_doc.title)
-                            }
+                let label_text = match state.index.resolve_link_full(link, Some(doc)) {
+                    satz_core::LinkResolution::Resolved {
+                        doc: target_doc, ..
+                    }
+                    | satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
+                        if !target_doc.tags.is_empty() {
+                            let tag_str: Vec<String> = target_doc
+                                .tags
+                                .iter()
+                                .take(3)
+                                .map(|t| format!("#{}", t.name.trim_start_matches('#')))
+                                .collect();
+                            format!(" {}", tag_str.join(" "))
                         } else {
-                            " ⚠ not found".to_string()
+                            format!(" ({})", target_doc.title)
                         }
                     }
-                    None => " ⚠ not found".to_string(),
+                    satz_core::LinkResolution::DocMissing => " ⚠ not found".to_string(),
                 };
 
                 hints.push(InlayHint {

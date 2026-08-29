@@ -4,6 +4,20 @@ use std::path::{Path, PathBuf};
 use crate::model::{DocId, Document, Link, LinkKind};
 use crate::slug::fold_key;
 
+/// Result of resolving a link against the index.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkResolution<'a> {
+    /// The target document exists and the requested anchor (heading or block) was found (or no anchor was requested).
+    Resolved {
+        doc: &'a Document,
+        anchor: Option<crate::model::range::ByteRange>,
+    },
+    /// The target document exists, but the specified heading or block anchor was not found.
+    AnchorMissing { doc: &'a Document },
+    /// The target document could not be resolved.
+    DocMissing,
+}
+
 /// In-memory vault index.
 #[derive(Debug, Default)]
 pub struct Index {
@@ -13,7 +27,6 @@ pub struct Index {
     pub(crate) by_title_alias: HashMap<String, DocId>,
     pub(crate) backlinks: HashMap<DocId, HashSet<DocId>>,
     pub(crate) tags: HashMap<String, HashSet<DocId>>,
-    pub(crate) broken_link_count: usize,
 }
 
 impl Index {
@@ -32,9 +45,11 @@ impl Index {
         self.docs.values().map(|d| d.links.len()).sum()
     }
 
-    /// Total number of broken internal links (calculated at index build time).
+    /// Total number of broken internal links (calculated on demand).
     pub fn broken_link_count(&self) -> usize {
-        self.broken_link_count
+        self.docs_with_broken_links()
+            .map(|(_, links)| links.len())
+            .sum()
     }
 
     /// Resolves a raw link target (e.g. `"file"`, `"folder/file"`, or alias/title) to a `DocId`.
@@ -64,6 +79,52 @@ impl Index {
         }
 
         self.by_title_alias.get(&fold_key(raw_target))
+    }
+
+    /// Fully resolves a `Link` against the index, checking both document existence and heading/block anchors.
+    pub fn resolve_link_full<'a>(
+        &'a self,
+        link: &Link,
+        current_doc: Option<&'a Document>,
+    ) -> LinkResolution<'a> {
+        let target_doc = if link.target_doc.is_empty() {
+            match current_doc {
+                Some(d) => d,
+                None => return LinkResolution::DocMissing,
+            }
+        } else if let Some(target_id) = self.resolve_link(&link.target_doc) {
+            match self.get_doc(target_id) {
+                Some(d) => d,
+                None => return LinkResolution::DocMissing,
+            }
+        } else {
+            return LinkResolution::DocMissing;
+        };
+
+        if let Some(block_id) = &link.target_block {
+            if let Some(b) = target_doc.blocks.iter().find(|b| &b.id == block_id) {
+                LinkResolution::Resolved {
+                    doc: target_doc,
+                    anchor: Some(b.range),
+                }
+            } else {
+                LinkResolution::AnchorMissing { doc: target_doc }
+            }
+        } else if let Some(heading_ref) = &link.target_heading {
+            if let Some(h) = target_doc.headings.iter().find(|h| h.matches(heading_ref)) {
+                LinkResolution::Resolved {
+                    doc: target_doc,
+                    anchor: Some(h.range),
+                }
+            } else {
+                LinkResolution::AnchorMissing { doc: target_doc }
+            }
+        } else {
+            LinkResolution::Resolved {
+                doc: target_doc,
+                anchor: None,
+            }
+        }
     }
 
     /// Retrieves a document by its `DocId`.
@@ -114,13 +175,19 @@ impl Index {
                 .links
                 .iter()
                 .filter(|l| {
-                    matches!(
+                    if matches!(
                         l.kind,
                         LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-                    ) && !l.target_doc.is_empty()
-                        && !l.target_doc.starts_with("http://")
+                    ) && !l.target_doc.starts_with("http://")
                         && !l.target_doc.starts_with("https://")
-                        && self.resolve_link(&l.target_doc).is_none()
+                    {
+                        matches!(
+                            self.resolve_link_full(l, Some(doc)),
+                            LinkResolution::DocMissing | LinkResolution::AnchorMissing { .. }
+                        )
+                    } else {
+                        false
+                    }
                 })
                 .collect();
             if broken.is_empty() {
@@ -349,7 +416,7 @@ impl Index {
         IndexStats {
             doc_count: self.doc_count(),
             total_links: self.total_links(),
-            broken_links: self.broken_link_count,
+            broken_links: self.broken_link_count(),
             unique_tags: self.tags.len(),
             orphan_docs: self.orphan_docs().count(),
             total_headings,

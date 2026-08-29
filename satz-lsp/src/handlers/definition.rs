@@ -40,40 +40,45 @@ pub fn goto_definition(
         return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
     }
 
-    // Resolve target document
-    let target_id = if link.target_doc.is_empty() {
-        &doc_id
-    } else {
-        state.index.resolve_link(&link.target_doc)?
-    };
-
-    let target_doc = state.index.get_doc(target_id)?;
-    let target_path = match &state.vault_root {
-        Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
-        _ => target_doc.path.clone(),
-    };
-    let target_uri = path_to_uri(&target_path)?;
-
-    let mut target_range = Range {
-        start: tower_lsp_server::ls_types::Position::new(0, 0),
-        end: tower_lsp_server::ls_types::Position::new(0, 0),
-    };
-
-    // If there's a heading target, find its range
-    if let Some(heading_slug) = &link.target_heading {
-        if let Some(h) = target_doc.headings.iter().find(|h| h.matches(heading_slug)) {
-            target_range = byte_range_to_lsp(h.range, &target_doc.line_index);
+    match state.index.resolve_link_full(link, Some(doc)) {
+        satz_core::LinkResolution::Resolved {
+            doc: target_doc,
+            anchor,
+        } => {
+            let target_path = match &state.vault_root {
+                Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
+                _ => target_doc.path.clone(),
+            };
+            let target_uri = path_to_uri(&target_path)?;
+            let target_range = if let Some(r) = anchor {
+                byte_range_to_lsp(r, &target_doc.line_index)
+            } else {
+                Range {
+                    start: tower_lsp_server::ls_types::Position::new(0, 0),
+                    end: tower_lsp_server::ls_types::Position::new(0, 0),
+                }
+            };
+            Some(GotoDefinitionResponse::Scalar(Location::new(
+                target_uri,
+                target_range,
+            )))
         }
-    } else if let Some(block_id) = &link.target_block {
-        if let Some(b) = target_doc.blocks.iter().find(|b| b.id == *block_id) {
-            target_range = byte_range_to_lsp(b.range, &target_doc.line_index);
+        satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
+            let target_path = match &state.vault_root {
+                Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
+                _ => target_doc.path.clone(),
+            };
+            let target_uri = path_to_uri(&target_path)?;
+            Some(GotoDefinitionResponse::Scalar(Location::new(
+                target_uri,
+                Range {
+                    start: tower_lsp_server::ls_types::Position::new(0, 0),
+                    end: tower_lsp_server::ls_types::Position::new(0, 0),
+                },
+            )))
         }
+        satz_core::LinkResolution::DocMissing => None,
     }
-
-    Some(GotoDefinitionResponse::Scalar(Location::new(
-        target_uri,
-        target_range,
-    )))
 }
 
 #[cfg(test)]
