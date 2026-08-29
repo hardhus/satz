@@ -4,6 +4,7 @@ pub mod index;
 pub mod model;
 pub mod parser;
 pub mod slug;
+pub mod template;
 pub mod text;
 pub mod walk;
 
@@ -20,6 +21,7 @@ pub use model::{
 };
 pub use parser::parse_document;
 pub use slug::{fold_key, heading_matches, slugify};
+pub use template::{generate_document_template, generate_frontmatter_block};
 pub use text::{LineIndex, Position};
 pub use walk::walk_vault;
 

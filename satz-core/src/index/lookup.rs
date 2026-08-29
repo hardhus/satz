@@ -186,25 +186,32 @@ impl Index {
         tags
     }
 
-    /// Returns an iterator of documents containing broken internal links, along with the broken link items.
-    pub fn docs_with_broken_links(&self) -> impl Iterator<Item = (&Document, Vec<&Link>)> {
+    /// Returns an iterator of documents containing broken internal links, along with the broken link items and resolution status.
+    pub fn docs_with_broken_links(
+        &self,
+    ) -> impl Iterator<Item = (&Document, Vec<(&Link, LinkResolution<'_>)>)> {
         self.docs.values().filter_map(|doc| {
-            let broken: Vec<&Link> = doc
+            let broken: Vec<(&Link, LinkResolution)> = doc
                 .links
                 .iter()
-                .filter(|l| {
+                .filter_map(|l| {
                     if matches!(
                         l.kind,
                         LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
                     ) && !l.target_doc.starts_with("http://")
                         && !l.target_doc.starts_with("https://")
                     {
-                        matches!(
-                            self.resolve_link_full(l, Some(doc)),
+                        let res = self.resolve_link_full(l, Some(doc));
+                        if matches!(
+                            res,
                             LinkResolution::DocMissing | LinkResolution::AnchorMissing { .. }
-                        )
+                        ) {
+                            Some((l, res))
+                        } else {
+                            None
+                        }
                     } else {
-                        false
+                        None
                     }
                 })
                 .collect();

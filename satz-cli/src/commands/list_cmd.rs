@@ -28,8 +28,33 @@ pub fn run(args: ListArgs) -> Result<()> {
 
     if args.broken {
         for (doc, broken_links) in index.docs_with_broken_links() {
-            for link in broken_links {
-                println!("{}: [[{}]]", doc.path.display(), link.target_doc);
+            for (link, res) in broken_links {
+                let pos = doc.line_index.byte_to_position(link.range.start);
+                let line_no = pos.line + 1;
+                let link_repr = if link.range.end <= doc.line_index.source().len() {
+                    let raw = &doc.line_index.source()[link.range.start..link.range.end];
+                    raw.trim().to_string()
+                } else if let Some(h) = &link.target_heading {
+                    format!("[[{}#{}]]", link.target_doc, h)
+                } else if let Some(b) = &link.target_block {
+                    format!("[[{}#^{}]]", link.target_doc, b)
+                } else {
+                    format!("[[{}]]", link.target_doc)
+                };
+
+                let reason = match res {
+                    satz_core::LinkResolution::AnchorMissing { .. } => "dosya var, başlık yok",
+                    satz_core::LinkResolution::DocMissing => "dosya bulunamadı",
+                    satz_core::LinkResolution::Resolved { .. } => "",
+                };
+
+                println!(
+                    "{}:{}\t{}\t— {}",
+                    doc.path.display(),
+                    line_no,
+                    link_repr,
+                    reason
+                );
             }
         }
         return Ok(());

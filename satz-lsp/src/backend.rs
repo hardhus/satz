@@ -249,29 +249,100 @@ impl LanguageServer for Backend {
             return;
         };
 
-        {
+        let (peers_dirty, supports_pull, other_uris) = {
             let mut state = self.state.write().await;
             state.open_document(&uri, &content, &path, version);
-        }
+            let dirty = state.peers_dirty;
+            state.peers_dirty = false;
+            let other: Vec<String> = state
+                .open_docs
+                .keys()
+                .filter(|u| *u != &uri)
+                .cloned()
+                .collect();
+            (dirty, state.client_supports_pull_diagnostics, other)
+        };
 
         self.publish_diagnostics_for_uri(&uri).await;
+
+        if peers_dirty {
+            if supports_pull {
+                let _ = self
+                    .client
+                    .send_request::<WorkspaceDiagnosticRefresh>(())
+                    .await;
+            } else {
+                for other_uri in other_uris {
+                    publish_for(&self.client, &self.state, &other_uri).await;
+                }
+            }
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 
-        {
+        let (peers_dirty, supports_pull, other_uris) = {
             let mut state = self.state.write().await;
             state.apply_changes(&uri, params.content_changes, version);
-        }
+            let dirty = state.peers_dirty;
+            state.peers_dirty = false;
+            let other: Vec<String> = state
+                .open_docs
+                .keys()
+                .filter(|u| *u != &uri)
+                .cloned()
+                .collect();
+            (dirty, state.client_supports_pull_diagnostics, other)
+        };
 
         self.publish_diagnostics_for_uri(&uri).await;
+
+        if peers_dirty {
+            if supports_pull {
+                let _ = self
+                    .client
+                    .send_request::<WorkspaceDiagnosticRefresh>(())
+                    .await;
+            } else {
+                for other_uri in other_uris {
+                    publish_for(&self.client, &self.state, &other_uri).await;
+                }
+            }
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
+
+        let (peers_dirty, supports_pull, other_uris) = {
+            let mut state = self.state.write().await;
+            let dirty = state.peers_dirty;
+            state.peers_dirty = false;
+            let other: Vec<String> = state
+                .open_docs
+                .keys()
+                .filter(|u| *u != &uri)
+                .cloned()
+                .collect();
+            (dirty, state.client_supports_pull_diagnostics, other)
+        };
+
         self.publish_diagnostics_for_uri(&uri).await;
+
+        if peers_dirty {
+            if supports_pull {
+                let _ = self
+                    .client
+                    .send_request::<WorkspaceDiagnosticRefresh>(())
+                    .await;
+            } else {
+                for other_uri in other_uris {
+                    publish_for(&self.client, &self.state, &other_uri).await;
+                }
+            }
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

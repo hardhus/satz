@@ -114,3 +114,21 @@ fn test_satz_daily_command() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_satz_list_broken_command() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("satz-core/tests/fixtures");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(["list", "--vault", fixtures.to_str().unwrap(), "--broken"])
+        .output()
+        .expect("satz binary should execute");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Fixtures contain broken links to non-existent notes
+    assert!(stdout.contains("— dosya bulunamadı") || stdout.contains("— dosya var, başlık yok"));
+}

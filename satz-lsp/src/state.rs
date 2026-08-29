@@ -50,6 +50,21 @@ pub struct SatzState {
 
     /// Whether the client supports pull diagnostics
     pub client_supports_pull_diagnostics: bool,
+
+    /// Flag indicating that open document identity keys changed and peers need diagnostic refresh
+    pub peers_dirty: bool,
+}
+
+pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<String> {
+    std::iter::once(satz_core::fold_key(&d.title))
+        .chain(d.frontmatter.aliases.iter().map(|a| satz_core::fold_key(a)))
+        .chain(
+            d.path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(satz_core::fold_key),
+        )
+        .collect()
 }
 
 impl SatzState {
@@ -70,6 +85,7 @@ impl SatzState {
             open_docs: HashMap::new(),
             config,
             client_supports_pull_diagnostics: false,
+            peers_dirty: false,
         })
     }
 
@@ -100,8 +116,20 @@ impl SatzState {
     /// Handles opening a new document.
     pub fn open_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
         let rel_path = Self::get_rel_path(path, self.vault_root.as_deref());
+        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+        let doc_id = satz_core::DocId::new(&rel_path_str);
 
+        let old_keys = self
+            .index
+            .get_doc(&doc_id)
+            .map(identity_keys)
+            .unwrap_or_default();
         let new_doc = satz_core::parse_document(content, &rel_path);
+        let new_keys = identity_keys(&new_doc);
+
+        if !old_keys.is_empty() && old_keys != new_keys {
+            self.peers_dirty = true;
+        }
 
         self.open_docs.insert(
             uri.to_string(),
@@ -135,8 +163,21 @@ impl SatzState {
         let content = open_doc.rope.to_string();
 
         let rel_path = Self::get_rel_path(&path, self.vault_root.as_deref());
+        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+        let doc_id = satz_core::DocId::new(&rel_path_str);
 
+        let old_keys = self
+            .index
+            .get_doc(&doc_id)
+            .map(identity_keys)
+            .unwrap_or_default();
         let new_doc = satz_core::parse_document(&content, &rel_path);
+        let new_keys = identity_keys(&new_doc);
+
+        if old_keys != new_keys {
+            self.peers_dirty = true;
+        }
+
         self.index.replace_doc(new_doc);
     }
 
@@ -162,5 +203,24 @@ mod tests {
         let path_win = Path::new("c:\\notlar\\iş\\projeler\\proje1.md");
         let rel_win = SatzState::get_rel_path(path_win, Some(root_win));
         assert_eq!(rel_win, PathBuf::from("projeler\\proje1.md"));
+    }
+
+    #[test]
+    fn test_identity_keys_change_detected() {
+        let doc1 = satz_core::parse_document(
+            "---\ntitle: Eski Başlık\naliases: [alias1]\n---\n# Content",
+            Path::new("doc.md"),
+        );
+        let doc2 = satz_core::parse_document(
+            "---\ntitle: Yeni Başlık\naliases: [alias1]\n---\n# Content",
+            Path::new("doc.md"),
+        );
+
+        let keys1 = identity_keys(&doc1);
+        let keys2 = identity_keys(&doc2);
+
+        assert_ne!(keys1, keys2);
+        assert!(keys1.contains("eski baslik") || keys1.contains("eski başlık"));
+        assert!(keys2.contains("yeni baslik") || keys2.contains("yeni başlık"));
     }
 }

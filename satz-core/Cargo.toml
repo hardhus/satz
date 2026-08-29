@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 ignore.workspace = true
 petgraph.workspace = true
 pulldown-cmark.workspace = true

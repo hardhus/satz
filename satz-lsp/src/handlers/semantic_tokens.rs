@@ -63,15 +63,16 @@ pub fn semantic_tokens_full(
     for link in &doc.links {
         match link.kind {
             LinkKind::WikiLink | LinkKind::Markdown => {
-                if link.target_doc.is_empty()
-                    || link.target_doc.starts_with("http://")
-                    || link.target_doc.starts_with("https://")
+                if link.target_doc.starts_with("http://") || link.target_doc.starts_with("https://")
                 {
                     continue;
                 }
 
-                let is_resolved = state.index.resolve_link(&link.target_doc).is_some();
-                let token_type = if is_resolved { 0 } else { 1 };
+                let token_type = match state.index.resolve_link_full(link, Some(doc)) {
+                    satz_core::LinkResolution::Resolved { .. } => 0,
+                    satz_core::LinkResolution::AnchorMissing { .. }
+                    | satz_core::LinkResolution::DocMissing => 1,
+                };
                 raw_tokens.push(RawToken {
                     range: link.range,
                     token_type,
@@ -219,6 +220,41 @@ mod tests {
             assert_eq!(tokens.data[3].delta_start, 16); // 30 - 14 = 16
             assert_eq!(tokens.data[3].length, 5);
             assert_eq!(tokens.data[3].token_type, 2);
+        } else {
+            panic!("Expected Tokens");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_anchor_missing_unresolved() {
+        let text = "[[doc-b#NonexistentHeading]]";
+        let rel_path = Path::new("doc-a.md");
+        let doc_a = parse_document(text, rel_path);
+        let doc_b = parse_document("# Doc B", Path::new("doc-b.md"));
+
+        let mut state = SatzState {
+            index: Index::build(vec![doc_a, doc_b]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            "file:///doc-a.md".to_string(),
+            crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),
+        );
+
+        let params = SemanticTokensParams {
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            text_document: TextDocumentIdentifier {
+                uri: "file:///doc-a.md".parse().unwrap(),
+            },
+        };
+
+        let result = semantic_tokens_full(params, &state).expect("Tokens result expected");
+        if let SemanticTokensResult::Tokens(tokens) = result {
+            assert_eq!(tokens.data.len(), 1);
+            // AnchorMissing should have token_type 1 (unresolvedLink)
+            assert_eq!(tokens.data[0].token_type, 1);
         } else {
             panic!("Expected Tokens");
         }

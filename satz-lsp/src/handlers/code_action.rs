@@ -13,7 +13,6 @@ use satz_core::model::LinkKind;
 
 pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeActionResponse> {
     let uri = params.text_document.uri.as_str();
-    let pos = params.range.start;
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =
@@ -22,13 +21,24 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
     let doc_id = satz_core::DocId::new(&rel_path_str);
     let doc = state.index.get_doc(&doc_id)?;
 
-    let satz_pos = lsp_pos_to_satz(pos);
-    let byte_offset = doc.line_index.position_to_byte(satz_pos);
+    let satz_start = lsp_pos_to_satz(params.range.start);
+    let satz_end = lsp_pos_to_satz(params.range.end);
+    let start_off = doc.line_index.position_to_byte(satz_start);
+    let end_off = doc.line_index.position_to_byte(satz_end);
+    let sel = satz_core::ByteRange::new(start_off.min(end_off), start_off.max(end_off));
 
     let mut actions: Vec<CodeActionOrCommand> = Vec::new();
 
-    // Check for Link under cursor -> quickfixes
-    if let Some(link) = doc.links.iter().find(|l| l.range.contains(byte_offset)) {
+    // 1. Check for Link under cursor / selection -> quickfixes
+    let link_opt = doc.links.iter().find(|l| {
+        if sel.is_empty() {
+            l.range.contains(sel.start)
+        } else {
+            l.range.overlaps(&sel) || l.range.contains(sel.start)
+        }
+    });
+
+    if let Some(link) = link_opt {
         if matches!(
             link.kind,
             LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
@@ -46,7 +56,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
 
                     if let Some(target_uri) = path_to_uri(&target_path) {
                         let initial_content =
-                            format!("---\ntitle: {}\n---\n\n# {}\n", clean_name, clean_name);
+                            satz_core::generate_document_template(clean_name, None);
 
                         let ops = vec![
                             DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
@@ -143,6 +153,48 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
         }
     }
 
+    // 2. Check for missing frontmatter -> "Insert frontmatter template" quickfix
+    let source = doc.line_index.source();
+    if !source.trim_start().starts_with("---")
+        || (params.range.start.line == 0 && !source.starts_with("---"))
+    {
+        let title = doc
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&doc.title);
+        let template_text = satz_core::generate_frontmatter_block(title, None);
+
+        if let Ok(current_uri) = uri.parse() {
+            let edit = TextEdit {
+                range: Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                ),
+                new_text: template_text,
+            };
+
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(current_uri, vec![edit]);
+
+            let action = CodeAction {
+                title: "Insert frontmatter template".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: None,
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                is_preferred: Some(false),
+                disabled: None,
+                command: None,
+                data: None,
+            };
+
+            actions.push(CodeActionOrCommand::CodeAction(action));
+        }
+    }
+
     if actions.is_empty() {
         None
     } else {
@@ -168,7 +220,10 @@ mod tests {
         };
         let rel_a = Path::new("doc-a.md");
 
-        let doc_a = parse_document("# Doc A\n\nLink to [[missing-note]] here", rel_a);
+        let doc_a = parse_document(
+            "---\ntitle: Doc A\n---\n\nLink to [[missing-note]] here",
+            rel_a,
+        );
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
@@ -189,16 +244,17 @@ mod tests {
             crate::state::OpenDocument::new(
                 uri_a_str,
                 abs_a.to_path_buf(),
-                "# Doc A\n\nLink to [[missing-note]] here",
+                "---\ntitle: Doc A\n---\n\nLink to [[missing-note]] here",
                 1,
             ),
         );
 
+        // Selection range covering the link partially
         let params = CodeActionParams {
             text_document: TextDocumentIdentifier {
                 uri: uri_a_str.parse().unwrap(),
             },
-            range: Range::new(Position::new(2, 12), Position::new(2, 12)),
+            range: Range::new(Position::new(4, 5), Position::new(4, 20)),
             context: CodeActionContext::default(),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
@@ -217,12 +273,67 @@ mod tests {
     }
 
     #[test]
+    fn test_code_action_insert_frontmatter_template() {
+        let rel_a = Path::new("doc-a.md");
+        let doc_a = parse_document("# Doc A Without Frontmatter", rel_a);
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
+        } else {
+            Path::new("/").to_path_buf()
+        });
+
+        let uri_a_str = if cfg!(windows) {
+            "file:///C:/doc-a.md"
+        } else {
+            "file:///doc-a.md"
+        };
+
+        state.open_docs.insert(
+            uri_a_str.to_string(),
+            crate::state::OpenDocument::new(
+                uri_a_str,
+                Path::new(if cfg!(windows) {
+                    "C:\\doc-a.md"
+                } else {
+                    "/doc-a.md"
+                })
+                .to_path_buf(),
+                "# Doc A Without Frontmatter",
+                1,
+            ),
+        );
+
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri_a_str.parse().unwrap(),
+            },
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            context: CodeActionContext::default(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = code_action(params, &state).expect("CodeAction response expected");
+        assert!(
+            response
+                .iter()
+                .any(|a| matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title == "Insert frontmatter template"))
+        );
+    }
+
+    #[test]
     fn test_code_action_add_missing_heading() {
         let rel_a = Path::new("doc-a.md");
         let rel_b = Path::new("doc-b.md");
 
-        let doc_a = parse_document("# Doc A\n\nLink to [[doc-b#İstemciler]] here", rel_a);
-        let doc_b = parse_document("# Doc B\n\nExisting text.", rel_b);
+        let doc_a = parse_document(
+            "---\ntitle: Doc A\n---\n\nLink to [[doc-b#İstemciler]] here",
+            rel_a,
+        );
+        let doc_b = parse_document("---\ntitle: Doc B\n---\n\nExisting text.", rel_b);
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
@@ -248,7 +359,7 @@ mod tests {
                     "/doc-a.md"
                 })
                 .to_path_buf(),
-                "# Doc A\n\nLink to [[doc-b#İstemciler]] here",
+                "---\ntitle: Doc A\n---\n\nLink to [[doc-b#İstemciler]] here",
                 1,
             ),
         );
@@ -257,7 +368,7 @@ mod tests {
             text_document: TextDocumentIdentifier {
                 uri: uri_a_str.parse().unwrap(),
             },
-            range: Range::new(Position::new(2, 12), Position::new(2, 12)),
+            range: Range::new(Position::new(4, 12), Position::new(4, 12)),
             context: CodeActionContext::default(),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),

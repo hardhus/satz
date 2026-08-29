@@ -52,12 +52,8 @@ pub fn run(args: DailyArgs) -> Result<()> {
             .with_context(|| format!("Failed to create directory {}", target_dir.display()))?;
 
         let title = filename.trim_end_matches(".md");
-        let initial_content = format!(
-            "---\ntitle: {}\ndate: {}\n---\n\n# {}\n\n",
-            title,
-            now.format("%Y-%m-%d"),
-            title
-        );
+        let date_str = now.format("%Y-%m-%d").to_string();
+        let initial_content = satz_core::generate_document_template(title, Some(&date_str));
 
         fs::write(&target_file, initial_content)
             .with_context(|| format!("Failed to write daily note at {}", target_file.display()))?;
