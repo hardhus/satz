@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::model::{DocId, Document, Link, LinkKind};
+use crate::slug::fold_key;
 
 /// In-memory vault index.
 #[derive(Debug, Default)]
@@ -56,13 +57,13 @@ impl Index {
         }
 
         if let Some(stem) = as_path.file_stem().and_then(|s| s.to_str()) {
-            let stem_lower = stem.to_lowercase();
+            let stem_lower = fold_key(stem);
             if let Some(id) = self.by_stem.get(&stem_lower) {
                 return Some(id);
             }
         }
 
-        self.by_title_alias.get(&raw_target.to_lowercase())
+        self.by_title_alias.get(&fold_key(raw_target))
     }
 
     /// Retrieves a document by its `DocId`.
@@ -90,7 +91,7 @@ impl Index {
 
     /// Returns an iterator over documents tagged with the specified tag name (case-insensitive).
     pub fn docs_with_tag<'a>(&'a self, tag: &str) -> impl Iterator<Item = &'a Document> + 'a {
-        let clean = tag.trim_start_matches('#').to_lowercase();
+        let clean = fold_key(tag.trim_start_matches('#'));
         self.tags
             .get(&clean)
             .into_iter()
@@ -137,7 +138,7 @@ impl Index {
         if let Some(old_doc) = self.docs.get(&id) {
             // Remove old tags
             for tag in &old_doc.tags {
-                let tag_key = tag.name.trim_start_matches('#').to_lowercase();
+                let tag_key = fold_key(tag.name.trim_start_matches('#'));
                 if let Some(set) = self.tags.get_mut(&tag_key) {
                     set.remove(&id);
                     if set.is_empty() {
@@ -147,12 +148,12 @@ impl Index {
             }
 
             // Remove old title and aliases from by_title_alias if pointing to this doc
-            let old_title_key = old_doc.title.to_lowercase();
+            let old_title_key = fold_key(&old_doc.title);
             if self.by_title_alias.get(&old_title_key) == Some(&id) {
                 self.by_title_alias.remove(&old_title_key);
             }
             for alias in &old_doc.frontmatter.aliases {
-                let alias_key = alias.to_lowercase();
+                let alias_key = fold_key(alias);
                 if self.by_title_alias.get(&alias_key) == Some(&id) {
                     self.by_title_alias.remove(&alias_key);
                 }
@@ -163,8 +164,8 @@ impl Index {
                 .path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+                .map(fold_key)
+                .unwrap_or_default();
             if !old_stem_key.is_empty() && self.by_stem.get(&old_stem_key) == Some(&id) {
                 self.by_stem.remove(&old_stem_key);
             }
@@ -207,8 +208,8 @@ impl Index {
             .path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+            .map(fold_key)
+            .unwrap_or_default();
         if !new_stem_key.is_empty() {
             match self.by_stem.entry(new_stem_key) {
                 std::collections::hash_map::Entry::Occupied(e) => {
@@ -221,16 +222,16 @@ impl Index {
         }
 
         // Insert new title and aliases
-        let title_key = new_doc.title.to_lowercase();
+        let title_key = fold_key(&new_doc.title);
         self.by_title_alias.insert(title_key, id.clone());
         for alias in &new_doc.frontmatter.aliases {
-            let alias_key = alias.to_lowercase();
+            let alias_key = fold_key(alias);
             self.by_title_alias.insert(alias_key, id.clone());
         }
 
         // Insert new tags
         for tag in &new_doc.tags {
-            let tag_key = tag.name.trim_start_matches('#').to_lowercase();
+            let tag_key = fold_key(tag.name.trim_start_matches('#'));
             self.tags.entry(tag_key).or_default().insert(id.clone());
         }
 
@@ -258,7 +259,7 @@ impl Index {
     pub fn remove_doc(&mut self, id: &DocId) {
         if let Some(old_doc) = self.docs.remove(id) {
             for tag in &old_doc.tags {
-                let tag_key = tag.name.trim_start_matches('#').to_lowercase();
+                let tag_key = fold_key(tag.name.trim_start_matches('#'));
                 if let Some(set) = self.tags.get_mut(&tag_key) {
                     set.remove(id);
                     if set.is_empty() {
@@ -267,12 +268,12 @@ impl Index {
                 }
             }
 
-            let old_title_key = old_doc.title.to_lowercase();
+            let old_title_key = fold_key(&old_doc.title);
             if self.by_title_alias.get(&old_title_key) == Some(id) {
                 self.by_title_alias.remove(&old_title_key);
             }
             for alias in &old_doc.frontmatter.aliases {
-                let alias_key = alias.to_lowercase();
+                let alias_key = fold_key(alias);
                 if self.by_title_alias.get(&alias_key) == Some(id) {
                     self.by_title_alias.remove(&alias_key);
                 }
@@ -282,8 +283,8 @@ impl Index {
                 .path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+                .map(fold_key)
+                .unwrap_or_default();
             if !old_stem_key.is_empty() && self.by_stem.get(&old_stem_key) == Some(id) {
                 self.by_stem.remove(&old_stem_key);
             }

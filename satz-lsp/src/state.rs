@@ -50,6 +50,9 @@ pub struct SatzState {
 
     /// Vault configuration (.satz.toml or default)
     pub config: VaultConfig,
+
+    /// Whether the client supports pull diagnostics
+    pub client_supports_pull_diagnostics: bool,
 }
 
 impl SatzState {
@@ -69,17 +72,39 @@ impl SatzState {
             index,
             open_docs: HashMap::new(),
             config,
+            client_supports_pull_diagnostics: false,
         })
+    }
+
+    pub fn get_rel_path(path: &Path, root: Option<&Path>) -> PathBuf {
+        let Some(root) = root else {
+            return path.to_path_buf();
+        };
+        if let Ok(rel) = path.strip_prefix(root) {
+            return rel.to_path_buf();
+        }
+        // Fallback for case-insensitive platforms (Windows)
+        let path_str = path.to_string_lossy();
+        let root_str = root.to_string_lossy();
+        if path_str
+            .to_lowercase()
+            .starts_with(&root_str.to_lowercase())
+        {
+            let root_len = root_str.len();
+            let mut rel_str = &path_str[root_len..];
+            if rel_str.starts_with('/') || rel_str.starts_with('\\') {
+                rel_str = &rel_str[1..];
+            }
+            return PathBuf::from(rel_str);
+        }
+        path.to_path_buf()
     }
 
     /// Handles opening a new document.
     pub fn open_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
-        let rel_path = match &self.vault_root {
-            Some(root) => path.strip_prefix(root).unwrap_or(path),
-            None => path,
-        };
+        let rel_path = Self::get_rel_path(path, self.vault_root.as_deref());
 
-        let new_doc = satz_core::parse_document(content, rel_path);
+        let new_doc = satz_core::parse_document(content, &rel_path);
 
         self.open_docs.insert(
             uri.to_string(),
@@ -113,12 +138,9 @@ impl SatzState {
         let content = open_doc.rope.to_string();
         open_doc.content = content.clone();
 
-        let rel_path = match &self.vault_root {
-            Some(root) => path.strip_prefix(root).unwrap_or(&path),
-            None => &path,
-        };
+        let rel_path = Self::get_rel_path(&path, self.vault_root.as_deref());
 
-        let new_doc = satz_core::parse_document(&content, rel_path);
+        let new_doc = satz_core::parse_document(&content, &rel_path);
         self.index.replace_doc(new_doc);
     }
 

@@ -35,10 +35,8 @@ pub fn semantic_tokens_full(
 ) -> Option<SemanticTokensResult> {
     let uri = params.text_document.uri.as_str();
     let open_doc = state.open_docs.get(uri)?;
-    let rel_path = match &state.vault_root {
-        Some(root) => open_doc.path.strip_prefix(root).unwrap_or(&open_doc.path),
-        None => &open_doc.path,
-    };
+    let rel_path =
+        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
     let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
     let doc_id = satz_core::DocId::new(&rel_path_str);
     let doc = state.index.get_doc(&doc_id)?;

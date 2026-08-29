@@ -19,7 +19,7 @@ pub use model::{
     Tag,
 };
 pub use parser::parse_document;
-pub use slug::{heading_matches, slugify};
+pub use slug::{fold_key, heading_matches, slugify};
 pub use text::{LineIndex, Position};
 pub use walk::walk_vault;
 

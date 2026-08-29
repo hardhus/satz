@@ -114,3 +114,14 @@ fn test_alias_self_conflict() {
     // Path resolution still works
     assert_eq!(index.resolve_link("foo.md").unwrap().as_str(), "foo.md");
 }
+
+#[test]
+fn test_turkish_title_key() {
+    let doc = parse_document(
+        "---\ntitle: İstemciler\n---\n# İstemciler",
+        Path::new("i.md"),
+    );
+    let index = Index::build(vec![doc]);
+    assert!(index.resolve_link("istemciler").is_some());
+    assert!(index.resolve_link("İSTEMCİLER").is_some());
+}

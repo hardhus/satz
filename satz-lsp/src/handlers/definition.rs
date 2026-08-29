@@ -18,10 +18,7 @@ pub fn goto_definition(
 
     // Get the current document
     let open_doc = state.open_docs.get(uri)?;
-    let rel_path = match &state.vault_root {
-        Some(root) => open_doc.path.strip_prefix(root).unwrap_or(&open_doc.path),
-        None => &open_doc.path,
-    };
+    let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
     let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
     let doc_id = satz_core::DocId::new(&rel_path_str);
     let doc = state.index.get_doc(&doc_id)?;

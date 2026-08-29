@@ -29,13 +29,14 @@ impl Backend {
         let (diagnostics, uri_obj) = {
             let state = self.state.read().await;
 
+            if state.client_supports_pull_diagnostics {
+                return;
+            }
+
             let Some(open_doc) = state.open_docs.get(uri) else {
                 return;
             };
-            let rel_path = match &state.vault_root {
-                Some(root) => open_doc.path.strip_prefix(root).unwrap_or(&open_doc.path),
-                None => &open_doc.path,
-            };
+            let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
             let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
             let doc_id = satz_core::DocId::new(&rel_path_str);
 
@@ -72,6 +73,18 @@ impl LanguageServer for Backend {
                     .and_then(|u| uri_to_path(u.as_str()))
             });
 
+        let supports_pull = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.diagnostic.as_ref())
+            .is_some();
+
+        {
+            let mut state = self.state.write().await;
+            state.client_supports_pull_diagnostics = supports_pull;
+        }
+
         if let Some(root) = vault_root {
             let state_arc = self.state.clone();
             let client = self.client.clone();
@@ -85,10 +98,28 @@ impl LanguageServer for Backend {
                 .await;
 
                 match result {
-                    Ok(Ok(new_state)) => {
+                    Ok(Ok(mut new_state)) => {
                         let doc_count = new_state.index.doc_count();
                         let broken = new_state.index.broken_link_count();
-                        *state_arc.write().await = new_state;
+
+                        {
+                            let mut current_state = state_arc.write().await;
+                            new_state.client_supports_pull_diagnostics =
+                                current_state.client_supports_pull_diagnostics;
+                            new_state.open_docs = std::mem::take(&mut current_state.open_docs);
+
+                            for doc in new_state.open_docs.values() {
+                                let rel_path = SatzState::get_rel_path(
+                                    &doc.path,
+                                    new_state.vault_root.as_deref(),
+                                );
+                                let parsed = satz_core::parse_document(&doc.content, &rel_path);
+                                new_state.index.replace_doc(parsed);
+                            }
+
+                            *current_state = new_state;
+                        }
+
                         crate::watcher::spawn_watcher(root_clone, state_arc);
                         client
                             .log_message(
@@ -341,5 +372,39 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
         let state = self.state.read().await;
         Ok(crate::handlers::formatting::formatting(params, &state))
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> jsonrpc::Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri.to_string();
+        let diagnostics = {
+            let state = self.state.read().await;
+
+            if let Some(open_doc) = state.open_docs.get(&uri) {
+                let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
+                let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+                let doc_id = satz_core::DocId::new(&rel_path_str);
+
+                if let Some(doc) = state.index.get_doc(&doc_id) {
+                    compute_diagnostics(doc, &state.index, &state.config)
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        };
+
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items: diagnostics,
+                },
+            }),
+        ))
     }
 }

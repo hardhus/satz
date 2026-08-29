@@ -35,6 +35,33 @@ pub fn slugify(text: &str) -> String {
     slug
 }
 
+/// Index anahtarları için birleşik katlama. slugify ile aynı İ/U+0307 davranışı.
+pub fn fold_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.trim().chars() {
+        if c == 'İ' {
+            out.push('i');
+            prev_space = false;
+            continue;
+        }
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        prev_space = false;
+        for lc in c.to_lowercase() {
+            if lc != '\u{0307}' {
+                out.push(lc);
+            }
+        }
+    }
+    out
+}
+
 /// Checks if a link heading target (raw text or slug) matches a heading.
 pub fn heading_matches(link_heading: &str, h: &crate::model::Heading) -> bool {
     h.matches(link_heading)
@@ -55,5 +82,16 @@ mod tests {
         assert_eq!(slugify("   multiple   spaces  "), "multiple-spaces");
         assert_eq!(slugify("---dashes---"), "dashes");
         assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn test_fold_key_basic() {
+        assert_eq!(fold_key("İstemciler"), "istemciler");
+        assert_eq!(fold_key("istemciler"), "istemciler");
+        assert_eq!(fold_key("İSTEMCİLER"), "istemciler");
+        assert_eq!(
+            fold_key("  Language   Server  Protocol  "),
+            "language server protocol"
+        );
     }
 }

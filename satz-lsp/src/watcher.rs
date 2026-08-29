@@ -84,10 +84,7 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>) {
 }
 
 async fn process_file_event(path: &Path, vault_root: &Path, state: &Arc<RwLock<SatzState>>) {
-    let rel_path = match path.strip_prefix(vault_root) {
-        Ok(p) => p,
-        Err(_) => path,
-    };
+    let rel_path = crate::state::SatzState::get_rel_path(path, Some(vault_root));
     let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
     let doc_id = satz_core::DocId::new(&rel_path_str);
 
@@ -105,7 +102,7 @@ async fn process_file_event(path: &Path, vault_root: &Path, state: &Arc<RwLock<S
         };
 
         if !is_open && let Ok(content) = std::fs::read_to_string(path) {
-            let new_doc = satz_core::parse_document(&content, rel_path);
+            let new_doc = satz_core::parse_document(&content, &rel_path);
             let mut s = state.write().await;
             s.index.replace_doc(new_doc);
             tracing::info!("Watcher: re-indexed {}", doc_id);

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::index::lookup::Index;
 use crate::model::{Document, LinkKind};
+use crate::slug::fold_key;
 
 impl Index {
     /// Builds an in-memory index from a collection of parsed `Document`s.
@@ -22,8 +23,8 @@ impl Index {
                 .path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+                .map(fold_key)
+                .unwrap_or_default();
             if !stem_key.is_empty() {
                 match index.by_stem.entry(stem_key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
@@ -35,7 +36,7 @@ impl Index {
                 }
             }
 
-            let title_key = doc.title.to_lowercase();
+            let title_key = fold_key(&doc.title);
             if index
                 .by_title_alias
                 .get(&title_key)
@@ -49,7 +50,7 @@ impl Index {
             index.by_title_alias.insert(title_key, doc.id.clone());
 
             for alias in &doc.frontmatter.aliases {
-                let alias_key = alias.to_lowercase();
+                let alias_key = fold_key(alias);
                 if index
                     .by_title_alias
                     .get(&alias_key)
@@ -64,7 +65,7 @@ impl Index {
             }
 
             for tag in &doc.tags {
-                let tag_key = tag.name.trim_start_matches('#').to_lowercase();
+                let tag_key = fold_key(tag.name.trim_start_matches('#'));
                 index
                     .tags
                     .entry(tag_key)
