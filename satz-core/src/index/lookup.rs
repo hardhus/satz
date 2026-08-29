@@ -84,8 +84,9 @@ impl Index {
     /// Returns an iterator over documents with no incoming backlinks (orphan notes).
     pub fn orphan_docs(&self) -> impl Iterator<Item = &Document> {
         self.docs.values().filter(|d| {
-            !self.backlinks.contains_key(&d.id)
-                || self.backlinks.get(&d.id).is_some_and(|s| s.is_empty())
+            self.backlinks
+                .get(&d.id)
+                .is_none_or(|s| s.iter().all(|id| id == &d.id))
         })
     }
 
@@ -136,6 +137,30 @@ impl Index {
 
         // If old doc exists, clean up old references
         if let Some(old_doc) = self.docs.get(&id) {
+            // Remove outgoing backlinks from old_doc FIRST
+            for link in &old_doc.links {
+                if matches!(
+                    link.kind,
+                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
+                ) && !link.target_doc.starts_with("http://")
+                    && !link.target_doc.starts_with("https://")
+                {
+                    let target_id = if link.target_doc.is_empty() {
+                        Some(id.clone())
+                    } else {
+                        self.resolve_link(&link.target_doc).cloned()
+                    };
+                    if let Some(target_id) = target_id
+                        && let Some(set) = self.backlinks.get_mut(&target_id)
+                    {
+                        set.remove(&id);
+                        if set.is_empty() {
+                            self.backlinks.remove(&target_id);
+                        }
+                    }
+                }
+            }
+
             // Remove old tags
             for tag in &old_doc.tags {
                 let tag_key = fold_key(tag.name.trim_start_matches('#'));
@@ -177,24 +202,6 @@ impl Index {
             }
             if self.by_path.get(&old_doc.path) == Some(&id) {
                 self.by_path.remove(&old_doc.path);
-            }
-
-            // Remove outgoing backlinks from old_doc
-            for link in &old_doc.links {
-                if matches!(
-                    link.kind,
-                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-                ) && !link.target_doc.is_empty()
-                    && !link.target_doc.starts_with("http://")
-                    && !link.target_doc.starts_with("https://")
-                    && let Some(target_id) = self.resolve_link(&link.target_doc).cloned()
-                    && let Some(set) = self.backlinks.get_mut(&target_id)
-                {
-                    set.remove(&id);
-                    if set.is_empty() {
-                        self.backlinks.remove(&target_id);
-                    }
-                }
             }
         }
 
@@ -240,15 +247,20 @@ impl Index {
             if matches!(
                 link.kind,
                 LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-            ) && !link.target_doc.is_empty()
-                && !link.target_doc.starts_with("http://")
+            ) && !link.target_doc.starts_with("http://")
                 && !link.target_doc.starts_with("https://")
-                && let Some(target_id) = self.resolve_link(&link.target_doc).cloned()
             {
-                self.backlinks
-                    .entry(target_id)
-                    .or_default()
-                    .insert(id.clone());
+                let target_id = if link.target_doc.is_empty() {
+                    Some(id.clone())
+                } else {
+                    self.resolve_link(&link.target_doc).cloned()
+                };
+                if let Some(target_id) = target_id {
+                    self.backlinks
+                        .entry(target_id)
+                        .or_default()
+                        .insert(id.clone());
+                }
             }
         }
 
@@ -258,6 +270,30 @@ impl Index {
     /// Removes a document from the index.
     pub fn remove_doc(&mut self, id: &DocId) {
         if let Some(old_doc) = self.docs.remove(id) {
+            // Remove outgoing backlinks
+            for link in &old_doc.links {
+                if matches!(
+                    link.kind,
+                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
+                ) && !link.target_doc.starts_with("http://")
+                    && !link.target_doc.starts_with("https://")
+                {
+                    let target_id = if link.target_doc.is_empty() {
+                        Some(id.clone())
+                    } else {
+                        self.resolve_link(&link.target_doc).cloned()
+                    };
+                    if let Some(target_id) = target_id
+                        && let Some(set) = self.backlinks.get_mut(&target_id)
+                    {
+                        set.remove(id);
+                        if set.is_empty() {
+                            self.backlinks.remove(&target_id);
+                        }
+                    }
+                }
+            }
+
             for tag in &old_doc.tags {
                 let tag_key = fold_key(tag.name.trim_start_matches('#'));
                 if let Some(set) = self.tags.get_mut(&tag_key) {
@@ -295,24 +331,6 @@ impl Index {
             }
             if self.by_path.get(&old_doc.path) == Some(id) {
                 self.by_path.remove(&old_doc.path);
-            }
-
-            // Remove outgoing backlinks
-            for link in &old_doc.links {
-                if matches!(
-                    link.kind,
-                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-                ) && !link.target_doc.is_empty()
-                    && !link.target_doc.starts_with("http://")
-                    && !link.target_doc.starts_with("https://")
-                    && let Some(target_id) = self.resolve_link(&link.target_doc).cloned()
-                    && let Some(set) = self.backlinks.get_mut(&target_id)
-                {
-                    set.remove(id);
-                    if set.is_empty() {
-                        self.backlinks.remove(&target_id);
-                    }
-                }
             }
 
             self.backlinks.remove(id);

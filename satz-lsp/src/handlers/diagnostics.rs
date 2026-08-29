@@ -80,7 +80,11 @@ pub fn compute_diagnostics(
     }
 
     // 4. Orphan note diagnostic (HINT)
-    if index.backlinks_of(&doc.id).count() == 0
+    if index
+        .backlinks_of(&doc.id)
+        .filter(|id| *id != &doc.id)
+        .count()
+        == 0
         && (!doc.links.is_empty() || !doc.headings.is_empty())
     {
         diagnostics.push(lsp::Diagnostic {

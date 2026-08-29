@@ -85,10 +85,13 @@ impl Index {
             for link in &doc.links {
                 match link.kind {
                     LinkKind::WikiLink | LinkKind::Embed => {
-                        if link.target_doc.is_empty() {
-                            continue;
-                        }
-                        if let Some(target_id) = index.resolve_link(&link.target_doc).cloned() {
+                        let target_id = if link.target_doc.is_empty() {
+                            Some(src_id.clone())
+                        } else {
+                            index.resolve_link(&link.target_doc).cloned()
+                        };
+
+                        if let Some(target_id) = target_id {
                             index
                                 .backlinks
                                 .entry(target_id)
@@ -99,13 +102,18 @@ impl Index {
                         }
                     }
                     LinkKind::Markdown => {
-                        if link.target_doc.is_empty()
-                            || link.target_doc.starts_with("http://")
+                        if link.target_doc.starts_with("http://")
                             || link.target_doc.starts_with("https://")
                         {
                             continue;
                         }
-                        if let Some(target_id) = index.resolve_link(&link.target_doc).cloned() {
+                        let target_id = if link.target_doc.is_empty() {
+                            Some(src_id.clone())
+                        } else {
+                            index.resolve_link(&link.target_doc).cloned()
+                        };
+
+                        if let Some(target_id) = target_id {
                             index
                                 .backlinks
                                 .entry(target_id)
@@ -259,5 +267,18 @@ mod tests {
         let a_id = index.resolve_link("a").unwrap().clone();
         index.remove_doc(&a_id);
         assert_eq!(index.backlinks_of(&d_id).count(), 0);
+    }
+
+    #[test]
+    fn test_intra_document_backlinks_and_orphan() {
+        let doc_src = "# Self Note\n\n[[#Section]] and [Self](#section).";
+        let doc = parse_document(doc_src, Path::new("self.md"));
+        let index = Index::build(vec![doc]);
+        let self_id = crate::model::DocId::new("self.md");
+        // Self has backlinks from itself
+        assert_eq!(index.backlinks_of(&self_id).count(), 1);
+        // But self is still considered an orphan note because incoming link is only from itself
+        let orphans: Vec<_> = index.orphan_docs().map(|d| d.id.as_str()).collect();
+        assert_eq!(orphans, vec!["self.md"]);
     }
 }
