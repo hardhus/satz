@@ -61,8 +61,10 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> 
                     state.index.resolve_link(&link.target_doc) == Some(&doc_id)
                 };
 
-                let matches_heading = link.target_heading.as_deref() == Some(&h.slug)
-                    || link.target_heading.as_deref() == Some(&h.text);
+                let matches_heading = link
+                    .target_heading
+                    .as_deref()
+                    .is_some_and(|th| h.matches(th));
 
                 if matches_doc && matches_heading {
                     let new_link_text = format_wikilink_heading(
@@ -136,8 +138,8 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> 
                             state.index.resolve_link(&l.target_doc) == Some(target_id)
                         };
 
-                        let matches_heading = l.target_heading.as_deref() == Some(&h.slug)
-                            || l.target_heading.as_deref() == Some(&h.text);
+                        let matches_heading =
+                            l.target_heading.as_deref().is_some_and(|th| h.matches(th));
 
                         if matches_doc && matches_heading {
                             let new_link_text = format_wikilink_heading(
@@ -419,5 +421,66 @@ mod tests {
         } else {
             panic!("Expected DocumentChanges::Operations");
         }
+    }
+
+    #[test]
+    fn rename_heading_matches_slug_and_case_variants() {
+        let abs_a = if cfg!(windows) {
+            Path::new("C:\\doc-a.md")
+        } else {
+            Path::new("/doc-a.md")
+        };
+        let abs_b = if cfg!(windows) {
+            Path::new("C:\\doc-b.md")
+        } else {
+            Path::new("/doc-b.md")
+        };
+
+        let rel_a = Path::new("doc-a.md");
+        let rel_b = Path::new("doc-b.md");
+
+        let doc_a = parse_document("## Günün Özeti\n\nNotlar burada.", rel_a);
+        let doc_b = parse_document("Link: [[doc-a#günün özeti]]", rel_b);
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a.clone(), doc_b.clone()]);
+        state.vault_root = Some(if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
+        } else {
+            Path::new("/").to_path_buf()
+        });
+
+        let uri_a_str = if cfg!(windows) {
+            "file:///C:/doc-a.md"
+        } else {
+            "file:///doc-a.md"
+        };
+
+        state.open_docs.insert(
+            uri_a_str.to_string(),
+            crate::state::OpenDocument::new(
+                uri_a_str,
+                abs_a.to_path_buf(),
+                "## Günün Özeti\n\nNotlar burada.",
+                1,
+            ),
+        );
+
+        let params = RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri_a_str.parse().unwrap(),
+                },
+                position: Position::new(0, 4), // on "## Günün Özeti"
+            },
+            new_name: "Haftanın Özeti".to_string(),
+            work_done_progress_params: Default::default(),
+        };
+
+        let edit = rename(params, &state).expect("WorkspaceEdit expected");
+        let changes = edit.changes.expect("Changes map expected");
+        let uri_b = path_to_uri(abs_b).unwrap();
+        let edits_b = &changes[&uri_b];
+        assert_eq!(edits_b[0].new_text, "[[doc-a#Haftanın Özeti]]");
     }
 }

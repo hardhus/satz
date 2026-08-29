@@ -36,7 +36,11 @@ pub fn goto_definition(
         && let Some(def) = doc.footnotes.definitions.iter().find(|d| d.label == *label)
     {
         let range = byte_range_to_lsp(def.range, &doc.line_index);
-        let url = path_to_uri(&doc.path)?;
+        let doc_path = match &state.vault_root {
+            Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
+            _ => doc.path.clone(),
+        };
+        let url = path_to_uri(&doc_path)?;
         return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
     }
 
@@ -149,6 +153,56 @@ mod tests {
         let def = goto_definition(params, &state).expect("Should return definition");
         if let GotoDefinitionResponse::Scalar(loc) = def {
             assert!(loc.uri.as_str().ends_with("doc-b.md"));
+        } else {
+            panic!("Expected scalar location");
+        }
+    }
+
+    #[test]
+    fn footnote_definition_uses_absolute_uri() {
+        let abs_a = if cfg!(windows) {
+            Path::new("C:\\doc-a.md")
+        } else {
+            Path::new("/doc-a.md")
+        };
+        let rel_a = Path::new("doc-a.md");
+        let content = "Here is a note[^1].\n\n[^1]: This is the footnote definition.";
+        let doc_a = parse_document(content, rel_a);
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
+        } else {
+            Path::new("/").to_path_buf()
+        });
+
+        let uri_a_str = if cfg!(windows) {
+            "file:///C:/doc-a.md"
+        } else {
+            "file:///doc-a.md"
+        };
+
+        state.open_docs.insert(
+            uri_a_str.to_string(),
+            crate::state::OpenDocument::new(uri_a_str, abs_a.to_path_buf(), content, 1),
+        );
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri_a_str.parse().unwrap(),
+                },
+                position: tower_lsp_server::ls_types::Position::new(0, 15), // on [^1]
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let def = goto_definition(params, &state).expect("Footnote definition expected");
+        if let GotoDefinitionResponse::Scalar(loc) = def {
+            assert!(loc.uri.as_str().ends_with("doc-a.md"));
+            assert_eq!(loc.range.start.line, 2);
         } else {
             panic!("Expected scalar location");
         }

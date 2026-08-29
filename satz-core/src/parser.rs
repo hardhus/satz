@@ -14,7 +14,19 @@ use crate::text::LineIndex;
 
 fn locate_fm_tag(source: &str, fm: ByteRange, name: &str, from: usize) -> Option<ByteRange> {
     let hay = &source[fm.start..fm.end];
-    let mut at = from;
+    let key_at = hay
+        .find("\ntags:")
+        .or_else(|| hay.find("\ntag:"))
+        .map(|i| i + 1)
+        .or_else(|| {
+            if hay.starts_with("tags:") || hay.starts_with("tag:") {
+                Some(0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let mut at = from.max(key_at);
     while let Some(idx) = hay[at..].find(name) {
         let s = at + idx;
         let e = s + name.len();
@@ -181,5 +193,16 @@ Here is a tag: #syntax and a footnote[^1].
             &md[yazilim_tag.range.start..yazilim_tag.range.end],
             "yazilim/araclar"
         );
+    }
+
+    #[test]
+    fn test_fm_tag_range_not_confused_by_title() {
+        let md = "---\ntitle: rust rehberi\ntags: [rust]\n---\n# Content";
+        let doc = parse_document(md, Path::new("doc.md"));
+        assert_eq!(doc.tags.len(), 1);
+        let tag = &doc.tags[0];
+        assert_eq!(&md[tag.range.start..tag.range.end], "rust");
+        let tags_key_pos = md.find("tags:").unwrap();
+        assert!(tag.range.start > tags_key_pos);
     }
 }

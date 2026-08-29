@@ -87,6 +87,24 @@ impl Index {
         link: &Link,
         current_doc: Option<&'a Document>,
     ) -> LinkResolution<'a> {
+        let heading_empty = link
+            .target_heading
+            .as_deref()
+            .is_none_or(|h| h.trim().is_empty());
+        let block_empty = link
+            .target_block
+            .as_deref()
+            .is_none_or(|b| b.trim().is_empty());
+        if link.target_doc.is_empty() && heading_empty && block_empty {
+            return match current_doc {
+                Some(d) => LinkResolution::Resolved {
+                    doc: d,
+                    anchor: None,
+                },
+                None => LinkResolution::DocMissing,
+            };
+        }
+
         let target_doc = if link.target_doc.is_empty() {
             match current_doc {
                 Some(d) => d,
@@ -212,7 +230,19 @@ impl Index {
                 ) && !link.target_doc.starts_with("http://")
                     && !link.target_doc.starts_with("https://")
                 {
-                    let target_id = if link.target_doc.is_empty() {
+                    let is_degenerate = link.target_doc.is_empty()
+                        && link
+                            .target_heading
+                            .as_deref()
+                            .is_none_or(|h| h.trim().is_empty())
+                        && link
+                            .target_block
+                            .as_deref()
+                            .is_none_or(|b| b.trim().is_empty());
+
+                    let target_id = if is_degenerate {
+                        None
+                    } else if link.target_doc.is_empty() {
                         Some(id.clone())
                     } else {
                         self.resolve_link(&link.target_doc).cloned()
@@ -317,7 +347,19 @@ impl Index {
             ) && !link.target_doc.starts_with("http://")
                 && !link.target_doc.starts_with("https://")
             {
-                let target_id = if link.target_doc.is_empty() {
+                let is_degenerate = link.target_doc.is_empty()
+                    && link
+                        .target_heading
+                        .as_deref()
+                        .is_none_or(|h| h.trim().is_empty())
+                    && link
+                        .target_block
+                        .as_deref()
+                        .is_none_or(|b| b.trim().is_empty());
+
+                let target_id = if is_degenerate {
+                    None
+                } else if link.target_doc.is_empty() {
                     Some(id.clone())
                 } else {
                     self.resolve_link(&link.target_doc).cloned()
@@ -345,7 +387,19 @@ impl Index {
                 ) && !link.target_doc.starts_with("http://")
                     && !link.target_doc.starts_with("https://")
                 {
-                    let target_id = if link.target_doc.is_empty() {
+                    let is_degenerate = link.target_doc.is_empty()
+                        && link
+                            .target_heading
+                            .as_deref()
+                            .is_none_or(|h| h.trim().is_empty())
+                        && link
+                            .target_block
+                            .as_deref()
+                            .is_none_or(|b| b.trim().is_empty());
+
+                    let target_id = if is_degenerate {
+                        None
+                    } else if link.target_doc.is_empty() {
                         Some(id.clone())
                     } else {
                         self.resolve_link(&link.target_doc).cloned()
@@ -435,4 +489,34 @@ pub struct IndexStats {
     pub orphan_docs: usize,
     pub total_headings: usize,
     pub total_words: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_document;
+
+    #[test]
+    fn empty_and_degenerate_links_are_silent() {
+        let content = "# Test\n\nEmpty: [[]] and [[#]] and [[|sadece-display]]";
+        let doc = parse_document(content, Path::new("test.md"));
+        let index = Index::build(vec![doc.clone()]);
+
+        // 0 broken links (degenerate links are resolved silently as intra-doc without diagnostics)
+        assert_eq!(index.broken_link_count(), 0);
+
+        // 0 incoming backlinks (degenerate links produce 0 backlinks)
+        let doc_id = DocId::new("test.md");
+        assert_eq!(index.backlinks_of(&doc_id).count(), 0);
+
+        // Individual full resolution
+        for link in &doc.links {
+            let res = index.resolve_link_full(link, Some(&doc));
+            assert!(
+                matches!(res, LinkResolution::Resolved { anchor: None, .. }),
+                "Expected Resolved anchor: None for link: {:?}",
+                link
+            );
+        }
+    }
 }

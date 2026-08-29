@@ -84,7 +84,19 @@ impl Index {
             for link in &doc.links {
                 match link.kind {
                     LinkKind::WikiLink | LinkKind::Embed => {
-                        let target_id = if link.target_doc.is_empty() {
+                        let is_degenerate = link.target_doc.is_empty()
+                            && link
+                                .target_heading
+                                .as_deref()
+                                .is_none_or(|h| h.trim().is_empty())
+                            && link
+                                .target_block
+                                .as_deref()
+                                .is_none_or(|b| b.trim().is_empty());
+
+                        let target_id = if is_degenerate {
+                            None
+                        } else if link.target_doc.is_empty() {
                             Some(src_id.clone())
                         } else {
                             index.resolve_link(&link.target_doc).cloned()
@@ -101,14 +113,11 @@ impl Index {
                     LinkKind::Markdown => {
                         if link.target_doc.starts_with("http://")
                             || link.target_doc.starts_with("https://")
+                            || link.target_doc.is_empty()
                         {
                             continue;
                         }
-                        let target_id = if link.target_doc.is_empty() {
-                            Some(src_id.clone())
-                        } else {
-                            index.resolve_link(&link.target_doc).cloned()
-                        };
+                        let target_id = index.resolve_link(&link.target_doc).cloned();
 
                         if let Some(target_id) = target_id {
                             index

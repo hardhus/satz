@@ -80,21 +80,21 @@ impl SatzState {
         if let Ok(rel) = path.strip_prefix(root) {
             return rel.to_path_buf();
         }
-        // Fallback for case-insensitive platforms (Windows)
-        let path_str = path.to_string_lossy();
-        let root_str = root.to_string_lossy();
-        if path_str
-            .to_lowercase()
-            .starts_with(&root_str.to_lowercase())
-        {
-            let root_len = root_str.len();
-            let mut rel_str = &path_str[root_len..];
-            if rel_str.starts_with('/') || rel_str.starts_with('\\') {
-                rel_str = &rel_str[1..];
+
+        let mut path_comps = path.components();
+        for rc in root.components() {
+            let mut clone_comps = path_comps.clone();
+            match clone_comps.next() {
+                Some(pc)
+                    if satz_core::slug::fold_key(&pc.as_os_str().to_string_lossy())
+                        == satz_core::slug::fold_key(&rc.as_os_str().to_string_lossy()) =>
+                {
+                    path_comps = clone_comps;
+                }
+                _ => return path.to_path_buf(),
             }
-            return PathBuf::from(rel_str);
         }
-        path.to_path_buf()
+        path_comps.as_path().to_path_buf()
     }
 
     /// Handles opening a new document.
@@ -143,5 +143,24 @@ impl SatzState {
     /// Closes and untracks an open document.
     pub fn close_document(&mut self, uri: &str) {
         self.open_docs.remove(uri);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_rel_path_with_turkish_vault_root() {
+        let root = Path::new("/notlar/İş");
+        let path = Path::new("/notlar/İş/projeler/proje1.md");
+        let rel = SatzState::get_rel_path(path, Some(root));
+        assert_eq!(rel, PathBuf::from("projeler/proje1.md"));
+
+        // Case-insensitive test on Windows path format
+        let root_win = Path::new("C:\\Notlar\\İş");
+        let path_win = Path::new("c:\\notlar\\iş\\projeler\\proje1.md");
+        let rel_win = SatzState::get_rel_path(path_win, Some(root_win));
+        assert_eq!(rel_win, PathBuf::from("projeler\\proje1.md"));
     }
 }
