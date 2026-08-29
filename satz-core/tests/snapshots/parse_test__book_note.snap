@@ -87,16 +87,16 @@ links:
 tags:
   - name: felsefe
     range:
-      start: 0
-      end: 174
+      start: 82
+      end: 89
   - name: wittgenstein
     range:
-      start: 0
-      end: 174
+      start: 91
+      end: 103
   - name: mantık
     range:
-      start: 0
-      end: 174
+      start: 105
+      end: 112
   - name: alıntı
     range:
       start: 381

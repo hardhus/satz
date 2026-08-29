@@ -123,7 +123,11 @@ impl LanguageServer for Backend {
                             *current_state = new_state;
                         }
 
-                        crate::watcher::spawn_watcher(root_clone, state_arc.clone(), client.clone());
+                        crate::watcher::spawn_watcher(
+                            root_clone,
+                            state_arc.clone(),
+                            client.clone(),
+                        );
                         client
                             .log_message(
                                 MessageType::INFO,
@@ -143,9 +147,7 @@ impl LanguageServer for Backend {
                         };
 
                         if supports_pull {
-                            let _ = client
-                                .send_request::<WorkspaceDiagnosticRefresh>(())
-                                .await;
+                            let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
                         } else {
                             for uri in uris {
                                 publish_for(&client, &state_arc, &uri).await;

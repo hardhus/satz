@@ -60,12 +60,12 @@ links:
 tags:
   - name: daily
     range:
-      start: 0
-      end: 65
+      start: 31
+      end: 36
   - name: log
     range:
-      start: 0
-      end: 65
+      start: 38
+      end: 41
   - name: fikir
     range:
       start: 193

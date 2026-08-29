@@ -12,6 +12,29 @@ use crate::model::range::ByteRange;
 use crate::model::tag::Tag;
 use crate::text::LineIndex;
 
+fn locate_fm_tag(source: &str, fm: ByteRange, name: &str, from: usize) -> Option<ByteRange> {
+    let hay = &source[fm.start..fm.end];
+    let mut at = from;
+    while let Some(idx) = hay[at..].find(name) {
+        let s = at + idx;
+        let e = s + name.len();
+        let prev_ok = s == 0
+            || !hay[..s]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '/');
+        let next_ok = hay[e..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '/');
+        if prev_ok && next_ok {
+            return Some(ByteRange::new(fm.start + s, fm.start + e));
+        }
+        at = e;
+    }
+    None
+}
+
 /// Parses a single Markdown source text into a complete `Document`.
 ///
 /// This is the primary single-file entry point in `satz-core`.
@@ -41,12 +64,22 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
     let inline = inline_scan::scan_inline(source, &code_spans);
 
     // Frontmatter tags + body tags
-    let fm_range = structure.frontmatter_range.unwrap_or(ByteRange::new(0, 0));
-    let mut tags: Vec<Tag> = frontmatter
-        .tags
-        .iter()
-        .map(|t| Tag::new(t.clone(), fm_range))
-        .collect();
+    let mut tags: Vec<Tag> = Vec::new();
+    if let Some(fm_range) = structure.frontmatter_range {
+        let mut fm_cursor = 0usize;
+        for t in &frontmatter.tags {
+            let clean_name = t.trim_start_matches('#');
+            if let Some(range) = locate_fm_tag(source, fm_range, clean_name, fm_cursor) {
+                fm_cursor = range.end.saturating_sub(fm_range.start);
+                tags.push(Tag::new(t.clone(), range));
+            } else {
+                tags.push(Tag::new(
+                    t.clone(),
+                    ByteRange::new(fm_range.start, fm_range.start),
+                ));
+            }
+        }
+    }
     tags.extend(inline.tags);
 
     // Combine all links: markdown, wikilinks, and footnote references
@@ -130,5 +163,22 @@ Here is a tag: #syntax and a footnote[^1].
         // Footnotes
         assert_eq!(doc.footnotes.definitions.len(), 1);
         assert_eq!(doc.footnotes.definitions[0].label, "1");
+    }
+
+    #[test]
+    fn test_frontmatter_tag_range() {
+        let md = "---\ntitle: Foo\ntags: [rust, yazilim/araclar]\n---\n# Foo";
+        let doc = parse_document(md, Path::new("foo.md"));
+        let rust_tag = doc.tags.iter().find(|t| t.name == "rust").unwrap();
+        assert_eq!(&md[rust_tag.range.start..rust_tag.range.end], "rust");
+        let yazilim_tag = doc
+            .tags
+            .iter()
+            .find(|t| t.name == "yazilim/araclar")
+            .unwrap();
+        assert_eq!(
+            &md[yazilim_tag.range.start..yazilim_tag.range.end],
+            "yazilim/araclar"
+        );
     }
 }

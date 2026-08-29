@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{mpsc, RwLock};
-use tower_lsp_server::ls_types::request::WorkspaceDiagnosticRefresh;
+use tokio::sync::{RwLock, mpsc};
 use tower_lsp_server::Client;
+use tower_lsp_server::ls_types::request::WorkspaceDiagnosticRefresh;
 
 use crate::state::SatzState;
 
@@ -125,9 +125,7 @@ async fn process_file_event(
     };
 
     if supports_pull {
-        let _ = client
-            .send_request::<WorkspaceDiagnosticRefresh>(())
-            .await;
+        let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
     } else {
         for uri in uris {
             crate::backend::publish_for(client, state, &uri).await;

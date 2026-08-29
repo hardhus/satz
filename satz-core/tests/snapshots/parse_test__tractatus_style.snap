@@ -45,12 +45,12 @@ links:
 tags:
   - name: tractatus
     range:
-      start: 0
-      end: 98
+      start: 74
+      end: 83
   - name: ontoloji
     range:
-      start: 0
-      end: 98
+      start: 85
+      end: 93
   - name: ontoloji
     range:
       start: 315

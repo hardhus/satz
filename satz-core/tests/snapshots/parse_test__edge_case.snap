@@ -135,8 +135,8 @@ links:
 tags:
   - name: unicode-test
     range:
-      start: 0
-      end: 119
+      start: 67
+      end: 79
   - name: gerçek-tag
     range:
       start: 472
