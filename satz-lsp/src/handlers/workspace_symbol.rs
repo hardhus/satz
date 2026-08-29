@@ -35,7 +35,7 @@ pub fn workspace_symbol(
     // Sort documents by path for stable ordering
     candidate_docs.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
 
-    let mut ranker = Ranker::new();
+    let mut ranker = Ranker::new(search_query);
     let mut scored_symbols: Vec<(u32, SymbolInformation)> = Vec::new();
 
     for doc in candidate_docs {
@@ -60,7 +60,7 @@ pub fn workspace_symbol(
             doc.id.as_str().to_string()
         };
 
-        if let Some(score) = ranker.score(search_query, &title_name) {
+        if let Some(score) = ranker.score(&title_name) {
             #[allow(deprecated)]
             scored_symbols.push((
                 score,
@@ -77,7 +77,7 @@ pub fn workspace_symbol(
 
         // 2. Match Doc Aliases
         for alias in &doc.frontmatter.aliases {
-            if let Some(score) = ranker.score(search_query, alias) {
+            if let Some(score) = ranker.score(alias) {
                 #[allow(deprecated)]
                 scored_symbols.push((
                     score,
@@ -96,7 +96,7 @@ pub fn workspace_symbol(
         // 3. Match Headings
         for heading in &doc.headings {
             let heading_text = heading.text.trim();
-            if let Some(score) = ranker.score(search_query, heading_text) {
+            if let Some(score) = ranker.score(heading_text) {
                 let range = byte_range_to_lsp(heading.range, &doc.line_index);
                 #[allow(deprecated)]
                 scored_symbols.push((

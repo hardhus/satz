@@ -116,7 +116,8 @@ impl LanguageServer for Backend {
                                     &doc.path,
                                     new_state.vault_root.as_deref(),
                                 );
-                                let parsed = satz_core::parse_document(&doc.content, &rel_path);
+                                let content = doc.rope.to_string();
+                                let parsed = satz_core::parse_document(&content, &rel_path);
                                 new_state.index.replace_doc(parsed);
                             }
 

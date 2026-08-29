@@ -12,7 +12,6 @@ pub struct OpenDocument {
     pub uri: String,
     pub path: PathBuf,
     pub rope: Rope,
-    pub content: String,
     pub version: i32,
 }
 
@@ -24,13 +23,11 @@ impl OpenDocument {
         content: impl Into<String>,
         version: i32,
     ) -> Self {
-        let content_str = content.into();
-        let rope = Rope::from_str(&content_str);
+        let rope = Rope::from_str(&content.into());
         Self {
             uri: uri.into(),
             path,
             rope,
-            content: content_str,
             version,
         }
     }
@@ -136,7 +133,6 @@ impl SatzState {
 
         let path = open_doc.path.clone();
         let content = open_doc.rope.to_string();
-        open_doc.content = content.clone();
 
         let rel_path = Self::get_rel_path(&path, self.vault_root.as_deref());
 

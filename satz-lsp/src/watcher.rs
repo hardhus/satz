@@ -43,7 +43,7 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
                             EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                         ) {
                             for path in paths {
-                                if is_markdown_file(&path) && !is_ignored_path(&path) {
+                                if is_markdown_file(&path) && !is_ignored_path(&path, &vault_root) {
                                     let _ = tx.send(path);
                                 }
                             }
@@ -140,9 +140,12 @@ fn is_markdown_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_ignored_path(path: &Path) -> bool {
-    path.components().any(|comp| {
-        let s = comp.as_os_str().to_string_lossy();
-        s.starts_with('.') && s != "." && s != ".."
-    })
+fn is_ignored_path(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            s.starts_with('.') && s != "." && s != ".."
+        })
 }

@@ -61,6 +61,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
     if let Some(fm_range) = structure.frontmatter_range {
         code_spans.push(fm_range);
     }
+    code_spans.sort_unstable_by_key(|s| s.start);
     let inline = inline_scan::scan_inline(source, &code_spans);
 
     // Frontmatter tags + body tags

@@ -5,22 +5,19 @@ use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, Text
 pub fn formatting(params: DocumentFormattingParams, state: &SatzState) -> Option<Vec<TextEdit>> {
     let uri = params.text_document.uri.as_str();
     let open_doc = state.open_docs.get(uri)?;
-    let original = &open_doc.content;
+    let original = open_doc.rope.to_string();
 
-    let formatted = satz_core::formatter::format_document(original, &state.config.formatter);
+    let formatted = satz_core::formatter::format_document(&original, &state.config.formatter);
 
-    if formatted == *original {
+    if formatted == original {
         return Some(vec![]);
     }
 
-    let line_count = original.lines().count() as u32;
-    let last_line_len = original.lines().last().map(|l| l.len() as u32).unwrap_or(0);
+    let li = satz_core::LineIndex::new(&original);
+    let end = li.byte_to_position(original.len());
 
     Some(vec![TextEdit {
-        range: Range::new(
-            Position::new(0, 0),
-            Position::new(line_count, last_line_len),
-        ),
+        range: Range::new(Position::new(0, 0), Position::new(end.line, end.character)),
         new_text: formatted,
     }])
 }

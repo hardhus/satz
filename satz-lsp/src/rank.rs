@@ -4,33 +4,29 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 /// Fuzzy matcher utility for scoring target strings against a query pattern.
 pub struct Ranker {
     matcher: Matcher,
-}
-
-impl Default for Ranker {
-    fn default() -> Self {
-        Self::new()
-    }
+    pattern: Pattern,
+    buf: Vec<char>,
+    is_empty_query: bool,
 }
 
 impl Ranker {
-    pub fn new() -> Self {
+    pub fn new(query: &str) -> Self {
         Self {
             matcher: Matcher::new(Config::DEFAULT),
+            pattern: Pattern::parse(query, CaseMatching::Smart, Normalization::Smart),
+            buf: Vec::new(),
+            is_empty_query: query.is_empty(),
         }
     }
 
     /// Returns a score if `target` matches `pattern`. Higher score means better match.
-    pub fn score(&mut self, pattern_str: &str, target: &str) -> Option<u32> {
-        if pattern_str.is_empty() {
+    pub fn score(&mut self, target: &str) -> Option<u32> {
+        if self.is_empty_query {
             return Some(0);
         }
-
-        let pattern = Pattern::parse(pattern_str, CaseMatching::Smart, Normalization::Smart);
-
-        let mut buf = Vec::new();
-        let utf32_target = Utf32Str::new(target, &mut buf);
-
-        pattern.score(utf32_target, &mut self.matcher)
+        self.buf.clear();
+        self.pattern
+            .score(Utf32Str::new(target, &mut self.buf), &mut self.matcher)
     }
 }
 
@@ -40,12 +36,13 @@ mod tests {
 
     #[test]
     fn test_ranker_fuzzy_match() {
-        let mut ranker = Ranker::new();
-        let score1 = ranker.score("sat", "satz-project");
-        let score2 = ranker.score("xyz", "satz-project");
-
+        let mut ranker = Ranker::new("sat");
+        let score1 = ranker.score("satz-project");
         assert!(score1.is_some());
-        assert!(score2.is_none());
         assert!(score1.unwrap() > 0);
+
+        let mut ranker_miss = Ranker::new("xyz");
+        let score2 = ranker_miss.score("satz-project");
+        assert!(score2.is_none());
     }
 }

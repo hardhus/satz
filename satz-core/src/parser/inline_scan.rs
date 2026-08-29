@@ -17,14 +17,15 @@ pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let mut i = 0;
-
-    let is_in_code =
-        |offset: usize| -> bool { code_spans.iter().any(|span| span.contains(offset)) };
+    let mut si = 0usize;
 
     while i < len {
         // Skip code spans quickly
-        if let Some(span) = code_spans.iter().find(|s| s.contains(i)) {
-            i = span.end;
+        while si < code_spans.len() && code_spans[si].end <= i {
+            si += 1;
+        }
+        if si < code_spans.len() && code_spans[si].contains(i) {
+            i = code_spans[si].end;
             continue;
         }
 
@@ -32,7 +33,8 @@ pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
         if bytes[i] == b'!' && i + 2 < len && bytes[i + 1] == b'[' && bytes[i + 2] == b'[' {
             let start = i;
             if let Some((link, next_i)) = parse_wikilink(source, start, true) {
-                if !code_spans.iter().any(|s| s.overlaps(&link.range)) {
+                let overlaps = si < code_spans.len() && code_spans[si].overlaps(&link.range);
+                if !overlaps {
                     output.wiki_links.push(link);
                 }
                 i = next_i;
@@ -41,7 +43,8 @@ pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
         } else if bytes[i] == b'[' && i + 1 < len && bytes[i + 1] == b'[' {
             let start = i;
             if let Some((link, next_i)) = parse_wikilink(source, start, false) {
-                if !code_spans.iter().any(|s| s.overlaps(&link.range)) {
+                let overlaps = si < code_spans.len() && code_spans[si].overlaps(&link.range);
+                if !overlaps {
                     output.wiki_links.push(link);
                 }
                 i = next_i;
@@ -67,10 +70,11 @@ pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
                 }
             };
 
-            if valid_prefix && !is_in_code(start) {
+            if valid_prefix {
                 let tag_opt = parse_tag(source, start);
                 if let Some((tag, next_i)) = tag_opt {
-                    if !code_spans.iter().any(|s| s.overlaps(&tag.range)) {
+                    let overlaps = si < code_spans.len() && code_spans[si].overlaps(&tag.range);
+                    if !overlaps {
                         output.tags.push(tag);
                     }
                     i = next_i;
@@ -93,11 +97,9 @@ pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
                 Some(c) => c.is_whitespace(),
             };
 
-            if valid_prefix
-                && !is_in_code(start)
-                && let Some((block, next_i)) = parse_block_anchor(source, start)
-            {
-                if !code_spans.iter().any(|s| s.overlaps(&block.range)) {
+            if valid_prefix && let Some((block, next_i)) = parse_block_anchor(source, start) {
+                let overlaps = si < code_spans.len() && code_spans[si].overlaps(&block.range);
+                if !overlaps {
                     output.blocks.push(block);
                 }
                 i = next_i;
