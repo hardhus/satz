@@ -48,6 +48,9 @@ pub struct FormatterConfig {
     pub final_newline: bool,
     pub normalize_links: bool,
     pub tables: TablesConfig,
+    pub lists: ListsConfig,
+    pub emphasis: EmphasisConfig,
+    pub misc: MiscConfig,
 }
 
 impl Default for FormatterConfig {
@@ -59,6 +62,9 @@ impl Default for FormatterConfig {
             final_newline: true,
             normalize_links: true,
             tables: TablesConfig::default(),
+            lists: ListsConfig::default(),
+            emphasis: EmphasisConfig::default(),
+            misc: MiscConfig::default(),
         }
     }
 }
@@ -80,6 +86,74 @@ impl Default for TablesConfig {
             enable: true,
             cell_padding: 1,
             min_column_width: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ListsConfig {
+    /// Enable list marker and task-checkbox normalization. Default: true.
+    pub enable: bool,
+    /// Unordered list marker character: "-", "*", or "+". Default: "-".
+    pub marker: String,
+    /// Renumber ordered lists sequentially (1. 2. 3. ...) starting from the list's own first
+    /// number, regardless of what the user typed for later items. Default: true.
+    pub renumber_ordered: bool,
+}
+
+impl Default for ListsConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            marker: "-".to_string(),
+            renumber_ordered: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct EmphasisConfig {
+    /// Enable emphasis/strong delimiter normalization. Default: true.
+    pub enable: bool,
+    /// Italic delimiter: "*" or "_". Default: "*".
+    pub italic_marker: String,
+    /// Bold delimiter: "**" or "__". Default: "**".
+    pub bold_marker: String,
+}
+
+impl Default for EmphasisConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            italic_marker: "*".to_string(),
+            bold_marker: "**".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MiscConfig {
+    /// Enable thematic-break and code-fence style normalization. Default: true.
+    pub enable: bool,
+    /// Thematic break (horizontal rule) style: "---", "***", or "___". Default: "---".
+    pub hr_style: String,
+    /// Code fence style: "```" or "~~~". Default: "```".
+    pub code_fence_style: String,
+    /// Guarantee exactly one space after every blockquote `>` marker (at every nesting level).
+    /// Default: true.
+    pub blockquote_single_space: bool,
+}
+
+impl Default for MiscConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            hr_style: "---".to_string(),
+            code_fence_style: "```".to_string(),
+            blockquote_single_space: true,
         }
     }
 }
@@ -213,6 +287,16 @@ mod tests {
         assert!(cfg.formatter.tables.enable);
         assert_eq!(cfg.formatter.tables.cell_padding, 1);
         assert_eq!(cfg.formatter.tables.min_column_width, 3);
+        assert!(cfg.formatter.lists.enable);
+        assert_eq!(cfg.formatter.lists.marker, "-");
+        assert!(cfg.formatter.lists.renumber_ordered);
+        assert!(cfg.formatter.emphasis.enable);
+        assert_eq!(cfg.formatter.emphasis.italic_marker, "*");
+        assert_eq!(cfg.formatter.emphasis.bold_marker, "**");
+        assert!(cfg.formatter.misc.enable);
+        assert_eq!(cfg.formatter.misc.hr_style, "---");
+        assert_eq!(cfg.formatter.misc.code_fence_style, "```");
+        assert!(cfg.formatter.misc.blockquote_single_space);
     }
 
     #[test]
@@ -247,6 +331,22 @@ normalize_links = false
 enable = false
 cell_padding = 2
 min_column_width = 5
+
+[formatter.lists]
+enable = false
+marker = "*"
+renumber_ordered = false
+
+[formatter.emphasis]
+enable = false
+italic_marker = "_"
+bold_marker = "__"
+
+[formatter.misc]
+enable = false
+hr_style = "***"
+code_fence_style = "~~~"
+blockquote_single_space = false
 "#;
         let cfg = VaultConfig::from_toml(toml_str).unwrap();
         assert_eq!(cfg.id_scheme, IdSchemeConfig::Hierarchical);
@@ -264,5 +364,15 @@ min_column_width = 5
         assert!(!cfg.formatter.tables.enable);
         assert_eq!(cfg.formatter.tables.cell_padding, 2);
         assert_eq!(cfg.formatter.tables.min_column_width, 5);
+        assert!(!cfg.formatter.lists.enable);
+        assert_eq!(cfg.formatter.lists.marker, "*");
+        assert!(!cfg.formatter.lists.renumber_ordered);
+        assert!(!cfg.formatter.emphasis.enable);
+        assert_eq!(cfg.formatter.emphasis.italic_marker, "_");
+        assert_eq!(cfg.formatter.emphasis.bold_marker, "__");
+        assert!(!cfg.formatter.misc.enable);
+        assert_eq!(cfg.formatter.misc.hr_style, "***");
+        assert_eq!(cfg.formatter.misc.code_fence_style, "~~~");
+        assert!(!cfg.formatter.misc.blockquote_single_space);
     }
 }
