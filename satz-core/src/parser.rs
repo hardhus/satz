@@ -109,6 +109,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         path: path.to_path_buf(),
         title,
         frontmatter,
+        frontmatter_range: structure.frontmatter_range,
         headings: structure.headings,
         links,
         tags,

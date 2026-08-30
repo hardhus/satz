@@ -14,6 +14,9 @@ frontmatter:
   date: 2024-03-20
   extra:
     custom_field: 42
+frontmatter_range:
+  start: 0
+  end: 119
 headings:
   - level: 1
     text: Kenar Durumları ığüşçö 😀

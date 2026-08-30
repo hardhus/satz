@@ -5,7 +5,20 @@ pub struct VaultConfig {
     pub daily_note: DailyNoteConfig,
     pub frontmatter: FrontmatterConfig,
     pub lsp: LspConfig,
+    pub hover: HoverConfig,
     pub formatter: FormatterConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct HoverConfig {
+    pub preview_lines: usize,
+}
+
+impl Default for HoverConfig {
+    fn default() -> Self {
+        Self { preview_lines: 8 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -103,6 +116,7 @@ mod tests {
         assert_eq!(cfg.daily_note.format, "%Y-%m-%d");
         assert!(!cfg.lsp.codelens.enable);
         assert!(cfg.lsp.inlay_hints.enable);
+        assert_eq!(cfg.hover.preview_lines, 8);
         assert_eq!(cfg.formatter.line_width, 80);
         assert_eq!(cfg.formatter.blank_lines_around_headings, 1);
         assert!(cfg.formatter.final_newline);
@@ -127,6 +141,9 @@ enable = true
 [lsp.inlay_hints]
 enable = false
 
+[hover]
+preview_lines = 12
+
 [formatter]
 line_width = 100
 blank_lines_around_headings = 2
@@ -140,6 +157,7 @@ normalize_links = false
         assert_eq!(cfg.frontmatter.required_fields, vec!["title", "date"]);
         assert!(cfg.lsp.codelens.enable);
         assert!(!cfg.lsp.inlay_hints.enable);
+        assert_eq!(cfg.hover.preview_lines, 12);
         assert_eq!(cfg.formatter.line_width, 100);
         assert_eq!(cfg.formatter.blank_lines_around_headings, 2);
         assert!(!cfg.formatter.final_newline);

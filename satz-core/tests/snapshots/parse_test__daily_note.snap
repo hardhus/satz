@@ -11,6 +11,9 @@ frontmatter:
     - daily
     - log
   date: 2024-01-15
+frontmatter_range:
+  start: 0
+  end: 65
 headings:
   - level: 1
     text: Günlük

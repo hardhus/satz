@@ -5,6 +5,7 @@ use crate::model::footnote::FootnoteTable;
 use crate::model::frontmatter::Frontmatter;
 use crate::model::heading::Heading;
 use crate::model::link::Link;
+use crate::model::range::ByteRange;
 use crate::model::tag::Tag;
 use crate::text::LineIndex;
 
@@ -35,6 +36,7 @@ pub struct Document {
     pub path: PathBuf,
     pub title: String,
     pub frontmatter: Frontmatter,
+    pub frontmatter_range: Option<ByteRange>,
     pub headings: Vec<Heading>,
     pub links: Vec<Link>,
     pub tags: Vec<Tag>,

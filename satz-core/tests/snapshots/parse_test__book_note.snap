@@ -18,6 +18,9 @@ frontmatter:
     author: Ludwig Wittgenstein
     status: reading
     year: 1921
+frontmatter_range:
+  start: 0
+  end: 174
 headings:
   - level: 1
     text: Tractatus Logico-Philosophicus
