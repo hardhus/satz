@@ -42,6 +42,7 @@ impl Default for HoverConfig {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FormatterConfig {
+    pub enabled: bool,
     pub line_width: usize,
     pub blank_lines_around_headings: u8,
     pub final_newline: bool,
@@ -51,6 +52,7 @@ pub struct FormatterConfig {
 impl Default for FormatterConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             line_width: 80,
             blank_lines_around_headings: 1,
             final_newline: true,
@@ -180,6 +182,7 @@ mod tests {
         assert!(!cfg.lsp.codelens.enable);
         assert!(cfg.lsp.inlay_hints.enable);
         assert_eq!(cfg.hover.preview_lines, 8);
+        assert!(cfg.formatter.enabled);
         assert_eq!(cfg.formatter.line_width, 80);
         assert_eq!(cfg.formatter.blank_lines_around_headings, 1);
         assert!(cfg.formatter.final_newline);
@@ -208,6 +211,7 @@ enable = false
 preview_lines = 12
 
 [formatter]
+enabled = false
 line_width = 100
 blank_lines_around_headings = 2
 final_newline = false
@@ -221,6 +225,7 @@ normalize_links = false
         assert!(cfg.lsp.codelens.enable);
         assert!(!cfg.lsp.inlay_hints.enable);
         assert_eq!(cfg.hover.preview_lines, 12);
+        assert!(!cfg.formatter.enabled);
         assert_eq!(cfg.formatter.line_width, 100);
         assert_eq!(cfg.formatter.blank_lines_around_headings, 2);
         assert!(!cfg.formatter.final_newline);

@@ -1,7 +1,8 @@
 use crate::config::FormatterConfig;
 
-/// Formats a markdown document deterministically according to the provided `FormatterConfig`.
-pub fn format_document(source: &str, config: &FormatterConfig) -> String {
+/// Line-based formatting pass: trailing whitespace, frontmatter/code-block preservation,
+/// blank-line and heading spacing normalization, wikilink whitespace trimming, final newline.
+pub fn run(source: &str, config: &FormatterConfig) -> String {
     if source.is_empty() {
         return if config.final_newline {
             "\n".to_string()
@@ -207,7 +208,7 @@ mod tests {
     fn test_trailing_whitespace_removal() {
         let input = "Line 1   \nLine 2\t\t\nLine 3";
         let config = FormatterConfig::default();
-        let formatted = format_document(input, &config);
+        let formatted = run(input, &config);
         assert_eq!(formatted, "Line 1\nLine 2\nLine 3\n");
     }
 
@@ -215,7 +216,7 @@ mod tests {
     fn test_consecutive_blank_lines_collapsed() {
         let input = "Line 1\n\n\n\n\nLine 2";
         let config = FormatterConfig::default();
-        let formatted = format_document(input, &config);
+        let formatted = run(input, &config);
         assert_eq!(formatted, "Line 1\n\nLine 2\n");
     }
 
@@ -223,7 +224,7 @@ mod tests {
     fn test_link_normalization() {
         let input = "See [[  note a  ]] and [[  note b  |  alias b  ]].";
         let config = FormatterConfig::default();
-        let formatted = format_document(input, &config);
+        let formatted = run(input, &config);
         assert_eq!(formatted, "See [[note a]] and [[note b|alias b]].\n");
     }
 
@@ -231,7 +232,7 @@ mod tests {
     fn test_code_block_preserved_verbatim() {
         let input = "```rust\nlet x = 1;   \n\n\nlet y = 2;\n```";
         let config = FormatterConfig::default();
-        let formatted = format_document(input, &config);
+        let formatted = run(input, &config);
         assert_eq!(formatted, "```rust\nlet x = 1;   \n\n\nlet y = 2;\n```\n");
     }
 
@@ -239,7 +240,7 @@ mod tests {
     fn test_heading_spacing() {
         let input = "# Heading 1\nContent\n\n\n\n## Heading 2\nContent 2";
         let config = FormatterConfig::default();
-        let formatted = format_document(input, &config);
+        let formatted = run(input, &config);
         assert_eq!(
             formatted,
             "# Heading 1\nContent\n\n## Heading 2\nContent 2\n"
@@ -250,7 +251,7 @@ mod tests {
     fn test_frontmatter_preserved() {
         let input = "---\ntitle: Note Title\ntags: [a, b]\n---\n\n\n# Heading\nContent";
         let config = FormatterConfig::default();
-        let formatted = format_document(input, &config);
+        let formatted = run(input, &config);
         assert_eq!(
             formatted,
             "---\ntitle: Note Title\ntags: [a, b]\n---\n\n# Heading\nContent\n"
@@ -261,8 +262,8 @@ mod tests {
     fn test_formatter_idempotence() {
         let input = "# Heading\n\nText with [[  link  ]] and code:\n\n```\nfoo\n```\n";
         let config = FormatterConfig::default();
-        let pass1 = format_document(input, &config);
-        let pass2 = format_document(&pass1, &config);
+        let pass1 = run(input, &config);
+        let pass2 = run(&pass1, &config);
         assert_eq!(pass1, pass2);
     }
 }

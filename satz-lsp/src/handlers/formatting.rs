@@ -3,6 +3,10 @@ use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, Text
 
 /// Formats a document according to the vault's FormatterConfig.
 pub fn formatting(params: DocumentFormattingParams, state: &SatzState) -> Option<Vec<TextEdit>> {
+    if !state.config.formatter.enabled {
+        return Some(vec![]);
+    }
+
     let uri = params.text_document.uri.as_str();
     let open_doc = state.open_docs.get(uri)?;
     let original = open_doc.rope.to_string();
@@ -92,5 +96,41 @@ mod tests {
 
         let edits = formatting(params, &state).expect("Edits expected");
         assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn test_formatting_disabled_returns_no_edits() {
+        let text = "Line 1   \n\n\n\nLine 2   ";
+        let rel_path = Path::new("test.md");
+        let doc = parse_document(text, rel_path);
+
+        let mut state = SatzState {
+            index: Index::build(vec![doc]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            ..Default::default()
+        };
+        state.config.formatter.enabled = false;
+        state.open_docs.insert(
+            "file:///test.md".to_string(),
+            crate::state::OpenDocument::new("file:///test.md", rel_path.to_path_buf(), text, 1),
+        );
+
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.md".parse().unwrap(),
+            },
+            options: tower_lsp_server::ls_types::FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let edits = formatting(params, &state).expect("Edits expected");
+        assert!(
+            edits.is_empty(),
+            "disabled formatter must return no edits even for dirty content"
+        );
     }
 }
