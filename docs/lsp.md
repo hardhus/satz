@@ -24,7 +24,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 | Code lens | "N backlinks" above the document. **Off by default** (`lsp.codelens.enable`). |
 | Inlay hints | Inline note metadata after links. **On by default** (`lsp.inlay_hints.enable`). |
 | Semantic tokens | Full-document only (no range requests). Legend: `link`, `unresolvedLink`, `tag`, `heading`, `embed`, `blockAnchor`. |
-| Document formatting | Whitespace/blank-line/link normalization — see [`docs/configuration.md`](configuration.md#formatter--used-by-the-lsps-format-document-and-by-satz_coreformatterformat_document-if-embedded-directly). |
+| Document formatting | Deterministic, structure-aware Markdown formatting (tables, lists, emphasis, thematic breaks, code fences, blockquotes) — see [`docs/configuration.md`](configuration.md#formatter--deterministic-markdown-formatting). |
 
 ## Diagnostics
 

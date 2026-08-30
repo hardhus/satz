@@ -43,10 +43,32 @@ moc_tags = ["moc", "index"]
 workspace = true
 
 [formatter]
+enabled = true
 line_width = 80
 blank_lines_around_headings = 1
 final_newline = true
 normalize_links = true
+
+[formatter.tables]
+enable = true
+cell_padding = 1
+min_column_width = 3
+
+[formatter.lists]
+enable = true
+marker = "-"
+renumber_ordered = true
+
+[formatter.emphasis]
+enable = true
+italic_marker = "*"
+bold_marker = "**"
+
+[formatter.misc]
+enable = true
+hr_style = "---"
+code_fence_style = "```"
+blockquote_single_space = true
 ```
 
 This is exactly the built-in default configuration, spelled out. You only need to include the keys you want to override.
@@ -100,14 +122,52 @@ This is exactly the built-in default configuration, spelled out. You only need t
 | `moc_tags` | list of strings | `["moc", "index"]` | Tag names (matched case/Unicode-folded, without `#`) that mark a note as a "Map of Content" — such notes are exempt from the `orphan-note` hint even if nothing links to them. |
 | `workspace` | bool | `true` | **Reserved, not yet enforced.** Intended to toggle workspace-wide diagnostics; the `workspace/diagnostic` LSP request currently always computes diagnostics for every document regardless of this setting. Safe to leave unset. |
 
-### `[formatter]` — used by the LSP's "Format Document" and by `satz_core::formatter::format_document` if embedded directly
+### `[formatter]` — deterministic Markdown formatting
+
+Used by `satz fmt`, the LSP's "Format Document" request, and `satz_core::formatter::format_document` if embedded directly.
+
+Deterministic, structure-aware Markdown formatting: the same input always produces the same byte-for-byte output. Every sub-table below can be disabled independently; `formatter.enabled = false` turns the whole thing off (both `satz fmt` and the LSP's format-on-request become a no-op).
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
+| `enabled` | bool | `true` | Master switch for the entire formatter. When `false`, `satz fmt` reports nothing to do and `textDocument/formatting` returns no edits. |
 | `line_width` | integer | `80` | **Reserved, not yet enforced.** The formatter does not currently wrap or rewrap prose to this width. Safe to leave unset. |
 | `blank_lines_around_headings` | integer (0–255) | `1` | Number of blank lines forced before each heading (headings immediately after frontmatter always get exactly one). |
 | `final_newline` | bool | `true` | Whether the formatted document must end with exactly one trailing newline. |
 | `normalize_links` | bool | `true` | Whether `[[  target  \|  display  ]]`-style wikilinks get their whitespace trimmed down to `[[target\|display]]` on format. |
+
+#### `[formatter.tables]`
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `enable` | bool | `true` | Detect and realign GFM pipe tables (column widths, alignment markers). Cell content itself is reproduced verbatim — never re-parsed — so inline markdown/wikilinks inside cells survive untouched. |
+| `cell_padding` | integer | `1` | Minimum whitespace padding on each side of a cell's content. |
+| `min_column_width` | integer | `3` | Minimum width (display columns) reserved for a column, even if its content is shorter. |
+
+#### `[formatter.lists]`
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `enable` | bool | `true` | Normalize unordered marker characters, renumber ordered lists, and canonicalize task-list checkboxes (`[ ]`/`[x]`). Indentation and nesting are never touched. |
+| `marker` | `"-"` \| `"*"` \| `"+"` | `"-"` | Character used for every unordered list marker in the vault. |
+| `renumber_ordered` | bool | `true` | Renumber ordered lists sequentially (`1. 2. 3. ...`) from the list's own starting number, regardless of what each item was originally typed as. The `.`/`)` delimiter is always normalized to `.` regardless of this setting — when `false`, only the *numbers themselves* are left as originally written. |
+
+#### `[formatter.emphasis]`
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `enable` | bool | `true` | Normalize emphasis/strong delimiters. Only the delimiter characters are touched — content (including nested emphasis or `[[wikilinks]]`) is never altered. |
+| `italic_marker` | `"*"` \| `"_"` | `"*"` | Delimiter used for single-emphasis (`*text*`/`_text_`). |
+| `bold_marker` | `"**"` \| `"__"` | `"**"` | Delimiter used for strong emphasis (`**text**`/`__text__`). |
+
+#### `[formatter.misc]`
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `enable` | bool | `true` | Enables thematic-break and code-fence style normalization (both governed by this one flag). |
+| `hr_style` | `"---"` \| `"***"` \| `"___"` | `"---"` | Style used for every thematic break (horizontal rule). The YAML frontmatter's own `---` fences are never affected — they're a distinct construct, not a thematic break. |
+| `code_fence_style` | `` "```" `` \| `"~~~"` | `` "```" `` | Style used for fenced code block delimiters. Fence length is preserved unless the code content itself contains a same-or-longer run of the target character, in which case the fence is lengthened just enough to stay unambiguous. An unterminated fence (cut off by EOF) has only its opening delimiter rewritten. |
+| `blockquote_single_space` | bool | `true` | Guarantee exactly one space after every `>` marker, at every nesting level (`>>text` → `> > text`). Lazy-continuation lines (part of a blockquote but not themselves prefixed with `>`) are left untouched. |
 
 ## See also
 

@@ -18,6 +18,7 @@ Point it at a folder of `.md` files and it gives you: link/tag/backlink indexing
 - `list` — filter documents by tag, orphan status, or list every broken link.
 - `resolve` — resolve a wikilink target to a file path from the shell.
 - `daily` — open or create today's daily note.
+- `fmt` — format the whole vault in place, or `--check` it in CI/pre-commit (tables, lists, emphasis, thematic breaks, code fences, blockquotes — deterministic, byte-for-byte).
 - `graph` — export the link graph as Graphviz DOT or JSON.
 
 **LSP (`satz-lsp`)**
@@ -56,6 +57,7 @@ satz list --vault . --tag project     # notes tagged #project (and #project/*)
 satz list --vault . --broken          # every broken link, with file:line
 satz resolve --vault . "[[My Note]]"  # -> path/to/my-note.md
 satz daily .                          # open/create today's daily note
+satz fmt . --check                    # CI check: exit 1 if anything needs formatting
 satz graph --vault . -f dot -o graph.dot && dot -Tsvg graph.dot -o graph.svg
 ```
 

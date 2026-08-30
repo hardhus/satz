@@ -1,6 +1,6 @@
 # CLI reference
 
-The `satz` binary exposes six subcommands. Run `satz --help` or `satz <command> --help` at any time for the same information from `clap`.
+The `satz` binary exposes seven subcommands. Run `satz --help` or `satz <command> --help` at any time for the same information from `clap`.
 
 General notes that apply to every command:
 
@@ -123,6 +123,30 @@ Behavior:
 |---|---|---|
 | `path` (positional) | `.` | Vault root. |
 | `-c, --create <bool>` | `true` | Whether to create the file if missing, e.g. `satz daily . --create false` to only report the path without creating anything. |
+
+## `satz fmt [path]`
+
+Formats every Markdown file in the vault in place, or checks whether they're already formatted — the guaranteed, editor-independent way to keep a vault consistently formatted (see [`docs/configuration.md`](configuration.md#formatter--deterministic-markdown-formatting) for everything `[formatter]` controls: tables, lists, emphasis, thematic breaks, code fences, blockquotes).
+
+```
+satz fmt . --check   # list files that would change; exit 1 if any would (CI/pre-commit)
+satz fmt . --write   # format in place (also the default if neither flag is given)
+```
+
+```
+$ satz fmt . --check
+notes/messy-table.md
+notes/mixed-emphasis.md
+✗ 2 file(s) need formatting, 41 file(s) already clean (18ms)
+```
+
+Runs in parallel (`rayon`) over every parsed document; a file whose formatted output is byte-identical to its current content is never written (no unnecessary I/O or mtime churn) in `--write` mode. If `formatter.enabled = false` in `.satz.toml`, the command prints a notice and exits successfully without touching anything.
+
+| Flag/Arg | Default | Meaning |
+|---|---|---|
+| `path` (positional) | `.` | Vault root. |
+| `--check` | off | Report which files would change (one relative path per line, sorted) without writing anything. Exits with status `1` if any file would change — usable directly as a CI or pre-commit check. Mutually exclusive with `--write`. |
+| `--write` | on (default) | Format files in place. This is what happens when neither flag is passed; passing it explicitly is only for clarity in scripts. Mutually exclusive with `--check`. |
 
 ## `satz graph`
 
