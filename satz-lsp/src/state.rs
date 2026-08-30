@@ -5,14 +5,29 @@ use ropey::Rope;
 use satz_core::{Index, VaultConfig, walk_vault};
 use tower_lsp_server::ls_types::TextDocumentContentChangeEvent;
 
+use std::time::Instant;
+use tokio::task::JoinHandle;
+
 /// In-memory representation of an open text document with a Rope buffer.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
 pub struct OpenDocument {
     pub uri: String,
     pub path: PathBuf,
     pub rope: Rope,
     pub version: i32,
+    pub first_change_at: Option<Instant>,
+    pub pending_task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for OpenDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenDocument")
+            .field("uri", &self.uri)
+            .field("path", &self.path)
+            .field("version", &self.version)
+            .field("first_change_at", &self.first_change_at)
+            .finish()
+    }
 }
 
 #[allow(dead_code)]
@@ -29,6 +44,8 @@ impl OpenDocument {
             path,
             rope,
             version,
+            first_change_at: None,
+            pending_task: None,
         }
     }
 }
@@ -139,26 +156,12 @@ impl SatzState {
         self.index.replace_doc(new_doc);
     }
 
-    /// Re-parses a single document upon changes (full text) and updates the index.
-    #[allow(dead_code)]
-    pub fn reparse_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
-        self.open_document(uri, content, path, version);
-    }
-
-    /// Applies incremental changes to an open document and updates the index.
-    pub fn apply_changes(
-        &mut self,
-        uri: &str,
-        changes: Vec<TextDocumentContentChangeEvent>,
-        version: i32,
-    ) {
+    /// Re-parses the in-memory rope content of an open document and updates index.
+    pub fn reparse_open_document(&mut self, uri: &str) {
         let Some(open_doc) = self.open_docs.get_mut(uri) else {
             return;
         };
-
-        crate::sync::apply_changes_to_rope(&mut open_doc.rope, changes);
-        open_doc.version = version;
-
+        open_doc.first_change_at = None;
         let path = open_doc.path.clone();
         let content = open_doc.rope.to_string();
 
@@ -181,9 +184,37 @@ impl SatzState {
         self.index.replace_doc(new_doc);
     }
 
-    /// Closes and untracks an open document.
+    /// Re-parses a single document upon changes (full text) and updates the index.
+    #[allow(dead_code)]
+    pub fn reparse_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
+        self.open_document(uri, content, path, version);
+    }
+
+    /// Applies incremental changes to an open document and updates the index.
+    #[allow(dead_code)]
+    pub fn apply_changes(
+        &mut self,
+        uri: &str,
+        changes: Vec<TextDocumentContentChangeEvent>,
+        version: i32,
+    ) {
+        let Some(open_doc) = self.open_docs.get_mut(uri) else {
+            return;
+        };
+
+        crate::sync::apply_changes_to_rope(&mut open_doc.rope, changes);
+        open_doc.version = version;
+
+        self.reparse_open_document(uri);
+    }
+
+    /// Closes and untracks an open document, aborting any background debounce tasks.
     pub fn close_document(&mut self, uri: &str) {
-        self.open_docs.remove(uri);
+        if let Some(mut doc) = self.open_docs.remove(uri)
+            && let Some(task) = doc.pending_task.take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -222,5 +253,76 @@ mod tests {
         assert_ne!(keys1, keys2);
         assert!(keys1.contains("eski baslik") || keys1.contains("eski başlık"));
         assert!(keys2.contains("yeni baslik") || keys2.contains("yeni başlık"));
+    }
+
+    #[test]
+    fn test_debounce_and_max_wait_delay_calculation() {
+        let debounce = std::time::Duration::from_millis(200);
+        let max_wait = std::time::Duration::from_millis(500);
+
+        // At t = 0
+        let elapsed_0 = std::time::Duration::from_millis(0);
+        let delay_0 = debounce.min(max_wait.saturating_sub(elapsed_0));
+        assert_eq!(delay_0, std::time::Duration::from_millis(200));
+
+        // At t = 100
+        let elapsed_100 = std::time::Duration::from_millis(100);
+        let delay_100 = debounce.min(max_wait.saturating_sub(elapsed_100));
+        assert_eq!(delay_100, std::time::Duration::from_millis(200));
+
+        // At t = 400 (max_wait capping)
+        let elapsed_400 = std::time::Duration::from_millis(400);
+        let delay_400 = debounce.min(max_wait.saturating_sub(elapsed_400));
+        assert_eq!(delay_400, std::time::Duration::from_millis(100));
+
+        // At t = 550 (max_wait exceeded)
+        let elapsed_550 = std::time::Duration::from_millis(550);
+        let delay_550 = debounce.min(max_wait.saturating_sub(elapsed_550));
+        assert_eq!(delay_550, std::time::Duration::from_millis(0));
+    }
+
+    #[tokio::test]
+    async fn test_async_debounced_task_execution() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let state = Arc::new(RwLock::new(SatzState::default()));
+        let uri = "file:///test.md";
+        let path = Path::new("test.md");
+
+        {
+            let mut s = state.write().await;
+            s.open_document(uri, "# Initial", path, 1);
+        }
+
+        // Send 3 rapid changes
+        for i in 2..=4 {
+            let mut s = state.write().await;
+            if let Some(doc) = s.open_docs.get_mut(uri) {
+                if let Some(prev) = doc.pending_task.take() {
+                    prev.abort();
+                }
+                doc.rope = ropey::Rope::from_str(&format!("# Version {}", i));
+                doc.version = i;
+
+                let state_clone = state.clone();
+                let uri_clone = uri.to_string();
+                let handle = tokio::task::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let mut st = state_clone.write().await;
+                    st.reparse_open_document(&uri_clone);
+                });
+                doc.pending_task = Some(handle);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Wait for final debounced task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let s = state.read().await;
+        let doc_id = satz_core::DocId::new("test.md");
+        let parsed = s.index.get_doc(&doc_id).expect("Doc should exist in index");
+        assert_eq!(parsed.title, "Version 4");
     }
 }

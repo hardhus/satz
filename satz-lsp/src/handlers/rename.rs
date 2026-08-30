@@ -43,8 +43,15 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> 
             });
         }
 
-        // Edit 2: Update all incoming backlinks to this heading across all documents
-        for src_doc in state.index.documents() {
+        // Edit 2: Update all incoming backlinks to this heading (scoped to backlinks + self)
+        let mut candidate_ids: std::collections::HashSet<&satz_core::DocId> =
+            state.index.backlinks_of(&doc_id).collect();
+        candidate_ids.insert(&doc_id);
+
+        for src_id in candidate_ids {
+            let Some(src_doc) = state.index.get_doc(src_id) else {
+                continue;
+            };
             let src_path = match &state.vault_root {
                 Some(root) if !src_doc.path.is_absolute() => root.join(&src_doc.path),
                 _ => src_doc.path.clone(),
@@ -120,8 +127,15 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> 
                     });
                 }
 
-                // Update all references
-                for src_doc in state.index.documents() {
+                // Update all references (scoped to backlinks + target)
+                let mut candidate_ids: std::collections::HashSet<&satz_core::DocId> =
+                    state.index.backlinks_of(target_id).collect();
+                candidate_ids.insert(target_id);
+
+                for src_id in candidate_ids {
+                    let Some(src_doc) = state.index.get_doc(src_id) else {
+                        continue;
+                    };
                     let src_path = match &state.vault_root {
                         Some(root) if !src_doc.path.is_absolute() => root.join(&src_doc.path),
                         _ => src_doc.path.clone(),
@@ -172,7 +186,15 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> 
 
             let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
-            for src_doc in state.index.documents() {
+            // Scoped to backlinks + target
+            let mut candidate_ids: std::collections::HashSet<&satz_core::DocId> =
+                state.index.backlinks_of(target_id).collect();
+            candidate_ids.insert(target_id);
+
+            for src_id in candidate_ids {
+                let Some(src_doc) = state.index.get_doc(src_id) else {
+                    continue;
+                };
                 let src_path = match &state.vault_root {
                     Some(root) if !src_doc.path.is_absolute() => root.join(&src_doc.path),
                     _ => src_doc.path.clone(),

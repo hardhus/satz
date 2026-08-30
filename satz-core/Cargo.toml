@@ -7,7 +7,6 @@ edition = "2024"
 anyhow.workspace = true
 chrono.workspace = true
 ignore.workspace = true
-petgraph.workspace = true
 pulldown-cmark.workspace = true
 rayon.workspace = true
 serde.workspace = true
@@ -20,4 +19,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 insta = { workspace = true, features = ["yaml"] }
+
+[[bench]]
+name = "benchmark"
+harness = false
 

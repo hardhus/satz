@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
 notify.workspace = true
 nucleo-matcher.workspace = true
 ropey.workspace = true

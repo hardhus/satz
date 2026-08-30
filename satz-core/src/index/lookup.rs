@@ -60,6 +60,22 @@ impl Index {
     /// 3. Stem match (`by_stem`)
     /// 4. Lowercase title or alias match (`by_title_alias`)
     pub fn resolve_link(&self, raw_target: &str) -> Option<&DocId> {
+        // Fast path: if target has no path separators or extension, check stem & title/alias directly
+        if !raw_target.contains('/') && !raw_target.contains('\\') && !raw_target.contains('.') {
+            let folded = fold_key(raw_target);
+            if let Some(id) = self.by_stem.get(&folded) {
+                return Some(id);
+            }
+            if let Some(id) = self.by_title_alias.get(&folded) {
+                return Some(id);
+            }
+            let as_path = Path::new(raw_target);
+            if let Some(id) = self.by_path.get(as_path) {
+                return Some(id);
+            }
+            return None;
+        }
+
         let normalized = raw_target.replace('\\', "/");
         let as_path = PathBuf::from(&normalized);
         if let Some(id) = self.by_path.get(&as_path) {
@@ -129,7 +145,12 @@ impl Index {
                 LinkResolution::AnchorMissing { doc: target_doc }
             }
         } else if let Some(heading_ref) = &link.target_heading {
-            if let Some(h) = target_doc.headings.iter().find(|h| h.matches(heading_ref)) {
+            let link_slug = crate::slug::slugify(heading_ref);
+            if let Some(h) = target_doc
+                .headings
+                .iter()
+                .find(|h| h.matches_slug(&link_slug) || h.matches(heading_ref))
+            {
                 LinkResolution::Resolved {
                     doc: target_doc,
                     anchor: Some(h.range),
@@ -152,7 +173,10 @@ impl Index {
 
     /// Retrieves a document by its vault-relative `Path`.
     pub fn get_doc_by_path(&self, path: &Path) -> Option<&Document> {
-        self.by_path.get(path).and_then(|id| self.docs.get(id))
+        let normalized = PathBuf::from(path.to_string_lossy().replace('\\', "/"));
+        self.by_path
+            .get(&normalized)
+            .and_then(|id| self.docs.get(id))
     }
 
     /// Returns an iterator over all document IDs that link to the given `id`.
@@ -304,15 +328,11 @@ impl Index {
             if self.by_path.get(&old_normalized) == Some(&id) {
                 self.by_path.remove(&old_normalized);
             }
-            if self.by_path.get(&old_doc.path) == Some(&id) {
-                self.by_path.remove(&old_doc.path);
-            }
         }
 
         // Insert new path
         let normalized_path = PathBuf::from(new_doc.path.to_string_lossy().replace('\\', "/"));
         self.by_path.insert(normalized_path, id.clone());
-        self.by_path.insert(new_doc.path.clone(), id.clone());
 
         // Insert new stem
         let new_stem_key = new_doc
@@ -457,9 +477,6 @@ impl Index {
             if self.by_path.get(&old_normalized) == Some(id) {
                 self.by_path.remove(&old_normalized);
             }
-            if self.by_path.get(&old_doc.path) == Some(id) {
-                self.by_path.remove(&old_doc.path);
-            }
 
             self.backlinks.remove(id);
         }
@@ -525,5 +542,58 @@ mod tests {
                 link
             );
         }
+    }
+
+    #[test]
+    fn test_fast_path_resolve_equivalence() {
+        let doc1 = parse_document(
+            "---\ntitle: Rust Rehberi\naliases: [Guide, Rehber]\n---\n# Rust Rehberi\nİçerik",
+            Path::new("books/rust.md"),
+        );
+        let doc2 = parse_document("# Genel Not\nİçerik", Path::new("genel.md"));
+        let index = Index::build(vec![doc1, doc2]);
+
+        // Targets without slashes/extensions (fast path candidates)
+        let fast_candidates = vec![
+            "rust",
+            "Rust",
+            "RUST",
+            "guide",
+            "Guide",
+            "rehber",
+            "Rust Rehberi",
+            "genel",
+            "Genel",
+            "Genel Not",
+            "nonexistent",
+        ];
+
+        for target in fast_candidates {
+            let res = index.resolve_link(target);
+            if target.eq_ignore_ascii_case("nonexistent") {
+                assert_eq!(res, None);
+            } else if target.to_lowercase().contains("rust")
+                || target.eq_ignore_ascii_case("guide")
+                || target.eq_ignore_ascii_case("rehber")
+            {
+                assert_eq!(res, Some(&DocId::new("books/rust.md")));
+            } else {
+                assert_eq!(res, Some(&DocId::new("genel.md")));
+            }
+        }
+
+        // Targets with paths/extensions
+        assert_eq!(
+            index.resolve_link("books/rust"),
+            Some(&DocId::new("books/rust.md"))
+        );
+        assert_eq!(
+            index.resolve_link("books/rust.md"),
+            Some(&DocId::new("books/rust.md"))
+        );
+        assert_eq!(
+            index.resolve_link("books\\rust.md"),
+            Some(&DocId::new("books/rust.md"))
+        );
     }
 }

@@ -17,7 +17,6 @@ impl Index {
         for doc in docs {
             let normalized_path = PathBuf::from(doc.path.to_string_lossy().replace('\\', "/"));
             index.by_path.insert(normalized_path, doc.id.clone());
-            index.by_path.insert(doc.path.clone(), doc.id.clone());
 
             let stem_key = doc
                 .path

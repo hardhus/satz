@@ -103,7 +103,6 @@ impl LanguageServer for Backend {
                 match result {
                     Ok(Ok(mut new_state)) => {
                         let doc_count = new_state.index.doc_count();
-                        let broken = new_state.index.broken_link_count();
 
                         {
                             let mut current_state = state_arc.write().await;
@@ -132,10 +131,7 @@ impl LanguageServer for Backend {
                         client
                             .log_message(
                                 MessageType::INFO,
-                                format!(
-                                    "satz: indexed {} documents ({} broken links)",
-                                    doc_count, broken
-                                ),
+                                format!("satz: indexed {} documents", doc_count),
                             )
                             .await;
 
@@ -283,41 +279,85 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 
-        let (peers_dirty, supports_pull, other_uris) = {
+        let (delay, prev_task) = {
             let mut state = self.state.write().await;
-            state.apply_changes(&uri, params.content_changes, version);
-            let dirty = state.peers_dirty;
-            state.peers_dirty = false;
-            let other: Vec<String> = state
-                .open_docs
-                .keys()
-                .filter(|u| *u != &uri)
-                .cloned()
-                .collect();
-            (dirty, state.client_supports_pull_diagnostics, other)
+            let debounce = std::time::Duration::from_millis(state.config.lsp.reparse_debounce_ms);
+            let max_wait = std::time::Duration::from_millis(state.config.lsp.reparse_max_wait_ms);
+
+            let Some(open_doc) = state.open_docs.get_mut(&uri) else {
+                return;
+            };
+
+            crate::sync::apply_changes_to_rope(&mut open_doc.rope, params.content_changes);
+            open_doc.version = version;
+
+            let now = std::time::Instant::now();
+            let first = open_doc.first_change_at.get_or_insert(now);
+            let elapsed = now.duration_since(*first);
+            let remaining = max_wait.saturating_sub(elapsed);
+            let delay = debounce.min(remaining);
+
+            let prev = open_doc.pending_task.take();
+            (delay, prev)
         };
 
-        self.publish_diagnostics_for_uri(&uri).await;
+        if let Some(task) = prev_task {
+            task.abort();
+        }
 
-        if peers_dirty {
-            if supports_pull {
-                let _ = self
-                    .client
-                    .send_request::<WorkspaceDiagnosticRefresh>(())
-                    .await;
-            } else {
-                for other_uri in other_uris {
-                    publish_for(&self.client, &self.state, &other_uri).await;
+        let state_arc = self.state.clone();
+        let client_clone = self.client.clone();
+        let uri_clone = uri.clone();
+
+        let handle = tokio::task::spawn(async move {
+            tokio::time::sleep(delay).await;
+
+            let (peers_dirty, supports_pull, other_uris) = {
+                let mut state = state_arc.write().await;
+                state.reparse_open_document(&uri_clone);
+                let dirty = state.peers_dirty;
+                state.peers_dirty = false;
+                let other: Vec<String> = state
+                    .open_docs
+                    .keys()
+                    .filter(|u| *u != &uri_clone)
+                    .cloned()
+                    .collect();
+                (dirty, state.client_supports_pull_diagnostics, other)
+            };
+
+            publish_for(&client_clone, &state_arc, &uri_clone).await;
+
+            if peers_dirty {
+                if supports_pull {
+                    let _ = client_clone
+                        .send_request::<WorkspaceDiagnosticRefresh>(())
+                        .await;
+                } else {
+                    for other_uri in other_uris {
+                        publish_for(&client_clone, &state_arc, &other_uri).await;
+                    }
                 }
             }
+        });
+
+        let mut state = self.state.write().await;
+        if let Some(open_doc) = state.open_docs.get_mut(&uri) {
+            open_doc.pending_task = Some(handle);
         }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
 
-        let (peers_dirty, supports_pull, other_uris) = {
+        let (peers_dirty, supports_pull, other_uris, prev_task) = {
             let mut state = self.state.write().await;
+            let prev = if let Some(open_doc) = state.open_docs.get_mut(&uri) {
+                open_doc.pending_task.take()
+            } else {
+                None
+            };
+            state.reparse_open_document(&uri);
             let dirty = state.peers_dirty;
             state.peers_dirty = false;
             let other: Vec<String> = state
@@ -326,8 +366,12 @@ impl LanguageServer for Backend {
                 .filter(|u| *u != &uri)
                 .cloned()
                 .collect();
-            (dirty, state.client_supports_pull_diagnostics, other)
+            (dirty, state.client_supports_pull_diagnostics, other, prev)
         };
+
+        if let Some(task) = prev_task {
+            task.abort();
+        }
 
         self.publish_diagnostics_for_uri(&uri).await;
 

@@ -41,11 +41,24 @@ impl Default for FormatterConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct LspConfig {
     pub codelens: CodelensConfig,
     pub inlay_hints: InlayHintConfig,
+    pub reparse_debounce_ms: u64,
+    pub reparse_max_wait_ms: u64,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            codelens: CodelensConfig::default(),
+            inlay_hints: InlayHintConfig::default(),
+            reparse_debounce_ms: 200,
+            reparse_max_wait_ms: 500,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
