@@ -132,3 +132,46 @@ fn test_satz_list_broken_command() {
     // Fixtures contain broken links to non-existent notes
     assert!(stdout.contains("— dosya bulunamadı") || stdout.contains("— dosya var, başlık yok"));
 }
+
+#[test]
+fn test_satz_graph_command() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("satz-core/tests/fixtures");
+
+    // 1. JSON format
+    let output_json = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args([
+            "graph",
+            "--vault",
+            fixtures.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("satz binary should execute");
+
+    assert!(output_json.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output_json.stdout).expect("output should be valid JSON");
+    assert!(json["nodes"].as_array().unwrap().len() >= 4);
+    assert!(json["edges"].as_array().is_some());
+
+    // 2. DOT format
+    let output_dot = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args([
+            "graph",
+            "--vault",
+            fixtures.to_str().unwrap(),
+            "--format",
+            "dot",
+        ])
+        .output()
+        .expect("satz binary should execute");
+
+    assert!(output_dot.status.success());
+    let dot = String::from_utf8_lossy(&output_dot.stdout);
+    assert!(dot.starts_with("digraph \"satz\" {"));
+    assert!(dot.contains("->"));
+}

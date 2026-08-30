@@ -3,6 +3,10 @@ name = "satz-cli"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "satz_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "satz"
 path = "src/main.rs"

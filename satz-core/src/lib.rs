@@ -1,5 +1,6 @@
 pub mod config;
 pub mod formatter;
+pub mod graph;
 pub mod index;
 pub mod model;
 pub mod parser;
@@ -14,6 +15,7 @@ pub fn version() -> &'static str {
 
 // Convenience re-exports
 pub use config::{DailyNoteConfig, DiagnosticsConfig, VaultConfig};
+pub use graph::{GraphData, GraphEdge, GraphNode, VaultGraph};
 pub use index::{IdScheme, Index, IndexStats, LinkResolution, PathScheme};
 pub use model::{
     ByteRange, DocId, Document, FootnoteDef, FootnoteTable, Frontmatter, Heading, Link, LinkKind,
