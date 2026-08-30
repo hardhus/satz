@@ -71,7 +71,20 @@ Full command reference, every flag, and exact output formats: **[`docs/cli.md`](
 
 ## Quick start: LSP
 
-Launch `satz-lsp` over stdio for Markdown files; it discovers the vault root from your editor's workspace folder. Minimal Neovim setup:
+Launch `satz-lsp` over stdio for Markdown files; it discovers the vault root from your editor's workspace folder.
+
+**Helix** (`languages.toml`, project or user config):
+
+```toml
+[language-server.satz]
+command = "satz-lsp"
+
+[[language]]
+name = "markdown"
+language-servers = ["satz"]
+```
+
+**Neovim** (built-in LSP client, no plugin required beyond `nvim-lspconfig` optionally):
 
 ```lua
 vim.api.nvim_create_autocmd("FileType", {
@@ -86,7 +99,7 @@ vim.api.nvim_create_autocmd("FileType", {
 })
 ```
 
-Full capability list, diagnostics codes, rename/code-action semantics, and more editor snippets (Helix, generic clients): **[`docs/lsp.md`](docs/lsp.md)**.
+Full capability list, diagnostics codes, rename/code-action semantics, and more editor snippets (generic clients): **[`docs/lsp.md`](docs/lsp.md)**.
 
 ## Configuration
 
