@@ -220,6 +220,12 @@ impl LanguageServer for Backend {
                     ),
                 ),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![
+                        crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND.to_string(),
+                    ],
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
 
@@ -533,6 +539,103 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
         let state = self.state.read().await;
         Ok(crate::handlers::formatting::formatting(params, &state))
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> jsonrpc::Result<Option<serde_json::Value>> {
+        if params.command != crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND {
+            return Err(jsonrpc::Error::method_not_found());
+        }
+
+        let changes = {
+            let state = self.state.read().await;
+            crate::handlers::execute_command::compute_format_changes(&state)
+        };
+
+        if changes.is_empty() {
+            self.client
+                .log_message(MessageType::INFO, "satz: vault is already fully formatted")
+                .await;
+            return Ok(Some(serde_json::json!({ "formatted": 0 })));
+        }
+
+        let count = changes.len();
+        let edit = crate::handlers::execute_command::build_workspace_edit(&changes);
+
+        let applied = match self.client.apply_edit(edit).await {
+            Ok(response) => response.applied,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("satz: workspace/applyEdit request failed: {}", e),
+                    )
+                    .await;
+                false
+            }
+        };
+
+        if !applied {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "satz: client did not apply the format-workspace edit",
+                )
+                .await;
+            return Ok(Some(serde_json::json!({ "formatted": 0 })));
+        }
+
+        // Keep any open document's in-memory rope (and the index built from it) in sync right
+        // away, rather than waiting for the client's own follow-up `didChange` notification.
+        let formatted_by_uri: std::collections::HashMap<String, &str> = changes
+            .iter()
+            .map(|c| (c.uri.as_str().to_string(), c.formatted.as_str()))
+            .collect();
+
+        let (supports_pull, all_open_uris) = {
+            let mut state = self.state.write().await;
+            let open_uris: Vec<String> = formatted_by_uri
+                .keys()
+                .filter(|uri| state.open_docs.contains_key(*uri))
+                .cloned()
+                .collect();
+
+            for uri in &open_uris {
+                if let Some(open_doc) = state.open_docs.get_mut(uri) {
+                    open_doc.rope = ropey::Rope::from_str(formatted_by_uri[uri]);
+                }
+            }
+            for uri in &open_uris {
+                state.reparse_open_document(uri);
+            }
+
+            (
+                state.client_supports_pull_diagnostics,
+                state.open_docs.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("satz: formatted {count} file(s)"),
+            )
+            .await;
+
+        if supports_pull {
+            let _ = self
+                .client
+                .send_request::<WorkspaceDiagnosticRefresh>(())
+                .await;
+        } else {
+            for uri in all_open_uris {
+                publish_for(&self.client, &self.state, &uri).await;
+            }
+        }
+
+        Ok(Some(serde_json::json!({ "formatted": count })))
     }
 
     async fn diagnostic(

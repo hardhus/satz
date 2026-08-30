@@ -1,7 +1,7 @@
 #![allow(clippy::collapsible_if)]
 
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command,
     CreateFile, DocumentChangeOperation, DocumentChanges, OneOf,
     OptionalVersionedTextDocumentIdentifier, Range, ResourceOp, TextDocumentEdit, TextEdit,
     WorkspaceEdit,
@@ -195,6 +195,26 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
         }
     }
 
+    // Source action: some clients surface `workspace/executeCommand`s more discoverably through
+    // the code action menu than through a dedicated command palette entry.
+    if state.config.formatter.enabled {
+        let action = CodeAction {
+            title: "Format entire vault".to_string(),
+            kind: Some(CodeActionKind::SOURCE),
+            diagnostics: None,
+            edit: None,
+            is_preferred: Some(false),
+            disabled: None,
+            command: Some(Command {
+                title: "Format entire vault".to_string(),
+                command: crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND.to_string(),
+                arguments: None,
+            }),
+            data: None,
+        };
+        actions.push(CodeActionOrCommand::CodeAction(action));
+    }
+
     if actions.is_empty() {
         None
     } else {
@@ -261,15 +281,24 @@ mod tests {
         };
 
         let response = code_action(params, &state).expect("CodeAction response expected");
-        assert_eq!(response.len(), 1);
+        // One quickfix for the broken link, plus the always-offered "Format entire vault" source
+        // action.
+        assert_eq!(response.len(), 2);
 
-        if let CodeActionOrCommand::CodeAction(action) = &response[0] {
-            assert!(action.title.contains("Create note: \"missing-note\""));
-            assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
-            assert!(action.edit.is_some());
-        } else {
-            panic!("Expected CodeAction");
-        }
+        let quickfix = response
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca)
+                    if ca.kind == Some(CodeActionKind::QUICKFIX) =>
+                {
+                    Some(ca)
+                }
+                _ => None,
+            })
+            .expect("quickfix action expected");
+        assert!(quickfix.title.contains("Create note: \"missing-note\""));
+        assert!(quickfix.edit.is_some());
+        assert_source_action_present(&response);
     }
 
     #[test]
@@ -375,18 +404,100 @@ mod tests {
         };
 
         let response = code_action(params, &state).expect("CodeAction response expected");
-        assert_eq!(response.len(), 1);
+        // One quickfix for the missing heading, plus the always-offered "Format entire vault"
+        // source action.
+        assert_eq!(response.len(), 2);
 
-        if let CodeActionOrCommand::CodeAction(action) = &response[0] {
-            assert!(
-                action
-                    .title
-                    .contains("Add heading '## İstemciler' to \"Doc B\"")
-            );
-            assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
-            assert!(action.edit.is_some());
+        let quickfix = response
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca)
+                    if ca.kind == Some(CodeActionKind::QUICKFIX) =>
+                {
+                    Some(ca)
+                }
+                _ => None,
+            })
+            .expect("quickfix action expected");
+        assert!(
+            quickfix
+                .title
+                .contains("Add heading '## İstemciler' to \"Doc B\"")
+        );
+        assert!(quickfix.edit.is_some());
+        assert_source_action_present(&response);
+    }
+
+    fn assert_source_action_present(response: &[CodeActionOrCommand]) {
+        let source_action = response
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) if ca.kind == Some(CodeActionKind::SOURCE) => {
+                    Some(ca)
+                }
+                _ => None,
+            })
+            .expect("'Format entire vault' source action expected");
+        assert_eq!(source_action.title, "Format entire vault");
+        let command = source_action
+            .command
+            .as_ref()
+            .expect("source action should carry a Command");
+        assert_eq!(
+            command.command,
+            crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND
+        );
+    }
+
+    #[test]
+    fn test_source_action_absent_when_formatter_disabled() {
+        let rel_a = Path::new("doc-a.md");
+        // Has frontmatter already and no links, so no quickfix action applies — isolates whether
+        // the source action alone appears.
+        let doc_a = parse_document("---\ntitle: Doc A\n---\n\nPlain content, no links.", rel_a);
+
+        let mut state = SatzState::default();
+        state.config.formatter.enabled = false;
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
         } else {
-            panic!("Expected CodeAction");
-        }
+            Path::new("/").to_path_buf()
+        });
+
+        let uri_a_str = if cfg!(windows) {
+            "file:///C:/doc-a.md"
+        } else {
+            "file:///doc-a.md"
+        };
+
+        state.open_docs.insert(
+            uri_a_str.to_string(),
+            crate::state::OpenDocument::new(
+                uri_a_str,
+                Path::new(if cfg!(windows) {
+                    "C:\\doc-a.md"
+                } else {
+                    "/doc-a.md"
+                })
+                .to_path_buf(),
+                "---\ntitle: Doc A\n---\n\nPlain content, no links.",
+                1,
+            ),
+        );
+
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri_a_str.parse().unwrap(),
+            },
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            context: CodeActionContext::default(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        // No quickfix applies here, so with the formatter disabled there should be nothing
+        // offered at all.
+        assert!(code_action(params, &state).is_none());
     }
 }
