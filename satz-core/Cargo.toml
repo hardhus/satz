@@ -1,7 +1,10 @@
 [package]
 name = "satz-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -24,4 +27,3 @@ insta = { workspace = true, features = ["yaml"] }
 [[bench]]
 name = "benchmark"
 harness = false
-
