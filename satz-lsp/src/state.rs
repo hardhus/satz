@@ -50,6 +50,50 @@ impl OpenDocument {
     }
 }
 
+/// Simple (non-LRU) cache mapping a document's content hash to its already-computed formatted
+/// text, used by `satz.formatWorkspace` to skip reformatting files whose content hasn't changed
+/// since the last workspace-format call. Once at capacity, new distinct hashes are silently not
+/// cached — existing entries keep serving hits rather than anything being evicted.
+#[derive(Debug, Clone)]
+pub struct FormatCache {
+    entries: HashMap<u64, String>,
+    capacity: usize,
+}
+
+impl FormatCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+        }
+    }
+
+    pub fn get(&self, hash: u64) -> Option<&str> {
+        self.entries.get(&hash).map(String::as_str)
+    }
+
+    pub fn insert(&mut self, hash: u64, formatted: String) {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&hash) {
+            return;
+        }
+        self.entries.insert(hash, formatted);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for FormatCache {
+    fn default() -> Self {
+        Self::new(satz_core::config::LspConfig::default().format_cache_capacity)
+    }
+}
+
 /// Global server state.
 #[derive(Debug, Default)]
 pub struct SatzState {
@@ -70,6 +114,9 @@ pub struct SatzState {
 
     /// Flag indicating that open document identity keys changed and peers need diagnostic refresh
     pub peers_dirty: bool,
+
+    /// `satz.formatWorkspace` result cache — see `FormatCache`.
+    pub format_cache: FormatCache,
 }
 
 pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<String> {
@@ -95,6 +142,7 @@ impl SatzState {
 
         let docs = walk_vault(&vault_root)?;
         let index = Index::build(docs);
+        let format_cache = FormatCache::new(config.lsp.format_cache_capacity);
 
         Ok(Self {
             vault_root: Some(vault_root),
@@ -103,6 +151,7 @@ impl SatzState {
             config,
             client_supports_pull_diagnostics: false,
             peers_dirty: false,
+            format_cache,
         })
     }
 

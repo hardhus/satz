@@ -1,3 +1,4 @@
+pub mod diff;
 pub mod emphasis;
 pub mod line_pass;
 pub mod list;

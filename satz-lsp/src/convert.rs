@@ -39,6 +39,36 @@ pub fn path_to_uri(path: &Path) -> Option<lsp::Uri> {
     lsp::Uri::from_file_path(path)
 }
 
+/// Converts line-based diff edits (`satz_core::formatter::diff::line_diff`) into minimal LSP
+/// `TextEdit`s against a document's current `LineIndex`, instead of one edit replacing the whole
+/// document. `old_start_line`/`old_end_line` are used directly as line numbers with character
+/// `0`, except when a `LineEdit` extends past the document's last addressable line (only
+/// possible when the document has no trailing newline), in which case the range's end is clamped
+/// to the document's actual end position.
+pub fn line_edits_to_text_edits(
+    line_index: &LineIndex,
+    edits: &[satz_core::formatter::diff::LineEdit],
+) -> Vec<lsp::TextEdit> {
+    let total_lines = line_index.line_count() as u32;
+    let doc_end = satz_pos_to_lsp(line_index.byte_to_position(line_index.source().len()));
+
+    edits
+        .iter()
+        .map(|edit| {
+            let start = lsp::Position::new(edit.old_start_line as u32, 0);
+            let end = if (edit.old_end_line as u32) < total_lines {
+                lsp::Position::new(edit.old_end_line as u32, 0)
+            } else {
+                doc_end
+            };
+            lsp::TextEdit {
+                range: lsp::Range::new(start, end),
+                new_text: edit.new_lines.concat(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +80,59 @@ mod tests {
         assert_eq!(lsp_pos.line, 10);
         assert_eq!(lsp_pos.character, 5);
         assert_eq!(lsp_pos_to_satz(lsp_pos), satz_pos);
+    }
+
+    #[test]
+    fn test_line_edits_to_text_edits_middle_of_document() {
+        let source = "a\nb\nc\nd\n";
+        let line_index = LineIndex::new(source);
+        let edits = vec![satz_core::formatter::diff::LineEdit {
+            old_start_line: 1,
+            old_end_line: 2,
+            new_lines: vec!["B\n".to_string()],
+        }];
+
+        let text_edits = line_edits_to_text_edits(&line_index, &edits);
+        assert_eq!(text_edits.len(), 1);
+        assert_eq!(text_edits[0].range.start, lsp::Position::new(1, 0));
+        assert_eq!(text_edits[0].range.end, lsp::Position::new(2, 0));
+        assert_eq!(text_edits[0].new_text, "B\n");
+    }
+
+    #[test]
+    fn test_line_edits_to_text_edits_end_of_document_with_trailing_newline() {
+        // "a\nb\n" has a trailing newline, so LSP counts a phantom empty final line (line 2) —
+        // an edit reaching that line's start is a normal, directly addressable position.
+        let source = "a\nb\n";
+        let line_index = LineIndex::new(source);
+        assert_eq!(line_index.line_count(), 3); // "a", "b", "" (phantom)
+
+        let edits = vec![satz_core::formatter::diff::LineEdit {
+            old_start_line: 1,
+            old_end_line: 2,
+            new_lines: vec!["B\n".to_string()],
+        }];
+        let text_edits = line_edits_to_text_edits(&line_index, &edits);
+        assert_eq!(text_edits[0].range.end, lsp::Position::new(2, 0));
+    }
+
+    #[test]
+    fn test_line_edits_to_text_edits_end_of_document_without_trailing_newline() {
+        // "a\nb" has no trailing newline — there is no line 2 to address, so an edit whose
+        // old_end_line reaches 2 must clamp to the actual end-of-document position (line 1,
+        // character 1), not an out-of-range Position(2, 0).
+        let source = "a\nb";
+        let line_index = LineIndex::new(source);
+        assert_eq!(line_index.line_count(), 2); // "a", "b" (no phantom line)
+
+        let edits = vec![satz_core::formatter::diff::LineEdit {
+            old_start_line: 1,
+            old_end_line: 2,
+            new_lines: vec!["B".to_string()],
+        }];
+        let text_edits = line_edits_to_text_edits(&line_index, &edits);
+        assert_eq!(text_edits[0].range.start, lsp::Position::new(1, 0));
+        assert_eq!(text_edits[0].range.end, lsp::Position::new(1, 1));
     }
 
     #[test]

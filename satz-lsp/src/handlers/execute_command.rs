@@ -1,34 +1,62 @@
 use std::collections::HashMap;
 
-use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri, WorkspaceEdit};
+use tower_lsp_server::ls_types::{TextEdit, Uri, WorkspaceEdit};
 
-use crate::convert::path_to_uri;
+use crate::convert::{line_edits_to_text_edits, path_to_uri};
 use crate::state::SatzState;
+use satz_core::formatter::diff::line_diff;
 
 pub const FORMAT_WORKSPACE_COMMAND: &str = "satz.formatWorkspace";
 
 /// One document's computed formatting result: its client URI, the full replacement text (used to
 /// keep an open document's in-memory rope in sync after the client confirms the edit), and the
-/// whole-document `TextEdit` that replaces its current content with the formatted version.
+/// minimal set of line-range `TextEdit`s that turn its current content into the formatted version.
 pub struct FormatChange {
     pub uri: Uri,
     pub formatted: String,
-    pub edit: TextEdit,
+    pub edits: Vec<TextEdit>,
+}
+
+/// Result of scanning the vault for formatting changes: the changes themselves (used to build
+/// the `WorkspaceEdit`), and any newly-computed `(content_hash, formatted_text)` pairs the caller
+/// should merge into `state.format_cache` — kept separate so this function only needs `&SatzState`
+/// rather than requiring a write lock just to compute what to send.
+pub struct FormatWorkspaceResult {
+    pub changes: Vec<FormatChange>,
+    pub cache_updates: Vec<(u64, String)>,
 }
 
 /// Computes formatting changes for every indexed document whose formatted output differs from
-/// its current content. Returns an empty list (no-op) if `formatter.enabled` is false or nothing
-/// in the vault actually needs reformatting.
-pub fn compute_format_changes(state: &SatzState) -> Vec<FormatChange> {
+/// its current content. Returns everything empty (no-op) if `formatter.enabled` is false.
+///
+/// Consults `state.format_cache` first for each document's content hash — on a vault that's
+/// already fully formatted, a repeat call does zero `format_document` work at all, just cache
+/// hits that immediately compare equal to the source and get skipped.
+pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
     if !state.config.formatter.enabled {
-        return Vec::new();
+        return FormatWorkspaceResult {
+            changes: Vec::new(),
+            cache_updates: Vec::new(),
+        };
     }
 
     let mut changes = Vec::new();
+    let mut cache_updates = Vec::new();
 
     for doc in state.index.documents() {
         let source = doc.line_index.source();
-        let formatted = satz_core::formatter::format_document(source, &state.config.formatter);
+        let hash = doc.content_hash;
+
+        let formatted = match state.format_cache.get(hash) {
+            Some(cached) => cached.to_string(),
+            None => {
+                let computed =
+                    satz_core::formatter::format_document(source, &state.config.formatter);
+                cache_updates.push((hash, computed.clone()));
+                computed
+            }
+        };
+
         if formatted == source {
             continue;
         }
@@ -41,27 +69,27 @@ pub fn compute_format_changes(state: &SatzState) -> Vec<FormatChange> {
             continue;
         };
 
-        let end = doc.line_index.byte_to_position(source.len());
-        let edit = TextEdit {
-            range: Range::new(Position::new(0, 0), Position::new(end.line, end.character)),
-            new_text: formatted.clone(),
-        };
+        let line_edits = line_diff(source, &formatted);
+        let edits = line_edits_to_text_edits(&doc.line_index, &line_edits);
 
         changes.push(FormatChange {
             uri,
             formatted,
-            edit,
+            edits,
         });
     }
 
-    changes
+    FormatWorkspaceResult {
+        changes,
+        cache_updates,
+    }
 }
 
 /// Builds the `WorkspaceEdit` to send via `workspace/applyEdit` from a set of format changes.
 pub fn build_workspace_edit(changes: &[FormatChange]) -> WorkspaceEdit {
     let mut map: HashMap<Uri, Vec<TextEdit>> = HashMap::with_capacity(changes.len());
     for change in changes {
-        map.insert(change.uri.clone(), vec![change.edit.clone()]);
+        map.insert(change.uri.clone(), change.edits.clone());
     }
     WorkspaceEdit {
         changes: Some(map),
@@ -96,14 +124,16 @@ mod tests {
         let clean = parse_document("# Clean\n\nAlready tidy.\n", Path::new("clean.md"));
         let state = state_with(vec![dirty, clean]);
 
-        let changes = compute_format_changes(&state);
+        let result = compute_format_changes(&state);
         assert_eq!(
-            changes.len(),
+            result.changes.len(),
             1,
             "only the dirty document should need an edit"
         );
-        assert!(changes[0].uri.as_str().ends_with("dirty.md"));
-        assert_eq!(changes[0].formatted, "Line 1\n\nLine 2\n");
+        assert!(result.changes[0].uri.as_str().ends_with("dirty.md"));
+        assert_eq!(result.changes[0].formatted, "Line 1\n\nLine 2\n");
+        // Both documents were freshly computed (cold cache), so both hashes get recorded.
+        assert_eq!(result.cache_updates.len(), 2);
     }
 
     #[test]
@@ -112,7 +142,9 @@ mod tests {
         let clean_b = parse_document("# B\n\nAlso tidy.\n", Path::new("b.md"));
         let state = state_with(vec![clean_a, clean_b]);
 
-        assert!(compute_format_changes(&state).is_empty());
+        let result = compute_format_changes(&state);
+        assert!(result.changes.is_empty());
+        assert_eq!(result.cache_updates.len(), 2);
     }
 
     #[test]
@@ -121,7 +153,9 @@ mod tests {
         let mut state = state_with(vec![dirty]);
         state.config.formatter.enabled = false;
 
-        assert!(compute_format_changes(&state).is_empty());
+        let result = compute_format_changes(&state);
+        assert!(result.changes.is_empty());
+        assert!(result.cache_updates.is_empty());
     }
 
     #[test]
@@ -131,18 +165,71 @@ mod tests {
         let clean = parse_document("# C\n\nTidy.\n", Path::new("c.md"));
         let state = state_with(vec![dirty_a, dirty_b, clean]);
 
-        let changes = compute_format_changes(&state);
-        assert_eq!(changes.len(), 2);
+        let result = compute_format_changes(&state);
+        assert_eq!(result.changes.len(), 2);
 
-        let edit = build_workspace_edit(&changes);
+        let edit = build_workspace_edit(&result.changes);
         let map = edit.changes.expect("changes map expected");
         assert_eq!(map.len(), 2);
-        for edits in map.values() {
-            assert_eq!(
-                edits.len(),
-                1,
-                "each document gets exactly one whole-document edit"
-            );
+    }
+
+    #[test]
+    fn test_scattered_changes_produce_multiple_minimal_edits_not_one_blob() {
+        let dirty = parse_document(
+            "1   \n2\n3\n4\n5   \n6\n7\n8   \n",
+            Path::new("scattered.md"),
+        );
+        let state = state_with(vec![dirty]);
+
+        let result = compute_format_changes(&state);
+        assert_eq!(result.changes.len(), 1);
+        assert!(
+            result.changes[0].edits.len() > 1,
+            "scattered single-line changes must not collapse into one whole-document edit, got {:?}",
+            result.changes[0].edits
+        );
+    }
+
+    #[test]
+    fn test_cache_hit_skips_recomputation_and_is_consistent() {
+        let dirty = parse_document("Line 1   \n\n\n\nLine 2   ", Path::new("dirty.md"));
+        let content_hash = dirty.content_hash;
+        let mut state = state_with(vec![dirty]);
+
+        // Prime the cache as if a previous call had already computed this exact result.
+        state
+            .format_cache
+            .insert(content_hash, "Line 1\n\nLine 2\n".to_string());
+
+        let result = compute_format_changes(&state);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].formatted, "Line 1\n\nLine 2\n");
+        // Served entirely from cache: nothing new to record.
+        assert!(result.cache_updates.is_empty());
+    }
+
+    #[test]
+    fn test_second_call_on_unchanged_vault_produces_no_new_cache_entries() {
+        let dirty = parse_document("Line 1   \n\n\n\nLine 2   ", Path::new("dirty.md"));
+        let mut state = state_with(vec![dirty]);
+
+        let first = compute_format_changes(&state);
+        assert_eq!(first.cache_updates.len(), 1);
+        for (hash, formatted) in first.cache_updates {
+            state.format_cache.insert(hash, formatted);
         }
+
+        // Second call, same state (as if the client declined to apply / vault re-scanned):
+        // every document should now be a cache hit.
+        let second = compute_format_changes(&state);
+        assert_eq!(
+            second.changes.len(),
+            1,
+            "still reports the same needed edit"
+        );
+        assert!(
+            second.cache_updates.is_empty(),
+            "nothing new to compute on a warm cache"
+        );
     }
 }

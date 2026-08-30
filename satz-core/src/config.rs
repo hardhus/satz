@@ -165,6 +165,11 @@ pub struct LspConfig {
     pub inlay_hints: InlayHintConfig,
     pub reparse_debounce_ms: u64,
     pub reparse_max_wait_ms: u64,
+    /// Maximum number of (content hash -> formatted text) entries kept in the
+    /// `satz.formatWorkspace` result cache. Not an LRU: once at capacity, new distinct hashes
+    /// are simply not cached (existing entries keep serving hits) rather than evicting anything.
+    /// Default: 2000.
+    pub format_cache_capacity: usize,
 }
 
 impl Default for LspConfig {
@@ -174,6 +179,7 @@ impl Default for LspConfig {
             inlay_hints: InlayHintConfig::default(),
             reparse_debounce_ms: 200,
             reparse_max_wait_ms: 500,
+            format_cache_capacity: 2000,
         }
     }
 }
@@ -278,6 +284,9 @@ mod tests {
         assert_eq!(cfg.daily_note.format, "%Y-%m-%d");
         assert!(!cfg.lsp.codelens.enable);
         assert!(cfg.lsp.inlay_hints.enable);
+        assert_eq!(cfg.lsp.reparse_debounce_ms, 200);
+        assert_eq!(cfg.lsp.reparse_max_wait_ms, 500);
+        assert_eq!(cfg.lsp.format_cache_capacity, 2000);
         assert_eq!(cfg.hover.preview_lines, 8);
         assert!(cfg.formatter.enabled);
         assert_eq!(cfg.formatter.line_width, 80);
@@ -310,6 +319,11 @@ format = "%Y/%m/%d"
 
 [frontmatter]
 required_fields = ["title", "date"]
+
+[lsp]
+reparse_debounce_ms = 300
+reparse_max_wait_ms = 900
+format_cache_capacity = 500
 
 [lsp.codelens]
 enable = true
@@ -355,6 +369,9 @@ blockquote_single_space = false
         assert_eq!(cfg.frontmatter.required_fields, vec!["title", "date"]);
         assert!(cfg.lsp.codelens.enable);
         assert!(!cfg.lsp.inlay_hints.enable);
+        assert_eq!(cfg.lsp.reparse_debounce_ms, 300);
+        assert_eq!(cfg.lsp.reparse_max_wait_ms, 900);
+        assert_eq!(cfg.lsp.format_cache_capacity, 500);
         assert_eq!(cfg.hover.preview_lines, 12);
         assert!(!cfg.formatter.enabled);
         assert_eq!(cfg.formatter.line_width, 100);

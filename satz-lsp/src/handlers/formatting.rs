@@ -1,7 +1,11 @@
+use crate::convert::line_edits_to_text_edits;
 use crate::state::SatzState;
-use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
+use satz_core::formatter::diff::line_diff;
+use tower_lsp_server::ls_types::{DocumentFormattingParams, TextEdit};
 
-/// Formats a document according to the vault's FormatterConfig.
+/// Formats a document according to the vault's FormatterConfig, returning minimal line-range
+/// `TextEdit`s (via a line-based diff) rather than one edit replacing the whole document — this
+/// keeps the editor's undo history and the LSP payload proportional to what actually changed.
 pub fn formatting(params: DocumentFormattingParams, state: &SatzState) -> Option<Vec<TextEdit>> {
     if !state.config.formatter.enabled {
         return Some(vec![]);
@@ -17,13 +21,9 @@ pub fn formatting(params: DocumentFormattingParams, state: &SatzState) -> Option
         return Some(vec![]);
     }
 
-    let li = satz_core::LineIndex::new(&original);
-    let end = li.byte_to_position(original.len());
-
-    Some(vec![TextEdit {
-        range: Range::new(Position::new(0, 0), Position::new(end.line, end.character)),
-        new_text: formatted,
-    }])
+    let line_index = satz_core::LineIndex::new(&original);
+    let edits = line_diff(&original, &formatted);
+    Some(line_edits_to_text_edits(&line_index, &edits))
 }
 
 #[cfg(test)]
@@ -62,8 +62,33 @@ mod tests {
         };
 
         let edits = formatting(params, &state).expect("Edits expected");
-        assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].new_text, "Line 1\n\nLine 2\n");
+        // Two scattered changes (trailing whitespace on line 1, and the collapsed blank lines +
+        // trailing whitespace around line 2) — minimal-diff must not collapse these into one
+        // whole-document edit.
+        assert!(
+            edits.len() > 1,
+            "expected multiple minimal edits, got {}: {edits:?}",
+            edits.len()
+        );
+
+        // Applying every edit's replacement text in range order must reconstruct the exact
+        // formatted output.
+        let mut cursor = tower_lsp_server::ls_types::Position::new(0, 0);
+        let mut rebuilt = String::new();
+        let li = satz_core::LineIndex::new(text);
+        for edit in &edits {
+            let from = li.position_to_byte(satz_core::Position::new(cursor.line, cursor.character));
+            let to = li.position_to_byte(satz_core::Position::new(
+                edit.range.start.line,
+                edit.range.start.character,
+            ));
+            rebuilt.push_str(&text[from..to]);
+            rebuilt.push_str(&edit.new_text);
+            cursor = edit.range.end;
+        }
+        let from = li.position_to_byte(satz_core::Position::new(cursor.line, cursor.character));
+        rebuilt.push_str(&text[from..]);
+        assert_eq!(rebuilt, "Line 1\n\nLine 2\n");
     }
 
     #[test]

@@ -549,11 +549,19 @@ impl LanguageServer for Backend {
             return Err(jsonrpc::Error::method_not_found());
         }
 
-        let changes = {
+        let result = {
             let state = self.state.read().await;
             crate::handlers::execute_command::compute_format_changes(&state)
         };
 
+        if !result.cache_updates.is_empty() {
+            let mut state = self.state.write().await;
+            for (hash, formatted) in result.cache_updates {
+                state.format_cache.insert(hash, formatted);
+            }
+        }
+
+        let changes = result.changes;
         if changes.is_empty() {
             self.client
                 .log_message(MessageType::INFO, "satz: vault is already fully formatted")
