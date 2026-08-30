@@ -175,3 +175,91 @@ fn test_satz_graph_command() {
     assert!(dot.starts_with("digraph \"satz\" {"));
     assert!(dot.contains("->"));
 }
+
+#[test]
+fn test_satz_fmt_check_exits_1_on_dirty_file() {
+    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_check_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    std::fs::write(
+        temp_dir.join("note.md"),
+        "# Title\n\nContent with   trailing spaces   \nand _underscore italic_.\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(["fmt", temp_dir.to_str().unwrap(), "--check"])
+        .output()
+        .expect("satz binary should execute");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("note.md"));
+
+    // --check must never write anything.
+    let content = std::fs::read_to_string(temp_dir.join("note.md")).unwrap();
+    assert!(content.contains("_underscore italic_"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_satz_fmt_write_actually_rewrites_dirty_file() {
+    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_write_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let file_path = temp_dir.join("note.md");
+    std::fs::write(
+        &file_path,
+        "# Title\n\nContent with   trailing spaces   \nand _underscore italic_.\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(["fmt", temp_dir.to_str().unwrap(), "--write"])
+        .output()
+        .expect("satz binary should execute");
+
+    assert!(output.status.success());
+
+    let content = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        content,
+        "# Title\n\nContent with   trailing spaces\nand *underscore italic*.\n"
+    );
+
+    // Running --check again on the now-clean file must succeed.
+    let recheck = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(["fmt", temp_dir.to_str().unwrap(), "--check"])
+        .output()
+        .expect("satz binary should execute");
+    assert!(recheck.status.success());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_satz_fmt_write_skips_io_for_already_clean_file() {
+    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_clean_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let file_path = temp_dir.join("note.md");
+    std::fs::write(&file_path, "# Title\n\nAlready clean content.\n").unwrap();
+
+    let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(["fmt", temp_dir.to_str().unwrap(), "--write"])
+        .output()
+        .expect("satz binary should execute");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("0 file(s) formatted"));
+    assert!(stdout.contains("1 file(s) already clean"));
+
+    let mtime_after = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_before, mtime_after,
+        "already-clean file must not be rewritten (mtime changed)"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

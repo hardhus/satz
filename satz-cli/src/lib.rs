@@ -19,6 +19,8 @@ pub struct Cli {
 pub enum Commands {
     /// Open or create today's daily note
     Daily(commands::daily_cmd::DailyArgs),
+    /// Format vault files in place, or check whether they're already formatted
+    Fmt(commands::fmt_cmd::FmtArgs),
     /// Export graph visualization (dot or json)
     Graph(commands::graph_cmd::GraphArgs),
     /// Index vault and show summary
@@ -35,6 +37,7 @@ pub enum Commands {
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Daily(args) => commands::daily_cmd::run(args),
+        Commands::Fmt(args) => commands::fmt_cmd::run(args),
         Commands::Graph(args) => commands::graph_cmd::run(args),
         Commands::Index(args) => commands::index_cmd::run(args),
         Commands::List(args) => commands::list_cmd::run(args),

@@ -966,6 +966,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "rayon",
  "satz-core",
  "serde_json",
  "tracing",
