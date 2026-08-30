@@ -39,6 +39,7 @@ Key types:
 - **`Index`** — the whole-vault view: document lookup by id/path, link resolution, tag queries, backlinks, orphan/broken-link queries, and incremental updates via `replace_doc`/`remove_doc` (what the LSP uses on every keystroke instead of rebuilding from scratch).
 - **`VaultGraph`** — a `petgraph::DiGraph` wrapper for exporting the link graph; see [`docs/cli.md`](cli.md#satz-graph) for what the JSON/DOT shapes look like.
 - **`VaultConfig`** — parses `.satz.toml`; see [`docs/configuration.md`](configuration.md) for the full schema (and which fields are currently load-bearing vs. reserved).
+- **`formatter::format_document(source: &str, config: &FormatterConfig) -> String`** — the deterministic Markdown formatter (tables, lists, emphasis, thematic breaks, code fences, blockquotes; see [`docs/configuration.md`](configuration.md#formatter--deterministic-markdown-formatting)). This is the same function `satz fmt` and the LSP's formatting requests call — embedding it directly gets you the formatter without going through either binary. `formatter::diff::line_diff(old, new)` is the minimal line-based diff helper the LSP uses to turn a `format_document` result into small edits instead of a whole-document replace.
 
 ## `satz-cli`: using it as a library
 

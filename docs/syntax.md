@@ -85,6 +85,19 @@ custom_field: 42
 - Any other key is preserved verbatim in a passthrough map rather than causing an error.
 - Malformed YAML never crashes the parser — the document just gets an empty frontmatter instead.
 
+## GFM tables & task lists
+
+```
+| Column A | Column B |
+|:---------|---------:|
+| left     |    right |
+
+- [ ] todo
+- [x] done
+```
+
+Recognized via `pulldown-cmark`'s GFM extensions, primarily for the **formatter** rather than indexing: pipe tables (with alignment markers `:---`/`---:`/`:---:`) and `- [ ]`/`- [x]` task-list checkboxes. A wikilink, tag, or footnote inside a table cell or list item is still indexed normally. See [`docs/configuration.md`](configuration.md#formatter--deterministic-markdown-formatting) for exactly how the formatter realigns tables, normalizes list markers/renumbers ordered lists, and canonicalizes checkboxes, and [`docs/cli.md`](cli.md#satz-fmt-path)/[`docs/lsp.md`](lsp.md#format-the-whole-workspace) for how to run it.
+
 ## Link and ID resolution order
 
 Given a raw target string (from a wikilink, markdown link, or `satz resolve`), `Index::resolve_link` tries, in order:

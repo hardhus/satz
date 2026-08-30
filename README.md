@@ -13,6 +13,11 @@ Point it at a folder of `.md` files and it gives you: link/tag/backlink indexing
 - Backlink graph, orphan-note detection, and broken-link/broken-anchor detection.
 - Fast: parallel parsing (`rayon`) and incremental re-indexing (no full rebuild on every edit).
 
+**Deterministic formatter (shared by both CLI and LSP)**
+- Same input always produces the same byte-for-byte output — no more vault drift from mixed `-`/`*` list markers or `*italic*` vs `_italic_`.
+- GFM tables (column alignment, Unicode-width-aware padding), list markers and ordered-list renumbering, task-list checkboxes, emphasis/strong delimiters, thematic breaks, code-fence style, and blockquote spacing — every construct independently toggleable in `.satz.toml`.
+- Whole-vault formatting from the CLI (`satz fmt --check`/`--write`) or the editor (`satz.formatWorkspace`), plus single-file `textDocument/formatting` — all producing minimal, line-scoped edits rather than replacing whole files.
+
 **CLI (`satz`)**
 - `index`, `stats` — vault-wide summary (docs, links, tags, orphans), human or JSON output.
 - `list` — filter documents by tag, orphan status, or list every broken link.
@@ -26,7 +31,8 @@ Point it at a folder of `.md` files and it gives you: link/tag/backlink indexing
 - Diagnostics: broken links/embeds/headings, duplicate heading slugs, missing frontmatter fields, orphan notes.
 - Rename (headings and whole documents, including a file-rename operation), prepare-rename.
 - Context-aware completion for links, headings, block anchors, footnotes, and tags.
-- Code actions (create a missing note, add a missing heading, insert a frontmatter template), code lens (backlink count), inlay hints (target metadata), semantic tokens, folding ranges, document links, document formatting.
+- Code actions (create a missing note, add a missing heading, insert a frontmatter template, format the entire vault), code lens (backlink count), inlay hints (target metadata), semantic tokens, folding ranges, document links, document formatting.
+- `satz.formatWorkspace` command — format every document in the vault in one `workspace/applyEdit`, with a result cache so repeat calls against an unchanged vault do no work.
 - Live file-watching and `.satz.toml` hot-reload — no restart needed after editing config or after external file changes.
 
 Full breakdowns: [`docs/cli.md`](docs/cli.md) and [`docs/lsp.md`](docs/lsp.md).
@@ -99,7 +105,7 @@ The LSP hot-reloads this file — edit and save it while the server is running a
 
 ## Vault syntax
 
-satz understands wikilinks, embeds, hierarchical tags, block/heading anchors, footnotes, and YAML frontmatter, plus relative daily-note aliases like `[[bugün]]`/`[[today]]`. See **[`docs/syntax.md`](docs/syntax.md)** for the exact rules (what counts as a tag, how link resolution priority works, heading slugification, etc.).
+satz understands wikilinks, embeds, hierarchical tags, block/heading anchors, footnotes, and YAML frontmatter, plus relative daily-note aliases like `[[bugün]]`/`[[today]]` — and, for the formatter, GFM tables, task-list checkboxes, and standard list/emphasis/thematic-break/blockquote/code-fence syntax. See **[`docs/syntax.md`](docs/syntax.md)** for the exact rules (what counts as a tag, how link resolution priority works, heading slugification, etc.).
 
 ## Documentation
 

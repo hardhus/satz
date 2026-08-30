@@ -126,7 +126,7 @@ This is exactly the built-in default configuration, spelled out. You only need t
 
 ### `[formatter]` — deterministic Markdown formatting
 
-Used by `satz fmt`, the LSP's "Format Document" request, and `satz_core::formatter::format_document` if embedded directly.
+Used by `satz fmt`, the LSP's "Format Document" request and `satz.formatWorkspace` command, and `satz_core::formatter::format_document` if embedded directly.
 
 Deterministic, structure-aware Markdown formatting: the same input always produces the same byte-for-byte output. Every sub-table below can be disabled independently; `formatter.enabled = false` turns the whole thing off (both `satz fmt` and the LSP's format-on-request become a no-op).
 
