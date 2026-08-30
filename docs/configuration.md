@@ -28,6 +28,7 @@ required_fields = ["title", "date"]
 [lsp]
 reparse_debounce_ms = 200
 reparse_max_wait_ms = 500
+format_cache_capacity = 2000
 
 [lsp.codelens]
 enable = false
@@ -108,6 +109,7 @@ This is exactly the built-in default configuration, spelled out. You only need t
 | `reparse_max_wait_ms` | integer (ms) | `500` | Upper bound on how long reparsing can be delayed while you keep typing continuously — guarantees a reparse happens at least this often even under constant edits. |
 | `codelens.enable` | bool | `false` | Turns on the "N backlinks" CodeLens shown above each document. Off by default because satz is terminal/CLI-first. |
 | `inlay_hints.enable` | bool | `true` | Turns on inline hints after links showing the target note's tags (or title, or a "⚠ not found" marker for broken links). |
+| `format_cache_capacity` | integer | `2000` | Maximum number of (content hash → formatted text) entries the `satz.formatWorkspace` command caches, so a repeat call against an unchanged vault does no reformatting work. Not an LRU: once at capacity, new distinct hashes just aren't cached — existing entries keep serving hits. See [`docs/lsp.md`](lsp.md#format-the-whole-workspace). |
 
 ### `[hover]`
 

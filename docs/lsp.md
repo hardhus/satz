@@ -66,11 +66,13 @@ Find References and Document Highlight both resolve "what's under the cursor" wi
 
 Run the `satz.formatWorkspace` command (via `workspace/executeCommand`, or the "Format entire vault" source code action) to format every document in the vault in one shot, without leaving the editor:
 
-1. The server computes each document's formatted output and skips any that are already identical to their current content — unchanged files never appear in the edit at all.
-2. If anything needs to change, it sends one `workspace/applyEdit` request containing a whole-document `TextEdit` per changed file.
+1. The server computes each document's formatted output — checking a small in-memory cache keyed by content hash first (`lsp.format_cache_capacity`), so a repeat call against a vault that hasn't changed since the last one does no reformatting work at all — and skips any document whose result is identical to its current content; unchanged files never appear in the edit.
+2. If anything needs to change, it sends one `workspace/applyEdit` request containing, per changed file, the *minimal* set of line-range `TextEdit`s (a line-based diff between the current and formatted text) rather than one edit replacing the whole document — scattered small changes stay small edits instead of one large blob.
 3. Once the client confirms the edit was applied, the server immediately updates its own in-memory copy (rope + index) of any *open* document among those changed, so diagnostics/hover/etc. reflect the new content right away rather than waiting for the client's own follow-up `textDocument/didChange`. Documents that aren't open are left for the client to persist — same as any other `workspace/applyEdit` — and the existing file watcher (see below) picks up the on-disk change normally.
 
 Whether your editor exposes a convenient way to *trigger* `workspace/executeCommand` (a keybinding, a command palette entry) varies by client — this is a real LSP mechanism, not a satz-specific limitation, but the spec doesn't mandate any particular UI for it. If your client makes it awkward to discover, [`satz fmt --write`](cli.md#satz-fmt-path) from a terminal is the always-available equivalent.
+
+`textDocument/formatting` (single-file formatting) uses the same minimal-diff approach, but never consults the workspace-format cache — you're actively editing that one file, so a cache would rarely help.
 
 ## Code lens caveat
 
