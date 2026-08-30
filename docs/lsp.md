@@ -25,6 +25,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 | Inlay hints | Inline note metadata after links. **On by default** (`lsp.inlay_hints.enable`). |
 | Semantic tokens | Full-document only (no range requests). Legend: `link`, `unresolvedLink`, `tag`, `heading`, `embed`, `blockAnchor`. |
 | Document formatting | Deterministic, structure-aware Markdown formatting (tables, lists, emphasis, thematic breaks, code fences, blockquotes) — see [`docs/configuration.md`](configuration.md#formatter--deterministic-markdown-formatting). |
+| Execute command | `satz.formatWorkspace` — formats every document in the vault in one `workspace/applyEdit`. See [Format the whole workspace](#format-the-whole-workspace). |
 
 ## Diagnostics
 
@@ -46,6 +47,7 @@ Offered contextually depending on what's under the cursor/selection:
 - **Create note** — offered on a broken wikilink/embed/markdown link; creates the target `.md` file (with a generated frontmatter + heading template) and opens it via a `workspace/applyEdit` create-then-edit operation.
 - **Add heading** — offered on a broken `#Heading` reference where the target document exists; appends `## <Heading>` to the end of the target document.
 - **Insert frontmatter template** — offered when the document has no `---` frontmatter block yet; inserts a title/date/aliases/tags template at the top.
+- **Format entire vault** (`CodeActionKind::SOURCE`) — always offered (whenever `formatter.enabled` is true), regardless of cursor position; runs the same `satz.formatWorkspace` command described below. Some clients surface source actions in the code action menu more discoverably than a command palette entry, hence offering both.
 
 ## Rename
 
@@ -60,9 +62,19 @@ Triggered from a heading definition or from a link:
 
 Find References and Document Highlight both resolve "what's under the cursor" with the same priority order: **link → block anchor → heading → tag → whole document**. For tags, the search expands hierarchically (referencing `#parent` also surfaces `#parent/child` occurrences). For headings/blocks/documents, results include both the definition (if in the current/target document) and every link that resolves to it, scoped to that target's known backlinks.
 
+## Format the whole workspace
+
+Run the `satz.formatWorkspace` command (via `workspace/executeCommand`, or the "Format entire vault" source code action) to format every document in the vault in one shot, without leaving the editor:
+
+1. The server computes each document's formatted output and skips any that are already identical to their current content — unchanged files never appear in the edit at all.
+2. If anything needs to change, it sends one `workspace/applyEdit` request containing a whole-document `TextEdit` per changed file.
+3. Once the client confirms the edit was applied, the server immediately updates its own in-memory copy (rope + index) of any *open* document among those changed, so diagnostics/hover/etc. reflect the new content right away rather than waiting for the client's own follow-up `textDocument/didChange`. Documents that aren't open are left for the client to persist — same as any other `workspace/applyEdit` — and the existing file watcher (see below) picks up the on-disk change normally.
+
+Whether your editor exposes a convenient way to *trigger* `workspace/executeCommand` (a keybinding, a command palette entry) varies by client — this is a real LSP mechanism, not a satz-specific limitation, but the spec doesn't mandate any particular UI for it. If your client makes it awkward to discover, [`satz fmt --write`](cli.md#satz-fmt-path) from a terminal is the always-available equivalent.
+
 ## Code lens caveat
 
-The backlink-count CodeLens's command is `satz.showBacklinks`. The server does not implement `workspace/executeCommand`, so clicking it does nothing unless your editor/extension separately binds that command to some client-side action (e.g. opening a references panel). Treat it as an informational count unless you've wired up a client-side handler.
+The backlink-count CodeLens's command is `satz.showBacklinks`, which the server does **not** implement (unlike `satz.formatWorkspace` above) — clicking it does nothing unless your editor/extension separately binds that command to some client-side action (e.g. opening a references panel). Treat it as an informational count unless you've wired up a client-side handler.
 
 ## Live reindexing & config hot-reload
 
