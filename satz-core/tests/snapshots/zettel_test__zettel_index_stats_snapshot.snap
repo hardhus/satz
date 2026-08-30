@@ -1,0 +1,11 @@
+---
+source: satz-core/tests/zettel_test.rs
+expression: stats
+---
+doc_count: 4
+total_links: 7
+broken_links: 3
+unique_tags: 5
+orphan_docs: 2
+total_headings: 7
+total_words: 101

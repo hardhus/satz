@@ -1,15 +1,6 @@
+use satz_lsp::backend::Backend;
 use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
-
-mod backend;
-mod convert;
-mod handlers;
-mod rank;
-mod state;
-mod sync;
-mod watcher;
-
-use backend::Backend;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
