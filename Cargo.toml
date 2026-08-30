@@ -35,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 
 satz-core = { path = "satz-core" }
-similar = "2.7"
+similar = "3.2"
 
 # test
 insta = "1.48"

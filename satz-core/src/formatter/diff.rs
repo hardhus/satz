@@ -25,7 +25,9 @@ pub struct LineEdit {
 /// newline), in which case the caller should clamp to the document's actual end position.
 pub fn line_diff(old: &str, new: &str) -> Vec<LineEdit> {
     let diff = TextDiff::from_lines(old, new);
-    let new_slices = diff.new_slices();
+    // `TextDiff::new_slices()` was removed in similar 3.0; `iter_new_slices()` is its
+    // range-indexable replacement (collected once so `new_range` can slice into it below).
+    let new_slices: Vec<&str> = diff.iter_new_slices().collect();
 
     diff.ops()
         .iter()
