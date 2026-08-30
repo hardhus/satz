@@ -113,7 +113,11 @@ fn zettel_vault_expected_diagnostics() {
         2,
         "Ana Dizin should have 2 broken link warnings"
     );
-    assert_eq!(hints_ana.len(), 1, "Ana Dizin should have 1 orphan hint");
+    assert_eq!(
+        hints_ana.len(),
+        0,
+        "Ana Dizin is a MOC note and should have 0 orphan hints"
+    );
     assert!(
         warnings_ana
             .iter()

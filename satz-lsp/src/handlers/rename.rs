@@ -3,12 +3,57 @@
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{
     DocumentChangeOperation, DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier,
-    RenameFile, RenameParams, ResourceOp, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    PrepareRenameResponse, RenameFile, RenameParams, ResourceOp, TextDocumentEdit,
+    TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
 };
 
 use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz, path_to_uri};
 use crate::state::SatzState;
 use satz_core::model::LinkKind;
+
+pub fn prepare_rename(
+    params: TextDocumentPositionParams,
+    state: &SatzState,
+) -> Option<PrepareRenameResponse> {
+    let uri = params.text_document.uri.as_str();
+    let pos = params.position;
+
+    let open_doc = state.open_docs.get(uri)?;
+    let rel_path =
+        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
+    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+    let doc_id = satz_core::DocId::new(&rel_path_str);
+    let doc = state.index.get_doc(&doc_id)?;
+
+    let satz_pos = lsp_pos_to_satz(pos);
+    let byte_offset = doc.line_index.position_to_byte(satz_pos);
+
+    // 1. Heading definition
+    if let Some(h) = doc.headings.iter().find(|h| h.range.contains(byte_offset)) {
+        return Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range: byte_range_to_lsp(h.range, &doc.line_index),
+            placeholder: h.text.trim().to_string(),
+        });
+    }
+
+    // 2. Link
+    if let Some(link) = doc.links.iter().find(|l| l.range.contains(byte_offset)) {
+        if let Some(target_heading) = &link.target_heading {
+            return Some(PrepareRenameResponse::RangeWithPlaceholder {
+                range: byte_range_to_lsp(link.range, &doc.line_index),
+                placeholder: target_heading.clone(),
+            });
+        }
+        if !link.target_doc.is_empty() {
+            return Some(PrepareRenameResponse::RangeWithPlaceholder {
+                range: byte_range_to_lsp(link.range, &doc.line_index),
+                placeholder: link.target_doc.clone(),
+            });
+        }
+    }
+
+    None
+}
 
 pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> {
     let uri = params.text_document_position.text_document.uri.as_str();
@@ -504,5 +549,62 @@ mod tests {
         let uri_b = path_to_uri(abs_b).unwrap();
         let edits_b = &changes[&uri_b];
         assert_eq!(edits_b[0].new_text, "[[doc-a#Haftanın Özeti]]");
+    }
+
+    #[test]
+    fn test_prepare_rename_valid_and_invalid_positions() {
+        let abs_a = if cfg!(windows) {
+            Path::new("C:\\doc-a.md")
+        } else {
+            Path::new("/doc-a.md")
+        };
+        let rel_a = Path::new("doc-a.md");
+        let doc_a = parse_document("## Başlık\n\nBoş metin satırı.", rel_a);
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
+        } else {
+            Path::new("/").to_path_buf()
+        });
+
+        let uri_a_str = if cfg!(windows) {
+            "file:///C:/doc-a.md"
+        } else {
+            "file:///doc-a.md"
+        };
+        state.open_docs.insert(
+            uri_a_str.to_string(),
+            crate::state::OpenDocument::new(
+                uri_a_str,
+                abs_a.to_path_buf(),
+                "## Başlık\n\nBoş metin satırı.",
+                1,
+            ),
+        );
+
+        // 1. Valid position on heading
+        let params_valid = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri_a_str.parse().unwrap(),
+            },
+            position: Position::new(0, 4),
+        };
+        let prep = prepare_rename(params_valid, &state).expect("PrepareRename expected");
+        if let PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } = prep {
+            assert_eq!(placeholder, "Başlık");
+        } else {
+            panic!("Expected RangeWithPlaceholder");
+        }
+
+        // 2. Invalid position on empty text
+        let params_invalid = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri_a_str.parse().unwrap(),
+            },
+            position: Position::new(2, 4),
+        };
+        assert!(prepare_rename(params_invalid, &state).is_none());
     }
 }

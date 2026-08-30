@@ -86,12 +86,16 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
     match target {
         CursorTarget::Tag(ref tag_name) => {
+            let clean_query = fold_key(tag_name.trim_start_matches('#'));
+            let prefix = format!("{}/", clean_query);
+
             for tagged_doc in state.index.docs_with_tag(tag_name) {
                 let Some(u) = doc_uri(tagged_doc, state.vault_root.as_deref()) else {
                     continue;
                 };
                 for t in &tagged_doc.tags {
-                    if fold_key(t.name.trim_start_matches('#')) == fold_key(tag_name) {
+                    let clean_t = fold_key(t.name.trim_start_matches('#'));
+                    if clean_t == clean_query || clean_t.starts_with(&prefix) {
                         locations.push(Location::new(
                             u.clone(),
                             byte_range_to_lsp(t.range, &tagged_doc.line_index),

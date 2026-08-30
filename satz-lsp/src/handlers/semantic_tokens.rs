@@ -11,6 +11,7 @@ pub const TOKEN_TYPES: &[&str] = &[
     "tag",            // 2 - #tag
     "heading",        // 3 - heading
     "embed",          // 4 - ![[embed]]
+    "blockAnchor",    // 5 - ^block-anchor
 ];
 
 pub fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -28,7 +29,7 @@ struct RawToken {
     token_type: u32,
 }
 
-/// Computes SemanticTokens for links, tags, and headings across the full document.
+/// Computes SemanticTokens for links, tags, headings, and block anchors across the full document.
 pub fn semantic_tokens_full(
     params: SemanticTokensParams,
     state: &SatzState,
@@ -86,6 +87,14 @@ pub fn semantic_tokens_full(
             }
             LinkKind::Footnote => {}
         }
+    }
+
+    // 4. Block anchors (type 5)
+    for block in &doc.blocks {
+        raw_tokens.push(RawToken {
+            range: block.range,
+            token_type: 5,
+        });
     }
 
     // Sort tokens by start byte offset
@@ -160,12 +169,13 @@ mod tests {
     #[test]
     fn test_semantic_tokens_legend() {
         let legend = semantic_tokens_legend();
-        assert_eq!(legend.token_types.len(), 5);
+        assert_eq!(legend.token_types.len(), 6);
         assert_eq!(legend.token_types[0].as_str(), "link");
         assert_eq!(legend.token_types[1].as_str(), "unresolvedLink");
         assert_eq!(legend.token_types[2].as_str(), "tag");
         assert_eq!(legend.token_types[3].as_str(), "heading");
         assert_eq!(legend.token_types[4].as_str(), "embed");
+        assert_eq!(legend.token_types[5].as_str(), "blockAnchor");
     }
 
     #[test]

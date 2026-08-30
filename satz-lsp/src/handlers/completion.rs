@@ -31,12 +31,17 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
         .unwrap_or(0);
     let line_prefix = &source[line_start_offset..byte_offset];
 
+    // Check if cursor is already followed by closing `]]` or `]`
+    let line_rest = &source[byte_offset..];
+    let has_closing_brackets = line_rest.starts_with("]]") || line_rest.starts_with(']');
+    let close_suffix = if !has_closing_brackets { "]]" } else { "" };
+
     // 1. Check for wikilink completion: `[[...`
     if let Some(open_bracket_idx) = line_prefix.rfind("[[") {
         let inside_wikilink = &line_prefix[open_bracket_idx + 2..];
 
-        // Check if inside heading reference `[[doc#...` or `[[#...`
-        if let Some((target_doc_str, _heading_query)) = inside_wikilink.split_once('#') {
+        // Check if inside heading or block reference `[[doc#...` or `[[#...`
+        if let Some((target_doc_str, heading_or_block)) = inside_wikilink.split_once('#') {
             let target_id = if target_doc_str.is_empty() {
                 &doc_id
             } else if let Some(resolved) = state.index.resolve_link(target_doc_str) {
@@ -46,18 +51,51 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
             };
 
             if let Some(target_doc) = state.index.get_doc(target_id) {
-                let items = target_doc
-                    .headings
-                    .iter()
-                    .map(|h| CompletionItem {
-                        label: h.text.trim().to_string(),
-                        kind: Some(CompletionItemKind::FIELD),
-                        detail: Some(format!("Level {} Heading", h.level)),
-                        insert_text: Some(h.text.trim().to_string()),
-                        ..Default::default()
-                    })
-                    .collect();
-                return Some(CompletionResponse::Array(items));
+                if let Some(_block_prefix) = heading_or_block.strip_prefix('^') {
+                    // Block anchor completion: `[[doc#^...`
+                    let items = target_doc
+                        .blocks
+                        .iter()
+                        .map(|b| CompletionItem {
+                            label: format!("^{}", b.id),
+                            kind: Some(CompletionItemKind::VARIABLE),
+                            detail: Some("Block Anchor".to_string()),
+                            insert_text: Some(format!("^{}{}", b.id, close_suffix)),
+                            filter_text: Some(format!("^{}", b.id)),
+                            ..Default::default()
+                        })
+                        .collect();
+                    return Some(CompletionResponse::Array(items));
+                } else {
+                    // Heading completion: `[[doc#...`
+                    let mut items: Vec<CompletionItem> = target_doc
+                        .headings
+                        .iter()
+                        .map(|h| CompletionItem {
+                            label: h.text.trim().to_string(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(format!("Level {} Heading", h.level)),
+                            insert_text: Some(format!("{}{}", h.text.trim(), close_suffix)),
+                            ..Default::default()
+                        })
+                        .collect();
+
+                    // If query is empty or starts with '^', also suggest blocks
+                    if heading_or_block.is_empty() {
+                        for b in &target_doc.blocks {
+                            items.push(CompletionItem {
+                                label: format!("^{}", b.id),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some("Block Anchor".to_string()),
+                                insert_text: Some(format!("^{}{}", b.id, close_suffix)),
+                                filter_text: Some(format!("^{}", b.id)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+
+                    return Some(CompletionResponse::Array(items));
+                }
             }
         } else {
             // Document / Note completion
@@ -72,7 +110,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 };
 
                 // Insert document by title or stem
-                let insert_text = if !d.title.is_empty() && d.title != "Untitled" {
+                let insert_base = if !d.title.is_empty() && d.title != "Untitled" {
                     d.title.clone()
                 } else {
                     d.path
@@ -83,10 +121,11 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 };
 
                 items.push(CompletionItem {
-                    label: title_label,
+                    label: title_label.clone(),
                     kind: Some(CompletionItemKind::FILE),
                     detail: Some(d.id.as_str().to_string()),
-                    insert_text: Some(insert_text),
+                    insert_text: Some(format!("{}{}", insert_base, close_suffix)),
+                    filter_text: Some(title_label),
                     data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
                     ..Default::default()
                 });
@@ -97,7 +136,8 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                         label: format!("{} (alias)", alias),
                         kind: Some(CompletionItemKind::REFERENCE),
                         detail: Some(format!("Alias for: {}", d.title)),
-                        insert_text: Some(alias.clone()),
+                        insert_text: Some(format!("{}{}", alias, close_suffix)),
+                        filter_text: Some(alias.clone()),
                         data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
                         ..Default::default()
                     });
@@ -310,6 +350,52 @@ mod tests {
             assert!(m.value.contains("rust"));
         } else {
             panic!("Expected MarkupContent in documentation");
+        }
+    }
+
+    #[test]
+    fn test_block_anchor_completion() {
+        let rel_a = Path::new("doc-a.md");
+        let rel_b = Path::new("doc-b.md");
+        let doc_a = parse_document("# Doc A\n\n[[doc-b#^", rel_a);
+        let doc_b = parse_document(
+            "Some block text ^my-block-id\nOther text ^other-block",
+            rel_b,
+        );
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a.clone(), doc_b]);
+        state.vault_root = Some(Path::new("").to_path_buf());
+
+        let uri_str = "file:///doc-a.md";
+        state.open_docs.insert(
+            uri_str.to_string(),
+            crate::state::OpenDocument::new(
+                uri_str,
+                rel_a.to_path_buf(),
+                "# Doc A\n\n[[doc-b#^",
+                1,
+            ),
+        );
+
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri_str.parse().unwrap(),
+                },
+                position: Position::new(2, 9), // right after `[[doc-b#^`
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        let response = completion(params, &state).expect("Completion response expected");
+        if let CompletionResponse::Array(items) = response {
+            assert!(items.iter().any(|i| i.label == "^my-block-id"));
+            assert!(items.iter().any(|i| i.label == "^other-block"));
+        } else {
+            panic!("Expected CompletionResponse::Array");
         }
     }
 }

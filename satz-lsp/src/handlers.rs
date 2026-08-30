@@ -3,6 +3,7 @@ pub mod codelens;
 pub mod completion;
 pub mod definition;
 pub mod diagnostics;
+pub mod document_highlight;
 pub mod document_link;
 pub mod document_symbol;
 pub mod folding_range;

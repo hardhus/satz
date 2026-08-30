@@ -193,14 +193,21 @@ impl Index {
         })
     }
 
-    /// Returns an iterator over documents tagged with the specified tag name (case-insensitive).
+    /// Returns an iterator over documents tagged with the specified tag name (case-insensitive and hierarchical prefix matching).
     pub fn docs_with_tag<'a>(&'a self, tag: &str) -> impl Iterator<Item = &'a Document> + 'a {
         let clean = fold_key(tag.trim_start_matches('#'));
-        self.tags
-            .get(&clean)
-            .into_iter()
-            .flat_map(|ids| ids.iter())
-            .filter_map(|id| self.docs.get(id))
+        let prefix = format!("{}/", clean);
+        let mut matched_ids = std::collections::HashSet::new();
+
+        for (k, ids) in &self.tags {
+            if k == &clean || k.starts_with(&prefix) {
+                for id in ids {
+                    matched_ids.insert(id);
+                }
+            }
+        }
+
+        matched_ids.into_iter().filter_map(|id| self.docs.get(id))
     }
 
     /// Returns a sorted list of all unique tag names in the vault.

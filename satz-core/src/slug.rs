@@ -36,11 +36,16 @@ pub fn slugify(text: &str) -> String {
 }
 
 /// Index anahtarları için birleşik katlama. slugify ile aynı İ/U+0307 davranışı.
-pub fn fold_key(s: &str) -> String {
+pub fn fold_key_ext(s: &str, turkish_i_folding: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for c in s.trim().chars() {
-        if c == 'İ' {
+        if c == 'İ' || (turkish_i_folding && (c == 'I' || c == 'ı')) {
+            out.push('i');
+            prev_space = false;
+            continue;
+        }
+        if c == 'i' {
             out.push('i');
             prev_space = false;
             continue;
@@ -55,11 +60,20 @@ pub fn fold_key(s: &str) -> String {
         prev_space = false;
         for lc in c.to_lowercase() {
             if lc != '\u{0307}' {
-                out.push(lc);
+                if turkish_i_folding && lc == 'ı' {
+                    out.push('i');
+                } else {
+                    out.push(lc);
+                }
             }
         }
     }
     out
+}
+
+/// Index anahtarları için varsayılan birleşik katlama.
+pub fn fold_key(s: &str) -> String {
+    fold_key_ext(s, false)
 }
 
 /// Checks if a link heading target (raw text or slug) matches a heading.
@@ -93,5 +107,23 @@ mod tests {
             fold_key("  Language   Server  Protocol  "),
             "language server protocol"
         );
+    }
+
+    #[test]
+    fn test_turkish_i_folding_option() {
+        // With turkish_i_folding = false (Obsidian default)
+        assert_eq!(fold_key_ext("Işık", false), "işık");
+        assert_eq!(fold_key_ext("ışık", false), "ışık");
+        assert_eq!(fold_key_ext("İstemciler", false), "istemciler");
+        assert_eq!(fold_key_ext("Istemciler", false), "istemciler");
+        assert_eq!(fold_key_ext("ıstemciler", false), "ıstemciler");
+
+        // With turkish_i_folding = true (Fold both I/ı and İ/i into i)
+        assert_eq!(fold_key_ext("Işık", true), "işik");
+        assert_eq!(fold_key_ext("ışık", true), "işik");
+        assert_eq!(fold_key_ext("İstemciler", true), "istemciler");
+        assert_eq!(fold_key_ext("Istemciler", true), "istemciler");
+        assert_eq!(fold_key_ext("istemciler", true), "istemciler");
+        assert_eq!(fold_key_ext("ıstemciler", true), "istemciler");
     }
 }

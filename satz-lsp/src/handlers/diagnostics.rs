@@ -133,11 +133,21 @@ pub fn compute_diagnostics(
     }
 
     // 4. Orphan note diagnostic (HINT)
-    if index
-        .backlinks_of(&doc.id)
-        .filter(|id| *id != &doc.id)
-        .count()
-        == 0
+    let is_moc = doc.tags.iter().any(|t| {
+        let tag_clean = satz_core::fold_key(t.name.trim_start_matches('#'));
+        config
+            .diagnostics
+            .moc_tags
+            .iter()
+            .any(|moc| satz_core::fold_key(moc) == tag_clean)
+    });
+
+    if !is_moc
+        && index
+            .backlinks_of(&doc.id)
+            .filter(|id| *id != &doc.id)
+            .count()
+            == 0
         && (!doc.links.is_empty() || !doc.headings.is_empty())
     {
         diagnostics.push(lsp::Diagnostic {

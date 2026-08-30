@@ -6,7 +6,23 @@ pub struct VaultConfig {
     pub frontmatter: FrontmatterConfig,
     pub lsp: LspConfig,
     pub hover: HoverConfig,
+    pub diagnostics: DiagnosticsConfig,
     pub formatter: FormatterConfig,
+    pub turkish_i_folding: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    pub moc_tags: Vec<String>,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            moc_tags: vec!["moc".to_string(), "index".to_string()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
