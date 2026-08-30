@@ -1,14 +1,47 @@
 pub mod line_pass;
+pub mod table;
+pub mod zones;
 
 use crate::config::FormatterConfig;
+use crate::model::ByteRange;
 
 /// Formats a markdown document deterministically according to the provided `FormatterConfig`.
 ///
-/// Currently a thin wrapper around the line-based pass (`line_pass::run`); future formatter
-/// phases (tables, lists, emphasis, ...) are added as additional passes here without changing
-/// this entry point's signature.
+/// Runs structure-aware passes before the line-based pass: currently just GFM table
+/// re-alignment (`table`), spliced into the source via `zones::splice_ranges` so table cell
+/// content is never touched by anything other than the table renderer itself. Future formatter
+/// phases (lists, emphasis, ...) are added the same way — detect byte ranges, render each region
+/// from scratch, splice, then let `line_pass` handle the remaining line-based rules.
 pub fn format_document(source: &str, config: &FormatterConfig) -> String {
-    line_pass::run(source, config)
+    let with_tables = if config.tables.enable {
+        splice_tables(source, config)
+    } else {
+        source.to_string()
+    };
+    line_pass::run(&with_tables, config)
+}
+
+/// Detects every GFM table in `source` and replaces each with its canonically re-rendered form.
+fn splice_tables(source: &str, config: &FormatterConfig) -> String {
+    let structure = crate::parser::structure::parse_structure(source);
+    if structure.table_spans.is_empty() {
+        return source.to_string();
+    }
+
+    let mut spans = structure.table_spans.clone();
+    spans.sort_by_key(|s| s.start);
+
+    let replacements: Vec<(ByteRange, String)> = spans
+        .into_iter()
+        .map(|span| {
+            let rendered = table::parse_table_block(source, span)
+                .map(|block| table::render(&block, &config.tables))
+                .unwrap_or_else(|| source[span.start..span.end].to_string());
+            (span, rendered)
+        })
+        .collect();
+
+    zones::splice_ranges(source, &replacements)
 }
 
 #[cfg(test)]
@@ -18,7 +51,7 @@ mod tests {
 
     /// Idempotency safety net: formatting every fixture in the test corpus must reach a fixed
     /// point on the first pass (format(format(x)) == format(x)). This is the regression guard
-    /// that later formatter phases (tables, lists, emphasis, ...) must not break.
+    /// that later formatter phases (lists, emphasis, ...) must not break.
     #[test]
     fn test_idempotent_across_all_fixtures() {
         let config = FormatterConfig::default();
@@ -55,11 +88,34 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")) {
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                {
                     out.push(path);
                 }
             }
         }
         out
+    }
+
+    #[test]
+    fn test_table_disabled_leaves_pipes_untouched() {
+        let input = "|  A |B|\n|---|---|\n|1|2|\n";
+        let mut config = FormatterConfig::default();
+        config.tables.enable = false;
+        let out = format_document(input, &config);
+        assert_eq!(out, "|  A |B|\n|---|---|\n|1|2|\n");
+    }
+
+    #[test]
+    fn test_table_formatting_end_to_end_idempotent() {
+        let input = "Intro.\n\n|Name|Score|\n|:--|--:|\n|Alice|10|\n|Bob|9|\n\nOutro.\n";
+        let config = FormatterConfig::default();
+        let pass1 = format_document(input, &config);
+        let pass2 = format_document(&pass1, &config);
+        assert_eq!(pass1, pass2);
+        assert!(pass1.contains("Intro."));
+        assert!(pass1.contains("Outro."));
     }
 }

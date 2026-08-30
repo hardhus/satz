@@ -47,6 +47,7 @@ pub struct FormatterConfig {
     pub blank_lines_around_headings: u8,
     pub final_newline: bool,
     pub normalize_links: bool,
+    pub tables: TablesConfig,
 }
 
 impl Default for FormatterConfig {
@@ -57,6 +58,28 @@ impl Default for FormatterConfig {
             blank_lines_around_headings: 1,
             final_newline: true,
             normalize_links: true,
+            tables: TablesConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TablesConfig {
+    /// Enable GFM pipe-table detection and column alignment. Default: true.
+    pub enable: bool,
+    /// Minimum whitespace padding on each side of a cell's content. Default: 1.
+    pub cell_padding: usize,
+    /// Minimum width (in display columns) reserved for a column's dashes. Default: 3.
+    pub min_column_width: usize,
+}
+
+impl Default for TablesConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            cell_padding: 1,
+            min_column_width: 3,
         }
     }
 }
@@ -187,6 +210,9 @@ mod tests {
         assert_eq!(cfg.formatter.blank_lines_around_headings, 1);
         assert!(cfg.formatter.final_newline);
         assert!(cfg.formatter.normalize_links);
+        assert!(cfg.formatter.tables.enable);
+        assert_eq!(cfg.formatter.tables.cell_padding, 1);
+        assert_eq!(cfg.formatter.tables.min_column_width, 3);
     }
 
     #[test]
@@ -216,6 +242,11 @@ line_width = 100
 blank_lines_around_headings = 2
 final_newline = false
 normalize_links = false
+
+[formatter.tables]
+enable = false
+cell_padding = 2
+min_column_width = 5
 "#;
         let cfg = VaultConfig::from_toml(toml_str).unwrap();
         assert_eq!(cfg.id_scheme, IdSchemeConfig::Hierarchical);
@@ -230,5 +261,8 @@ normalize_links = false
         assert_eq!(cfg.formatter.blank_lines_around_headings, 2);
         assert!(!cfg.formatter.final_newline);
         assert!(!cfg.formatter.normalize_links);
+        assert!(!cfg.formatter.tables.enable);
+        assert_eq!(cfg.formatter.tables.cell_padding, 2);
+        assert_eq!(cfg.formatter.tables.min_column_width, 5);
     }
 }

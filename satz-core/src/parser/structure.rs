@@ -15,17 +15,21 @@ pub struct StructureOutput {
     pub footnote_defs: Vec<FootnoteDef>,
     pub footnote_refs: Vec<Link>,
     pub code_spans: Vec<ByteRange>,
+    pub table_spans: Vec<ByteRange>,
 }
 
 /// Parses the structural markdown components using `pulldown-cmark`.
 ///
 /// Collects headings, standard markdown links, footnote definitions/references,
-/// YAML frontmatter block, and code spans (which inline scan will avoid).
+/// YAML frontmatter block, code spans (which inline scan will avoid), and GFM table byte
+/// ranges (the formatter re-parses the raw text of each range itself, to preserve inline
+/// markdown/wikilinks inside cells verbatim rather than reconstructing it from the AST).
 pub fn parse_structure(source: &str) -> StructureOutput {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
     options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TABLES);
 
     let parser = Parser::new_ext(source, options);
     let mut output = StructureOutput::default();
@@ -52,8 +56,26 @@ pub fn parse_structure(source: &str) -> StructureOutput {
     let mut footnote_def_label = String::new();
     let mut footnote_def_start = 0usize;
 
+    let mut in_table = false;
+    let mut table_start = 0usize;
+
     for (event, range) in parser.into_offset_iter() {
         match event {
+            // --- GFM Tables ---
+            // Only the outer block range is captured; the formatter re-derives cell text and
+            // alignment from the raw source itself rather than the table's inner cell events.
+            Event::Start(Tag::Table(_)) => {
+                in_table = true;
+                table_start = range.start;
+            }
+            Event::End(TagEnd::Table) => {
+                if in_table {
+                    in_table = false;
+                    output
+                        .table_spans
+                        .push(ByteRange::new(table_start, range.end));
+                }
+            }
             // --- Frontmatter / MetadataBlock ---
             Event::Start(Tag::MetadataBlock(MetadataBlockKind::YamlStyle)) => {
                 in_metadata = true;
@@ -223,6 +245,17 @@ mod tests {
         let md = "Here is `inline` and:\n```rust\nlet x = 1;\n```\n";
         let structure = parse_structure(md);
         assert_eq!(structure.code_spans.len(), 2);
+    }
+
+    #[test]
+    fn test_structure_table_span() {
+        let md = "Intro paragraph.\n\n| A | B |\n| --- | ---: |\n| 1 | 2 |\n\nAfter.\n";
+        let structure = parse_structure(md);
+        assert_eq!(structure.table_spans.len(), 1);
+        let span = structure.table_spans[0];
+        let table_text = &md[span.start..span.end];
+        assert!(table_text.starts_with("| A | B |"));
+        assert!(table_text.trim_end().ends_with("| 1 | 2 |"));
     }
 
     #[test]
