@@ -43,7 +43,9 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
                             EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                         ) {
                             for path in paths {
-                                if is_markdown_file(&path) && !is_ignored_path(&path, &vault_root) {
+                                if (is_markdown_file(&path) || is_config_file(&path))
+                                    && !is_ignored_path(&path, &vault_root)
+                                {
                                     let _ = tx.send(path);
                                 }
                             }
@@ -91,28 +93,56 @@ async fn process_file_event(
     state: &Arc<RwLock<SatzState>>,
     client: &Client,
 ) {
-    let rel_path = crate::state::SatzState::get_rel_path(path, Some(vault_root));
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-
-    if !path.exists() {
-        // File was deleted
-        let mut s = state.write().await;
-        s.index.remove_doc(&doc_id);
-        tracing::info!("Watcher: removed deleted document {}", doc_id);
+    if is_config_file(path) {
+        if path.exists()
+            && let Ok(content) = std::fs::read_to_string(path)
+        {
+            match satz_core::VaultConfig::from_toml(&content) {
+                Ok(new_config) => {
+                    {
+                        let mut s = state.write().await;
+                        s.config = new_config;
+                    }
+                    client
+                        .log_message(
+                            tower_lsp_server::ls_types::MessageType::INFO,
+                            "satz: reloaded configuration from .satz.toml",
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    client
+                        .log_message(
+                            tower_lsp_server::ls_types::MessageType::WARNING,
+                            format!("satz: failed to parse .satz.toml: {}", e),
+                        )
+                        .await;
+                }
+            }
+        }
     } else {
-        // File created or modified
-        // If the file is currently open in editor, editor state takes precedence
-        let is_open = {
-            let s = state.read().await;
-            s.open_docs.values().any(|d| d.path == path)
-        };
+        let rel_path = crate::state::SatzState::get_rel_path(path, Some(vault_root));
+        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+        let doc_id = satz_core::DocId::new(&rel_path_str);
 
-        if !is_open && let Ok(content) = std::fs::read_to_string(path) {
-            let new_doc = satz_core::parse_document(&content, &rel_path);
+        if !path.exists() {
+            // File was deleted
             let mut s = state.write().await;
-            s.index.replace_doc(new_doc);
-            tracing::info!("Watcher: re-indexed {}", doc_id);
+            s.index.remove_doc(&doc_id);
+            tracing::info!("Watcher: removed deleted document {}", doc_id);
+        } else {
+            // File created or modified
+            let is_open = {
+                let s = state.read().await;
+                s.open_docs.values().any(|d| d.path == path)
+            };
+
+            if !is_open && let Ok(content) = std::fs::read_to_string(path) {
+                let new_doc = satz_core::parse_document(&content, &rel_path);
+                let mut s = state.write().await;
+                s.index.replace_doc(new_doc);
+                tracing::info!("Watcher: re-indexed {}", doc_id);
+            }
         }
     }
 
@@ -140,12 +170,25 @@ fn is_markdown_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_config_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == ".satz.toml" || n == "satz.toml")
+}
+
 fn is_ignored_path(path: &Path, root: &Path) -> bool {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .components()
-        .any(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            s.starts_with('.') && s != "." && s != ".."
-        })
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    for c in rel.components() {
+        let s = c.as_os_str().to_string_lossy();
+        if satz_core::walk::DEFAULT_IGNORED_DIRS
+            .iter()
+            .any(|d| s.eq_ignore_ascii_case(d))
+        {
+            return true;
+        }
+        if s.starts_with('.') && s != "." && s != ".." && s != ".satz.toml" {
+            return true;
+        }
+    }
+    false
 }

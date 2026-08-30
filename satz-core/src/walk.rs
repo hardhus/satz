@@ -6,6 +6,30 @@ use std::path::{Path, PathBuf};
 use crate::model::Document;
 use crate::parser::parse_document;
 
+pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".obsidian",
+    "node_modules",
+    ".trash",
+    ".stversions",
+    ".svn",
+    ".hg",
+];
+
+pub fn is_ignored_entry(path: &Path, root: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    for c in rel.components() {
+        let s = c.as_os_str().to_string_lossy();
+        if DEFAULT_IGNORED_DIRS
+            .iter()
+            .any(|d| s.eq_ignore_ascii_case(d))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Traverses the given `vault_root` path respecting `.gitignore` rules and parses all `.md` files in parallel.
 ///
 /// Returns a list of `Document`s. Files with read errors or invalid encoding are logged as warnings and skipped.
@@ -26,14 +50,16 @@ pub fn walk_vault(vault_root: &Path) -> Result<Vec<Document>> {
     for result in walker {
         match result {
             Ok(entry) => {
-                if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                    let path = entry.path();
-                    if path
+                let path = entry.path();
+                if is_ignored_entry(path, vault_root) {
+                    continue;
+                }
+                if entry.file_type().is_some_and(|ft| ft.is_file())
+                    && path
                         .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                    {
-                        md_paths.push(path.to_path_buf());
-                    }
+                {
+                    md_paths.push(path.to_path_buf());
                 }
             }
             Err(e) => {

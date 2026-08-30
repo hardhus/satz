@@ -359,3 +359,45 @@ async fn test_pull_diagnostics_matches_compute_diagnostics() {
     assert_eq!(expected_diags.len(), pull_diags.len());
     assert_eq!(expected_diags, pull_diags);
 }
+
+#[tokio::test]
+async fn test_workspace_diagnostics_coverage() {
+    let (state, _) = create_zettel_state();
+
+    let mut all_reports = Vec::new();
+    for doc in state.index.documents() {
+        let diags = compute_diagnostics(doc, &state.index, &state.config);
+        all_reports.push((doc.id.as_str().to_string(), diags));
+    }
+
+    // Check that reports contain all 4 docs
+    assert_eq!(all_reports.len(), 4);
+
+    // Ana Dizin has 2 warnings (MOC note, so 0 orphan hints)
+    let (_, diags_ana) = all_reports
+        .iter()
+        .find(|(id, _)| id == "Ana Dizin.md")
+        .unwrap();
+    assert_eq!(diags_ana.len(), 2);
+
+    // Kavramlar/LSP has 1 duplicate heading warning
+    let (_, diags_lsp) = all_reports
+        .iter()
+        .find(|(id, _)| id == "Kavramlar/LSP.md")
+        .unwrap();
+    assert_eq!(diags_lsp.len(), 1);
+
+    // Gunluk/2026-08-27 has 0 warnings
+    let (_, diags_gunluk) = all_reports
+        .iter()
+        .find(|(id, _)| id == "Gunluk/2026-08-27.md")
+        .unwrap();
+    assert_eq!(diags_gunluk.len(), 0);
+
+    // Unutulmus Fikir has 2 (1 broken heading + 1 orphan hint)
+    let (_, diags_unutulan) = all_reports
+        .iter()
+        .find(|(id, _)| id == "Unutulmus Fikir.md")
+        .unwrap();
+    assert_eq!(diags_unutulan.len(), 2);
+}

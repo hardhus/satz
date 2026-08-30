@@ -15,12 +15,14 @@ pub struct VaultConfig {
 #[serde(default)]
 pub struct DiagnosticsConfig {
     pub moc_tags: Vec<String>,
+    pub workspace: bool,
 }
 
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             moc_tags: vec!["moc".to_string(), "index".to_string()],
+            workspace: true,
         }
     }
 }
@@ -110,6 +112,37 @@ pub enum IdSchemeConfig {
 pub struct DailyNoteConfig {
     pub folder: String,
     pub format: String,
+    pub aliases: DailyAliasesConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DailyAliasesConfig {
+    pub today: Vec<String>,
+    pub yesterday: Vec<String>,
+    pub tomorrow: Vec<String>,
+}
+
+impl Default for DailyAliasesConfig {
+    fn default() -> Self {
+        Self {
+            today: vec![
+                "bugün".to_string(),
+                "bugun".to_string(),
+                "today".to_string(),
+            ],
+            yesterday: vec![
+                "dün".to_string(),
+                "dun".to_string(),
+                "yesterday".to_string(),
+            ],
+            tomorrow: vec![
+                "yarın".to_string(),
+                "yarin".to_string(),
+                "tomorrow".to_string(),
+            ],
+        }
+    }
 }
 
 impl Default for DailyNoteConfig {
@@ -117,6 +150,7 @@ impl Default for DailyNoteConfig {
         Self {
             folder: "daily".to_string(),
             format: "%Y-%m-%d".to_string(),
+            aliases: DailyAliasesConfig::default(),
         }
     }
 }

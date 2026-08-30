@@ -13,7 +13,7 @@ pub fn version() -> &'static str {
 }
 
 // Convenience re-exports
-pub use config::VaultConfig;
+pub use config::{DailyNoteConfig, DiagnosticsConfig, VaultConfig};
 pub use index::{IdScheme, Index, IndexStats, LinkResolution, PathScheme};
 pub use model::{
     ByteRange, DocId, Document, FootnoteDef, FootnoteTable, Frontmatter, Heading, Link, LinkKind,

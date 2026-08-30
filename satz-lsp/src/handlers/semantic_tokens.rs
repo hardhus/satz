@@ -69,7 +69,11 @@ pub fn semantic_tokens_full(
                     continue;
                 }
 
-                let token_type = match state.index.resolve_link_full(link, Some(doc)) {
+                let token_type = match state.index.resolve_link_full_with_config(
+                    link,
+                    Some(doc),
+                    Some(&state.config),
+                ) {
                     satz_core::LinkResolution::Resolved { .. } => 0,
                     satz_core::LinkResolution::AnchorMissing { .. }
                     | satz_core::LinkResolution::DocMissing => 1,

@@ -16,7 +16,7 @@ pub fn compute_diagnostics(
         match link.kind {
             LinkKind::WikiLink | LinkKind::Embed => {
                 let range = byte_range_to_lsp(link.range, &doc.line_index);
-                match index.resolve_link_full(link, Some(doc)) {
+                match index.resolve_link_full_with_config(link, Some(doc), Some(config)) {
                     satz_core::LinkResolution::DocMissing => {
                         let code = if link.kind == LinkKind::Embed {
                             "broken-embed"

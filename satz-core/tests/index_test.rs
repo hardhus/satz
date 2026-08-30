@@ -125,3 +125,78 @@ fn test_turkish_title_key() {
     assert!(index.resolve_link("istemciler").is_some());
     assert!(index.resolve_link("İSTEMCİLER").is_some());
 }
+
+#[test]
+fn test_relative_daily_note_resolution() {
+    let now = chrono::Local::now().date_naive();
+    let today_str = now.format("%Y-%m-%d").to_string();
+    let yesterday_str = (now - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let tomorrow_str = (now + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let doc_today = parse_document("# Today", Path::new(&format!("daily/{}.md", today_str)));
+    let doc_yesterday = parse_document(
+        "# Yesterday",
+        Path::new(&format!("daily/{}.md", yesterday_str)),
+    );
+    let doc_tomorrow = parse_document(
+        "# Tomorrow",
+        Path::new(&format!("daily/{}.md", tomorrow_str)),
+    );
+
+    let index = Index::build(vec![doc_today, doc_yesterday, doc_tomorrow]);
+    let config = satz_core::DailyNoteConfig::default();
+
+    assert_eq!(
+        index
+            .resolve_relative_daily("bugün", &config)
+            .unwrap()
+            .as_str(),
+        format!("daily/{}.md", today_str)
+    );
+    assert_eq!(
+        index
+            .resolve_relative_daily("bugun", &config)
+            .unwrap()
+            .as_str(),
+        format!("daily/{}.md", today_str)
+    );
+    assert_eq!(
+        index
+            .resolve_relative_daily("today", &config)
+            .unwrap()
+            .as_str(),
+        format!("daily/{}.md", today_str)
+    );
+    assert_eq!(
+        index
+            .resolve_relative_daily("dün", &config)
+            .unwrap()
+            .as_str(),
+        format!("daily/{}.md", yesterday_str)
+    );
+    assert_eq!(
+        index
+            .resolve_relative_daily("yesterday", &config)
+            .unwrap()
+            .as_str(),
+        format!("daily/{}.md", yesterday_str)
+    );
+    assert_eq!(
+        index
+            .resolve_relative_daily("yarın", &config)
+            .unwrap()
+            .as_str(),
+        format!("daily/{}.md", tomorrow_str)
+    );
+    assert_eq!(
+        index
+            .resolve_relative_daily("tomorrow", &config)
+            .unwrap()
+            .as_str(),
+        format!("daily/{}.md", tomorrow_str)
+    );
+}

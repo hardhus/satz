@@ -180,7 +180,7 @@ impl LanguageServer for Backend {
                     DiagnosticOptions {
                         identifier: Some("satz".to_string()),
                         inter_file_dependencies: true,
-                        workspace_diagnostics: false,
+                        workspace_diagnostics: true,
                         work_done_progress_options: WorkDoneProgressOptions::default(),
                     },
                 )),
@@ -566,6 +566,42 @@ impl LanguageServer for Backend {
                     items: diagnostics,
                 },
             }),
+        ))
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> jsonrpc::Result<WorkspaceDiagnosticReportResult> {
+        let state = self.state.read().await;
+        let mut items = Vec::new();
+
+        for doc in state.index.documents() {
+            let doc_path = match &state.vault_root {
+                Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
+                _ => doc.path.clone(),
+            };
+            if let Some(uri) = crate::convert::path_to_uri(&doc_path) {
+                let diagnostics = compute_diagnostics(doc, &state.index, &state.config);
+                let version = state
+                    .open_docs
+                    .get(uri.as_str())
+                    .map(|od| od.version as i64);
+                items.push(WorkspaceDocumentDiagnosticReport::Full(
+                    WorkspaceFullDocumentDiagnosticReport {
+                        uri,
+                        version,
+                        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                            result_id: None,
+                            items: diagnostics,
+                        },
+                    },
+                ));
+            }
+        }
+
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
         ))
     }
 }

@@ -44,7 +44,10 @@ pub fn goto_definition(
         return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
     }
 
-    match state.index.resolve_link_full(link, Some(doc)) {
+    match state
+        .index
+        .resolve_link_full_with_config(link, Some(doc), Some(&state.config))
+    {
         satz_core::LinkResolution::Resolved {
             doc: target_doc,
             anchor,

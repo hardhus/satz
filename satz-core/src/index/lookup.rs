@@ -97,11 +97,57 @@ impl Index {
         self.by_title_alias.get(&fold_key(raw_target))
     }
 
-    /// Fully resolves a `Link` against the index, checking both document existence and heading/block anchors.
-    pub fn resolve_link_full<'a>(
+    /// Resolves relative daily note aliases like `[[bugün]]`, `[[dün]]`, `[[yarın]]`
+    /// to the target `DocId` based on `DailyNoteConfig`.
+    pub fn resolve_relative_daily(
+        &self,
+        raw_target: &str,
+        config: &crate::config::DailyNoteConfig,
+    ) -> Option<&DocId> {
+        let clean = fold_key(raw_target);
+        let today_match = config.aliases.today.iter().any(|a| fold_key(a) == clean);
+        let yesterday_match = config
+            .aliases
+            .yesterday
+            .iter()
+            .any(|a| fold_key(a) == clean);
+        let tomorrow_match = config.aliases.tomorrow.iter().any(|a| fold_key(a) == clean);
+
+        let target_date = if today_match {
+            Some(chrono::Local::now().date_naive())
+        } else if yesterday_match {
+            Some((chrono::Local::now() - chrono::Duration::days(1)).date_naive())
+        } else if tomorrow_match {
+            Some((chrono::Local::now() + chrono::Duration::days(1)).date_naive())
+        } else {
+            None
+        };
+
+        if let Some(date) = target_date {
+            let formatted_date = date.format(&config.format).to_string();
+            // Try resolving formatted date directly
+            if let Some(doc_id) = self.resolve_link(&formatted_date) {
+                return Some(doc_id);
+            }
+            // Try folder/formatted_date
+            let full_path = if config.folder.is_empty() {
+                formatted_date
+            } else {
+                format!("{}/{}", config.folder.trim_matches('/'), formatted_date)
+            };
+            return self.resolve_link(&full_path);
+        }
+
+        None
+    }
+
+    /// Fully resolves a `Link` against the index, checking both document existence and heading/block anchors,
+    /// with optional `VaultConfig` for relative daily notes.
+    pub fn resolve_link_full_with_config<'a>(
         &'a self,
         link: &Link,
         current_doc: Option<&'a Document>,
+        config: Option<&crate::config::VaultConfig>,
     ) -> LinkResolution<'a> {
         let heading_empty = link
             .target_heading
@@ -121,12 +167,22 @@ impl Index {
             };
         }
 
+        let resolved_id = if link.target_doc.is_empty() {
+            None
+        } else if let Some(id) = self.resolve_link(&link.target_doc) {
+            Some(id)
+        } else if let Some(cfg) = config {
+            self.resolve_relative_daily(&link.target_doc, &cfg.daily_note)
+        } else {
+            None
+        };
+
         let target_doc = if link.target_doc.is_empty() {
             match current_doc {
                 Some(d) => d,
                 None => return LinkResolution::DocMissing,
             }
-        } else if let Some(target_id) = self.resolve_link(&link.target_doc) {
+        } else if let Some(target_id) = resolved_id {
             match self.get_doc(target_id) {
                 Some(d) => d,
                 None => return LinkResolution::DocMissing,
@@ -164,6 +220,15 @@ impl Index {
                 anchor: None,
             }
         }
+    }
+
+    /// Fully resolves a `Link` against the index, checking both document existence and heading/block anchors.
+    pub fn resolve_link_full<'a>(
+        &'a self,
+        link: &Link,
+        current_doc: Option<&'a Document>,
+    ) -> LinkResolution<'a> {
+        self.resolve_link_full_with_config(link, current_doc, None)
     }
 
     /// Retrieves a document by its `DocId`.
