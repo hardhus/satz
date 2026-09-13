@@ -416,7 +416,13 @@ impl Index {
         if !new_stem_key.is_empty() {
             match self.by_stem.entry(new_stem_key) {
                 std::collections::hash_map::Entry::Occupied(e) => {
-                    tracing::warn!("stem conflict: '{}' (keeping first entry)", e.key());
+                    tracing::warn!(
+                        "stem conflict: '{}' (keeping first entry {:?}, new doc {:?} at path {:?} was rejected)",
+                        e.key(),
+                        e.get(),
+                        id,
+                        new_doc.path
+                    );
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(id.clone());

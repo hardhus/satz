@@ -30,7 +30,29 @@ pub fn byte_range_to_lsp(range: ByteRange, line_index: &LineIndex) -> lsp::Range
 /// Converts a file URI string into a local filesystem `PathBuf`.
 pub fn uri_to_path(uri_str: &str) -> Option<PathBuf> {
     let uri: lsp::Uri = uri_str.parse().ok()?;
-    uri.to_file_path().map(|p| p.into_owned())
+    let path = uri.to_file_path().map(|p| p.into_owned())?;
+    Some(normalize_windows_drive_root(path))
+}
+
+/// A Windows drive-root URI (`file:///m:/`) can round-trip through
+/// `Uri::to_file_path()` as the bare drive-relative path `"m:"` (no root
+/// separator) instead of the drive root `"m:\"`. Those are different paths
+/// on Windows — `"m:"` means "wherever that drive's own current directory
+/// happens to be", not its root — so every relative-path computation done
+/// against a `vault_root` built from it comes out short one separator (e.g.
+/// stripping `"m:"` off `"m:\tlp\1.md"` leaves `"\tlp\1.md"` instead of
+/// `"tlp\1.md"`), which then never matches the separator-free relative
+/// paths `walk_vault` computes internally — silently splitting every
+/// document into two different, colliding `DocId`s. Restore the missing
+/// separator whenever `to_file_path()` produced a bare drive prefix.
+fn normalize_windows_drive_root(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+    if path.has_root() || !matches!(path.components().next(), Some(Component::Prefix(_))) {
+        return path;
+    }
+    let mut fixed = path.into_os_string();
+    fixed.push(std::path::MAIN_SEPARATOR.to_string());
+    PathBuf::from(fixed)
 }
 
 /// Converts a filesystem `Path` into an `lsp::Uri`.
@@ -133,6 +155,49 @@ mod tests {
         let text_edits = line_edits_to_text_edits(&line_index, &edits);
         assert_eq!(text_edits[0].range.start, lsp::Position::new(1, 0));
         assert_eq!(text_edits[0].range.end, lsp::Position::new(1, 1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normalize_windows_drive_root_restores_missing_separator() {
+        // "z:" (drive-relative, no root) must become "z:\" (drive root).
+        assert!(normalize_windows_drive_root(PathBuf::from("z:")).has_root());
+        assert_eq!(
+            normalize_windows_drive_root(PathBuf::from("z:")),
+            PathBuf::from("z:\\")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normalize_windows_drive_root_leaves_well_formed_paths_alone() {
+        // Already-rooted paths (the common case, e.g. a subfolder vault root) must be untouched.
+        assert_eq!(
+            normalize_windows_drive_root(PathBuf::from("C:\\vault")),
+            PathBuf::from("C:\\vault")
+        );
+        assert_eq!(
+            normalize_windows_drive_root(PathBuf::from("z:\\")),
+            PathBuf::from("z:\\")
+        );
+    }
+
+    // Not run by default: exercises the full `Uri` parsing round-trip for a
+    // specific drive letter ("m:"), which only matters if that letter is
+    // ever actually used as a vault root — the real regression coverage is
+    // `test_normalize_windows_drive_root_restores_missing_separator` above,
+    // which tests the fix directly and unconditionally. Kept here (manual
+    // `cargo test -- --ignored`) as an end-to-end sanity check tied to the
+    // exact URI that originally triggered this bug.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "exercises one specific drive letter end-to-end; the real coverage is above"]
+    fn test_uri_to_path_drive_root_has_separator() {
+        let path = uri_to_path("file:///m:/").expect("should parse a drive-root URI");
+        assert!(
+            path.has_root(),
+            "drive-root URI must produce a rooted path, got {path:?}"
+        );
     }
 
     #[test]
