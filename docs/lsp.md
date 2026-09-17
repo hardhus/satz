@@ -88,6 +88,30 @@ A background file watcher (`notify`, polling every 500ms with a further 200ms de
 
 Two config fields control edit-triggered (as opposed to file-watcher-triggered) reparsing latency: `lsp.reparse_debounce_ms` and `lsp.reparse_max_wait_ms` — see [`docs/configuration.md`](configuration.md#lsp--server-wide-lsp-tuning).
 
+## Logging
+
+satz-lsp is silent by default — no log output at all, and no `RUST_LOG` env var is read. Verbosity is controlled entirely by a single `logLevel` field in the `initialize` request's `initializationOptions`, so it can be changed from your editor's own LSP config without recompiling or restarting anything beyond the language server itself.
+
+`logLevel` accepts either a bare level (`"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`) applied to every module, or a full [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directive string for per-module control, e.g. `"satz_lsp=trace,satz_core=debug"`. Both forms go through the same field — there's no separate syntax to learn.
+
+In Helix, set it under the language server's `config` table:
+
+```toml
+[language-server.satz]
+command = "satz-lsp"
+
+[language-server.satz.config]
+logLevel = "debug"
+
+[[language]]
+name = "markdown"
+language-servers = ["satz"]
+```
+
+Output goes to stderr, which most clients (including Helix, into `helix.log`) capture alongside the server's other diagnostic messages. Remove the `logLevel` line (or set it to `"off"`) to go back to silence — no rebuild needed either way.
+
+Coverage is deliberately boundary-focused: the LSP lifecycle, every request handler, the file watcher, and index build/update all log at `debug` (a few very hot paths — per-link resolution misses, per-document diagnostics — log at `trace` instead, so `debug` stays readable). Parser and formatter internals are not instrumented: they re-run on every keystroke, and logging inside them would add real overhead for little diagnostic value over the boundary logs.
+
 ## Editor setup
 
 satz doesn't ship an editor extension — configure your client's generic/manual LSP support to launch `satz-lsp` for Markdown files.

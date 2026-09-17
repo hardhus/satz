@@ -35,6 +35,7 @@ pub fn semantic_tokens_full(
     state: &SatzState,
 ) -> Option<SemanticTokensResult> {
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "semantic_tokens_full");
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =
         crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());

@@ -33,6 +33,10 @@ pub struct FormatWorkspaceResult {
 /// already fully formatted, a repeat call does zero `format_document` work at all, just cache
 /// hits that immediately compare equal to the source and get skipped.
 pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
+    tracing::debug!(
+        doc_count = state.index.doc_count(),
+        "compute_format_changes: starting"
+    );
     if !state.config.formatter.enabled {
         return FormatWorkspaceResult {
             changes: Vec::new(),

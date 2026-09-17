@@ -99,6 +99,8 @@ vim.api.nvim_create_autocmd("FileType", {
 })
 ```
 
+Logging is off by default; set `logLevel` (e.g. `"debug"`) in your editor's `initializationOptions` for the server to turn it on without a rebuild — see [`docs/lsp.md#logging`](docs/lsp.md#logging).
+
 Full capability list, diagnostics codes, rename/code-action semantics, and more editor snippets (generic clients): **[`docs/lsp.md`](docs/lsp.md)**.
 
 ## Configuration

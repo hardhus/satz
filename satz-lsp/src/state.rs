@@ -135,12 +135,15 @@ impl SatzState {
     /// Discovers and indexes all `.md` files in the vault.
     pub fn initialize_index(vault_root: PathBuf) -> anyhow::Result<Self> {
         let config_file = vault_root.join(".satz.toml");
+        let config_present = config_file.exists();
         let config = std::fs::read_to_string(&config_file)
             .ok()
             .and_then(|s| VaultConfig::from_toml(&s).ok())
             .unwrap_or_default();
+        tracing::debug!(config_present, "initialize_index: loaded .satz.toml (or default)");
 
         let docs = walk_vault(&vault_root)?;
+        tracing::debug!(doc_count = docs.len(), "initialize_index: walk_vault returned docs");
         let index = Index::build(docs);
         let format_cache = FormatCache::new(config.lsp.format_cache_capacity);
 
@@ -184,6 +187,7 @@ impl SatzState {
         let rel_path = Self::get_rel_path(path, self.vault_root.as_deref());
         let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
         let doc_id = satz_core::DocId::new(&rel_path_str);
+        tracing::debug!(%uri, ?doc_id, version, "open_document");
 
         let old_keys = self
             .index
@@ -217,6 +221,7 @@ impl SatzState {
         let rel_path = Self::get_rel_path(&path, self.vault_root.as_deref());
         let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
         let doc_id = satz_core::DocId::new(&rel_path_str);
+        tracing::debug!(%uri, ?doc_id, "reparse_open_document");
 
         let old_keys = self
             .index
@@ -259,6 +264,7 @@ impl SatzState {
 
     /// Closes and untracks an open document, aborting any background debounce tasks.
     pub fn close_document(&mut self, uri: &str) {
+        tracing::debug!(%uri, "close_document");
         if let Some(mut doc) = self.open_docs.remove(uri)
             && let Some(task) = doc.pending_task.take()
         {

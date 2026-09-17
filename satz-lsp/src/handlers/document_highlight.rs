@@ -67,6 +67,7 @@ pub fn document_highlight(
         .text_document
         .uri
         .as_str();
+    tracing::debug!(uri, "document_highlight");
     let pos = params.text_document_position_params.position;
 
     let open_doc = state.open_docs.get(uri)?;

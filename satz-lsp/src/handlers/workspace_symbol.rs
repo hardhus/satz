@@ -14,6 +14,7 @@ pub fn workspace_symbol(
     state: &SatzState,
 ) -> Option<WorkspaceSymbolResponse> {
     let raw_query = params.query.trim();
+    tracing::debug!(query = raw_query, "workspace_symbol");
 
     // Check for `tag:tagname query` prefix
     let (tag_filter, search_query) = if let Some(rest) = raw_query.strip_prefix("tag:") {

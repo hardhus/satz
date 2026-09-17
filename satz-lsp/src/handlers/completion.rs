@@ -12,6 +12,7 @@ use crate::state::SatzState;
 pub fn completion(params: CompletionParams, state: &SatzState) -> Option<CompletionResponse> {
     let uri = params.text_document_position.text_document.uri.as_str();
     let pos = params.text_document_position.position;
+    tracing::debug!(uri, ?pos, "completion");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =

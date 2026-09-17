@@ -12,6 +12,7 @@ pub fn formatting(params: DocumentFormattingParams, state: &SatzState) -> Option
     }
 
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "formatting");
     let open_doc = state.open_docs.get(uri)?;
     let original = open_doc.rope.to_string();
 

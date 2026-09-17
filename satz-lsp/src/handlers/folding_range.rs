@@ -4,6 +4,7 @@ use tower_lsp_server::ls_types::{FoldingRange, FoldingRangeKind, FoldingRangePar
 /// Computes folding ranges for headers and frontmatter in a document.
 pub fn folding_range(params: FoldingRangeParams, state: &SatzState) -> Option<Vec<FoldingRange>> {
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "folding_range");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =

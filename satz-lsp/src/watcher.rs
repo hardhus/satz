@@ -12,6 +12,7 @@ use crate::state::SatzState;
 
 /// Spawns a background task that watches `vault_root` for `.md` file changes.
 pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client: Client) {
+    tracing::debug!(vault_root = %vault_root.display(), "watcher: spawning");
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
 
     // 1. Setup notify watcher
@@ -34,10 +35,12 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
                 tracing::error!("Failed to watch vault root {}: {}", vault_root.display(), e);
                 return;
             }
+            tracing::debug!(vault_root = %vault_root.display(), "watcher: now watching");
 
             for res in event_rx {
                 match res {
                     Ok(Event { paths, kind, .. }) => {
+                        tracing::trace!(?kind, ?paths, "watcher: raw fs event");
                         if matches!(
                             kind,
                             EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
@@ -46,6 +49,7 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
                                 if (is_markdown_file(&path) || is_config_file(&path))
                                     && !is_ignored_path(&path, &vault_root)
                                 {
+                                    tracing::debug!(?path, "watcher: queued relevant change");
                                     let _ = tx.send(path);
                                 }
                             }
@@ -93,6 +97,7 @@ async fn process_file_event(
     state: &Arc<RwLock<SatzState>>,
     client: &Client,
 ) {
+    tracing::debug!(?path, "watcher: processing debounced event");
     if is_config_file(path) {
         if path.exists()
             && let Ok(content) = std::fs::read_to_string(path)

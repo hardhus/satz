@@ -60,6 +60,16 @@ impl Index {
     /// 3. Stem match (`by_stem`)
     /// 4. Lowercase title or alias match (`by_title_alias`)
     pub fn resolve_link(&self, raw_target: &str) -> Option<&DocId> {
+        let result = self.resolve_link_impl(raw_target);
+        if result.is_none() {
+            // trace, not debug: called for every link on every reparse/diagnostics
+            // pass, so a broken link would otherwise flood even a debug-level log.
+            tracing::trace!(raw_target, "resolve_link: no match");
+        }
+        result
+    }
+
+    fn resolve_link_impl(&self, raw_target: &str) -> Option<&DocId> {
         // Fast path: if target has no path separators or extension, check stem & title/alias directly
         if !raw_target.contains('/') && !raw_target.contains('\\') && !raw_target.contains('.') {
             let folded = fold_key(raw_target);
@@ -322,6 +332,7 @@ impl Index {
     /// Replaces or inserts a document in the index, updating paths, title/aliases, tags, and backlinks.
     pub fn replace_doc(&mut self, new_doc: Document) {
         let id = new_doc.id.clone();
+        tracing::debug!(?id, path = ?new_doc.path, "Index::replace_doc");
 
         // If old doc exists, clean up old references
         if let Some(old_doc) = self.docs.get(&id) {
@@ -483,6 +494,7 @@ impl Index {
 
     /// Removes a document from the index.
     pub fn remove_doc(&mut self, id: &DocId) {
+        tracing::debug!(?id, "Index::remove_doc");
         if let Some(old_doc) = self.docs.remove(id) {
             // Remove outgoing backlinks
             for link in &old_doc.links {

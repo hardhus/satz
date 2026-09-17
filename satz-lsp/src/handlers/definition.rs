@@ -15,6 +15,7 @@ pub fn goto_definition(
         .uri
         .as_str();
     let pos = params.text_document_position_params.position;
+    tracing::debug!(uri, ?pos, "goto_definition");
 
     // Get the current document
     let open_doc = state.open_docs.get(uri)?;
@@ -44,10 +45,25 @@ pub fn goto_definition(
         return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
     }
 
-    match state
+    let resolution = state
         .index
-        .resolve_link_full_with_config(link, Some(doc), Some(&state.config))
-    {
+        .resolve_link_full_with_config(link, Some(doc), Some(&state.config));
+    // Deliberately not logging `resolution` itself: it borrows the full target
+    // `Document` and its derived `Debug` would dump the whole parsed document
+    // (content, headings, links, ...) on every `gd` call at debug level.
+    let outcome = match &resolution {
+        satz_core::LinkResolution::Resolved { doc, .. } => format!("Resolved({:?})", doc.id),
+        satz_core::LinkResolution::AnchorMissing { doc } => format!("AnchorMissing({:?})", doc.id),
+        satz_core::LinkResolution::DocMissing => "DocMissing".to_string(),
+    };
+    tracing::debug!(
+        target_doc = %link.target_doc,
+        target_heading = ?link.target_heading,
+        outcome,
+        "goto_definition: link resolution"
+    );
+
+    match resolution {
         satz_core::LinkResolution::Resolved {
             doc: target_doc,
             anchor,

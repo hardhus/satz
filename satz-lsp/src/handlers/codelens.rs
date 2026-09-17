@@ -8,6 +8,7 @@ pub fn code_lens(params: CodeLensParams, state: &SatzState) -> Option<Vec<CodeLe
     }
 
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "code_lens");
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =
         crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());

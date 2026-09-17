@@ -131,6 +131,11 @@ impl Index {
             }
         }
 
+        tracing::debug!(
+            doc_count = index.docs.len(),
+            broken_links = index.broken_link_count(),
+            "Index::build: finished"
+        );
         index
     }
 }

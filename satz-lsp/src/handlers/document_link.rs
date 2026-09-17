@@ -8,6 +8,7 @@ use satz_core::model::LinkKind;
 
 pub fn document_link(params: DocumentLinkParams, state: &SatzState) -> Option<Vec<DocumentLink>> {
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "document_link");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =

@@ -13,6 +13,7 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
         .uri
         .as_str();
     let pos = params.text_document_position_params.position;
+    tracing::debug!(uri, ?pos, "hover");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =

@@ -13,6 +13,7 @@ use satz_core::model::LinkKind;
 
 pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeActionResponse> {
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "code_action");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =

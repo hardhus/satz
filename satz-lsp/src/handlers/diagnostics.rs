@@ -9,6 +9,7 @@ pub fn compute_diagnostics(
     index: &Index,
     config: &VaultConfig,
 ) -> Vec<lsp::Diagnostic> {
+    tracing::trace!(doc_id = ?doc.id, "compute_diagnostics");
     let mut diagnostics = Vec::new();
 
     // 1. Link diagnostics (broken wikilinks, broken heading references, broken internal markdown links)

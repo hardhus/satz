@@ -10,6 +10,7 @@ pub fn inlay_hint(params: InlayHintParams, state: &SatzState) -> Option<Vec<Inla
     }
 
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "inlay_hint");
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =
         crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());

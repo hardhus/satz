@@ -6,15 +6,22 @@ use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::request::WorkspaceDiagnosticRefresh;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::reload;
 
 use crate::convert::uri_to_path;
 use crate::handlers::diagnostics::compute_diagnostics;
 use crate::state::SatzState;
 
-#[derive(Debug)]
+/// Handle to the process-wide log filter, set up in `main`. Lets a single
+/// client-supplied `initializationOptions.logLevel` change verbosity at
+/// runtime without an env var or a rebuild.
+pub type LogReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
 pub struct Backend {
     pub client: Client,
     pub state: Arc<RwLock<SatzState>>,
+    log_reload_handle: LogReloadHandle,
 }
 
 /// Computes diagnostics for the specified open document URI and sends them to the client.
@@ -49,10 +56,28 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
 }
 
 impl Backend {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, log_reload_handle: LogReloadHandle) -> Self {
         Self {
             client,
             state: Arc::new(RwLock::new(SatzState::default())),
+            log_reload_handle,
+        }
+    }
+
+    /// Applies a client-requested log level/filter, if valid. Accepts either
+    /// a bare level (`"debug"`) or a full `EnvFilter` directive string
+    /// (`"satz_lsp=trace,satz_core=debug"`) — `EnvFilter` parses both the
+    /// same way, so no extra parsing is needed here.
+    fn apply_log_level(&self, level: &str) {
+        match EnvFilter::try_new(level) {
+            Ok(filter) => {
+                if self.log_reload_handle.reload(filter).is_ok() {
+                    tracing::info!("satz-lsp log level set to '{level}'");
+                }
+            }
+            Err(e) => {
+                tracing::error!("satz-lsp: invalid logLevel '{level}': {e}");
+            }
         }
     }
 
@@ -63,6 +88,15 @@ impl Backend {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        if let Some(level) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|opts| opts.get("logLevel"))
+            .and_then(|v| v.as_str())
+        {
+            self.apply_log_level(level);
+        }
+
         let vault_root: Option<PathBuf> = params
             .workspace_folders
             .as_deref()
@@ -88,12 +122,15 @@ impl LanguageServer for Backend {
             state.client_supports_pull_diagnostics = supports_pull;
         }
 
+        tracing::debug!(?vault_root, "initialize: resolved vault root");
+
         if let Some(root) = vault_root {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let root_clone = root.clone();
 
             tokio::task::spawn(async move {
+                tracing::debug!(vault_root = ?root_clone, "walk_vault: starting");
                 let root_for_blocking = root_clone.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     SatzState::initialize_index(root_for_blocking)
@@ -103,6 +140,7 @@ impl LanguageServer for Backend {
                 match result {
                     Ok(Ok(mut new_state)) => {
                         let doc_count = new_state.index.doc_count();
+                        tracing::info!(doc_count, vault_root = ?new_state.vault_root, "walk_vault: succeeded");
 
                         {
                             let mut current_state = state_arc.write().await;
@@ -152,6 +190,7 @@ impl LanguageServer for Backend {
                         }
                     }
                     Ok(Err(e)) => {
+                        tracing::error!(error = %e, "walk_vault: failed");
                         client
                             .log_message(
                                 MessageType::ERROR,
@@ -160,6 +199,7 @@ impl LanguageServer for Backend {
                             .await;
                     }
                     Err(e) => {
+                        tracing::error!(error = %e, "walk_vault: spawn_blocking panicked");
                         client
                             .log_message(
                                 MessageType::ERROR,
@@ -244,6 +284,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
+        tracing::debug!("shutdown requested");
         Ok(())
     }
 
@@ -251,7 +292,9 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let content = params.text_document.text;
         let version = params.text_document.version;
+        tracing::debug!(%uri, version, "did_open");
         let Some(path) = uri_to_path(&uri) else {
+            tracing::warn!(%uri, "did_open: uri_to_path failed, ignoring");
             return;
         };
 
@@ -288,6 +331,7 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
+        tracing::debug!(%uri, version, "did_change");
 
         let (delay, prev_task) = {
             let mut state = self.state.write().await;
@@ -359,6 +403,7 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
+        tracing::debug!(%uri, "did_save");
 
         let (peers_dirty, supports_pull, other_uris, prev_task) = {
             let mut state = self.state.write().await;
@@ -402,6 +447,7 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let lsp_uri = params.text_document.uri;
+        tracing::debug!(%uri, "did_close");
         {
             let mut state = self.state.write().await;
             state.close_document(&uri);
@@ -545,6 +591,7 @@ impl LanguageServer for Backend {
         &self,
         params: ExecuteCommandParams,
     ) -> jsonrpc::Result<Option<serde_json::Value>> {
+        tracing::debug!(command = %params.command, "execute_command");
         if params.command != crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND {
             return Err(jsonrpc::Error::method_not_found());
         }

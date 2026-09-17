@@ -9,6 +9,7 @@ pub fn document_symbol(
     state: &SatzState,
 ) -> Option<DocumentSymbolResponse> {
     let uri = params.text_document.uri.as_str();
+    tracing::debug!(uri, "document_symbol");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =

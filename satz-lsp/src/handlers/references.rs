@@ -69,6 +69,7 @@ fn doc_uri(doc: &Document, vault_root: Option<&Path>) -> Option<Uri> {
 pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec<Location>> {
     let uri = params.text_document_position.text_document.uri.as_str();
     let pos = params.text_document_position.position;
+    tracing::debug!(uri, ?pos, "find_references");
 
     let open_doc = state.open_docs.get(uri)?;
 

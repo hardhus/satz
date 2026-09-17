@@ -17,6 +17,7 @@ pub fn prepare_rename(
 ) -> Option<PrepareRenameResponse> {
     let uri = params.text_document.uri.as_str();
     let pos = params.position;
+    tracing::debug!(uri, ?pos, "prepare_rename");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =
@@ -59,6 +60,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Option<WorkspaceEdit> 
     let uri = params.text_document_position.text_document.uri.as_str();
     let pos = params.text_document_position.position;
     let new_name = params.new_name.trim();
+    tracing::debug!(uri, ?pos, new_name, "rename");
 
     let open_doc = state.open_docs.get(uri)?;
     let rel_path =
