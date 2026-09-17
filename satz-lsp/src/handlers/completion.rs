@@ -21,9 +21,15 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     let doc_id = satz_core::DocId::new(&rel_path_str);
     let doc = state.index.get_doc(&doc_id)?;
 
+    // Byte-offset/text-scan against the LIVE rope, not `doc.line_index`: `doc` is the
+    // debounced (200-500ms) reparse snapshot, but completion re-fires immediately on every
+    // `[`/`#`/`^` keystroke, faster than that debounce can settle. Scanning stale text here
+    // corrupts the line-prefix/closing-bracket checks below -- e.g. producing a duplicated
+    // `]]` when a second wikilink is typed quickly on the same line right after a first one.
+    let live_line_index = satz_core::LineIndex::new(&open_doc.rope.to_string());
     let satz_pos = lsp_pos_to_satz(pos);
-    let byte_offset = doc.line_index.position_to_byte(satz_pos);
-    let source = doc.line_index.source();
+    let byte_offset = live_line_index.position_to_byte(satz_pos);
+    let source = live_line_index.source();
 
     // Get prefix of the current line up to byte_offset
     let line_start_offset = source[..byte_offset]
@@ -335,6 +341,61 @@ mod tests {
             assert_eq!(target_note.insert_text.as_deref(), Some("doc-b]]"));
         } else {
             panic!("Expected CompletionResponse::Array");
+        }
+    }
+
+    #[test]
+    fn test_completion_uses_live_rope_not_stale_index() {
+        let rel_a = Path::new("doc-a.md");
+        // The indexed snapshot is stale: reparse hasn't caught up to the "]]" the editor
+        // already auto-paired in the live buffer, simulating typing faster than the
+        // reparse debounce window (200-500ms).
+        let stale_doc_a = parse_document("# Doc A\n\n[[Olgu", rel_a);
+        let doc_b = parse_document("# Olgu\nContent", Path::new("doc-b.md"));
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![stale_doc_a, doc_b]);
+        state.vault_root = Some(Path::new("").to_path_buf());
+
+        let uri_str = "file:///doc-a.md";
+        // Live buffer already has the closing brackets the editor auto-paired.
+        let live_content = "# Doc A\n\n[[Olgu]]";
+        state.open_docs.insert(
+            uri_str.to_string(),
+            crate::state::OpenDocument::new(uri_str, rel_a.to_path_buf(), live_content, 1),
+        );
+
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri_str.parse().unwrap(),
+                },
+                position: Position::new(2, 6), // right after "Olgu", before the live "]]"
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        let response = completion(params, &state).expect("Completion response expected");
+        let CompletionResponse::Array(items) = response else {
+            panic!("Expected CompletionResponse::Array");
+        };
+        assert!(!items.is_empty());
+
+        // The live buffer already has closing brackets right after the cursor; completion must
+        // not append a second "]]" on top of them. Before the fix, this scanned the stale
+        // indexed text (which had no trailing "]]" yet) instead of the live rope, and always
+        // appended "]]" -- producing a duplicated "]]]]" once the editor's own auto-pair merged
+        // in.
+        for item in &items {
+            if let Some(text) = &item.insert_text {
+                assert!(
+                    !text.ends_with("]]"),
+                    "insert_text must not append ]] when the live buffer already has \
+                     closing brackets after the cursor: {text:?}"
+                );
+            }
         }
     }
 
