@@ -33,6 +33,11 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
             return;
         }
 
+        if !state_guard.indexing_complete {
+            tracing::debug!(uri, "publish_for: initial indexing not complete yet, skipping");
+            return;
+        }
+
         let Some(open_doc) = state_guard.open_docs.get(uri) else {
             return;
         };
@@ -209,6 +214,11 @@ impl LanguageServer for Backend {
                     }
                 }
             });
+        } else {
+            // No workspace root at all: there is no vault to walk, so there is nothing for
+            // `indexing_complete` to wait on — diagnostics can run immediately.
+            let mut state = self.state.write().await;
+            state.indexing_complete = true;
         }
 
         Ok(InitializeResult {
@@ -700,20 +710,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let diagnostics = {
             let state = self.state.read().await;
-
-            if let Some(open_doc) = state.open_docs.get(&uri) {
-                let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-                let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-                let doc_id = satz_core::DocId::new(&rel_path_str);
-
-                if let Some(doc) = state.index.get_doc(&doc_id) {
-                    compute_diagnostics(doc, &state.index, &state.config)
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            }
+            crate::handlers::diagnostics::pull_document_diagnostics(&uri, &state)
         };
 
         Ok(DocumentDiagnosticReportResult::Report(
@@ -732,31 +729,7 @@ impl LanguageServer for Backend {
         _params: WorkspaceDiagnosticParams,
     ) -> jsonrpc::Result<WorkspaceDiagnosticReportResult> {
         let state = self.state.read().await;
-        let mut items = Vec::new();
-
-        for doc in state.index.documents() {
-            let doc_path = match &state.vault_root {
-                Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-                _ => doc.path.clone(),
-            };
-            if let Some(uri) = crate::convert::path_to_uri(&doc_path) {
-                let diagnostics = compute_diagnostics(doc, &state.index, &state.config);
-                let version = state
-                    .open_docs
-                    .get(uri.as_str())
-                    .map(|od| od.version as i64);
-                items.push(WorkspaceDocumentDiagnosticReport::Full(
-                    WorkspaceFullDocumentDiagnosticReport {
-                        uri,
-                        version,
-                        full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                            result_id: None,
-                            items: diagnostics,
-                        },
-                    },
-                ));
-            }
-        }
+        let items = crate::handlers::diagnostics::pull_workspace_diagnostics(&state);
 
         Ok(WorkspaceDiagnosticReportResult::Report(
             WorkspaceDiagnosticReport { items },

@@ -37,6 +37,7 @@ fn create_zettel_state() -> (SatzState, PathBuf) {
     let mut state = SatzState::default();
     state.vault_root = Some(vault_root.clone());
     state.index = index;
+    state.indexing_complete = true;
 
     // Register open docs
     let uri_ana = if cfg!(windows) {
@@ -347,14 +348,10 @@ async fn test_pull_diagnostics_matches_compute_diagnostics() {
     let expected_diags = compute_diagnostics(doc_ana, &state_guard.index, &state_guard.config);
     drop(state_guard);
 
-    // 2. Mock pull diagnostics call via state logic
+    // 2. Same document through the actual pull-mode entry point
     let state_guard = state_arc.read().await;
-    let open_doc = state_guard.open_docs.get(uri_ana).unwrap();
-    let rel_path = SatzState::get_rel_path(&open_doc.path, state_guard.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state_guard.index.get_doc(&doc_id).unwrap();
-    let pull_diags = compute_diagnostics(doc, &state_guard.index, &state_guard.config);
+    let pull_diags =
+        satz_lsp::handlers::diagnostics::pull_document_diagnostics(uri_ana, &state_guard);
 
     assert_eq!(expected_diags.len(), pull_diags.len());
     assert_eq!(expected_diags, pull_diags);

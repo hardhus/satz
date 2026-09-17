@@ -117,6 +117,14 @@ pub struct SatzState {
 
     /// `satz.formatWorkspace` result cache — see `FormatCache`.
     pub format_cache: FormatCache,
+
+    /// Whether the initial vault-wide `walk_vault` scan has finished. Starts `false` (the
+    /// `Default` state used until `initialize_index` completes); diagnostics computed before
+    /// this is `true` would only see whichever documents happened to already be open, so any
+    /// link to a not-yet-indexed peer looks spuriously broken. Handlers should return empty
+    /// diagnostics rather than that false positive — the `workspace/diagnostic/refresh` push
+    /// sent once indexing finishes will make the client re-pull the real results.
+    pub indexing_complete: bool,
 }
 
 pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<String> {
@@ -155,6 +163,7 @@ impl SatzState {
             client_supports_pull_diagnostics: false,
             peers_dirty: false,
             format_cache,
+            indexing_complete: true,
         })
     }
 

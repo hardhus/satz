@@ -103,30 +103,26 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
             let mut items = Vec::new();
 
             for d in state.index.documents() {
-                // Title completion
+                // Title completion. `insert_text` is always the document's own vault-relative
+                // path (extension stripped), never its title: a title is free-form prose the
+                // user should be able to reword at any time (this is a book, chapters get
+                // retitled) without silently breaking every wikilink that was inserted by
+                // completion — paths only change via `rename`, which already rewrites every
+                // link (of any style) pointing at the renamed document.
                 let title_label = if d.title != "Untitled" && !d.title.is_empty() {
                     d.title.clone()
                 } else {
                     d.id.as_str().to_string()
                 };
-
-                // Insert document by title or stem
-                let insert_base = if !d.title.is_empty() && d.title != "Untitled" {
-                    d.title.clone()
-                } else {
-                    d.path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(d.id.as_str())
-                        .to_string()
-                };
+                let path_str = d.path.to_string_lossy().replace('\\', "/");
+                let insert_base = path_str.strip_suffix(".md").unwrap_or(&path_str).to_string();
 
                 items.push(CompletionItem {
                     label: title_label.clone(),
                     kind: Some(CompletionItemKind::FILE),
                     detail: Some(d.id.as_str().to_string()),
                     insert_text: Some(format!("{}{}", insert_base, close_suffix)),
-                    filter_text: Some(title_label),
+                    filter_text: Some(title_label.clone()),
                     data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
                     ..Default::default()
                 });
@@ -139,6 +135,32 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                         detail: Some(format!("Alias for: {}", d.title)),
                         insert_text: Some(format!("{}{}", alias, close_suffix)),
                         filter_text: Some(alias.clone()),
+                        data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
+                        ..Default::default()
+                    });
+                }
+
+                // Heading completions, so e.g. typing "olgu" can directly surface a `## Olgu`
+                // heading buried in some other document as `path#Olgu`, without first having to
+                // complete to that document and then separately complete `#`. No manual
+                // `sort_text` bias here: a short, close-to-exact heading label like "Olgu"
+                // already ranks above an unrelated, much longer title in any reasonable
+                // client-side fuzzy matcher, so hand-tuning order here would just as likely
+                // fight the client's own scoring as help it.
+                for h in &d.headings {
+                    let heading_text = h.text.trim();
+                    if heading_text.is_empty() {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: heading_text.to_string(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some(format!("Heading in {}", title_label)),
+                        insert_text: Some(format!(
+                            "{}#{}{}",
+                            insert_base, heading_text, close_suffix
+                        )),
+                        filter_text: Some(heading_text.to_string()),
                         data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
                         ..Default::default()
                     });
@@ -283,9 +305,70 @@ mod tests {
         if let CompletionResponse::Array(items) = response {
             assert!(items.iter().any(|i| i.label == "Target Note"));
             assert!(items.iter().any(|i| i.label.contains("TargetAlias")));
+            // Document completions insert the path, not the title, so the link survives a
+            // future title edit; the title stays as the (searchable) label only.
+            let target_note = items
+                .iter()
+                .find(|i| i.label == "Target Note")
+                .expect("Target Note item");
+            assert_eq!(target_note.insert_text.as_deref(), Some("doc-b]]"));
         } else {
             panic!("Expected CompletionResponse::Array");
         }
+    }
+
+    #[test]
+    fn test_flat_wikilink_completion_includes_headings() {
+        let rel_a = Path::new("doc-a.md");
+        let rel_b = Path::new("tlp/sozluk.md");
+        let doc_a = parse_document("# Doc A\n\n[[", rel_a);
+        let doc_b = parse_document(
+            "---\ntitle: Tractatus Sözlüğü\n---\n# Tractatus Sözlüğü\n\n## Olgu\n\ntext",
+            rel_b,
+        );
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a.clone(), doc_b]);
+        state.vault_root = Some(Path::new("").to_path_buf());
+
+        let uri_str = "file:///doc-a.md";
+        state.open_docs.insert(
+            uri_str.to_string(),
+            crate::state::OpenDocument::new(uri_str, rel_a.to_path_buf(), "# Doc A\n\n[[", 1),
+        );
+
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri_str.parse().unwrap(),
+                },
+                position: Position::new(2, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        let response = completion(params, &state).expect("Completion response expected");
+        let CompletionResponse::Array(items) = response else {
+            panic!("Expected CompletionResponse::Array");
+        };
+
+        // Typing "olgu" should be able to jump straight to the `## Olgu` heading inside
+        // tlp/sozluk.md without first completing to the document and then to `#Olgu`.
+        let olgu_item = items
+            .iter()
+            .find(|i| i.label == "Olgu")
+            .expect("heading completion item for 'Olgu'");
+        assert_eq!(olgu_item.insert_text.as_deref(), Some("tlp/sozluk#Olgu]]"));
+
+        // The document-level completion for the same file is still path-based.
+        assert!(
+            items
+                .iter()
+                .any(|i| i.label == "Tractatus Sözlüğü" && i.insert_text.as_deref()
+                    == Some("tlp/sozluk]]"))
+        );
     }
 
     #[test]

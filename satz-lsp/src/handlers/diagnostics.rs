@@ -1,7 +1,72 @@
 use satz_core::{Document, Frontmatter, Index, LinkKind, VaultConfig};
 use tower_lsp_server::ls_types as lsp;
 
-use crate::convert::byte_range_to_lsp;
+use crate::convert::{byte_range_to_lsp, path_to_uri};
+use crate::state::SatzState;
+
+/// Computes the pull-mode `textDocument/diagnostic` report for a single open document.
+///
+/// Returns an empty result while the vault's initial `walk_vault` scan is still running
+/// (`!state.indexing_complete`): at that point the index may only contain whichever documents
+/// happened to already be open, so any link to a not-yet-indexed peer would be reported as
+/// spuriously broken. The `workspace/diagnostic/refresh` push sent once indexing finishes makes
+/// the client re-pull the real results.
+pub fn pull_document_diagnostics(uri: &str, state: &SatzState) -> Vec<lsp::Diagnostic> {
+    if !state.indexing_complete {
+        tracing::debug!(uri, "pull_document_diagnostics: initial indexing not complete yet");
+        return Vec::new();
+    }
+
+    let Some(open_doc) = state.open_docs.get(uri) else {
+        return Vec::new();
+    };
+    let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
+    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+    let doc_id = satz_core::DocId::new(&rel_path_str);
+
+    match state.index.get_doc(&doc_id) {
+        Some(doc) => compute_diagnostics(doc, &state.index, &state.config),
+        None => Vec::new(),
+    }
+}
+
+/// Computes the pull-mode `workspace/diagnostic` report across every indexed document.
+///
+/// Same `indexing_complete` gating as [`pull_document_diagnostics`], for the same reason: a
+/// workspace-wide scan taken mid-`walk_vault` would only cover a fraction of the vault.
+pub fn pull_workspace_diagnostics(state: &SatzState) -> Vec<lsp::WorkspaceDocumentDiagnosticReport> {
+    if !state.indexing_complete {
+        tracing::debug!("pull_workspace_diagnostics: initial indexing not complete yet");
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    for doc in state.index.documents() {
+        let doc_path = match &state.vault_root {
+            Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
+            _ => doc.path.clone(),
+        };
+        let Some(uri) = path_to_uri(&doc_path) else {
+            continue;
+        };
+        let diagnostics = compute_diagnostics(doc, &state.index, &state.config);
+        let version = state
+            .open_docs
+            .get(uri.as_str())
+            .map(|od| od.version as i64);
+        items.push(lsp::WorkspaceDocumentDiagnosticReport::Full(
+            lsp::WorkspaceFullDocumentDiagnosticReport {
+                uri,
+                version,
+                full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items: diagnostics,
+                },
+            },
+        ));
+    }
+    items
+}
 
 /// Computes all language server diagnostics for a single document.
 pub fn compute_diagnostics(
@@ -206,10 +271,12 @@ fn make_missing_field_diagnostic(field: &str) -> lsp::Diagnostic {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::state::OpenDocument;
     use satz_core::parse_document;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn test_valid_link_no_diagnostics() {
@@ -332,6 +399,48 @@ mod tests {
 
         let diagnostics = compute_diagnostics(&doc_a, &index, &config);
         assert_eq!(diagnostics.len(), 4);
+    }
+
+    fn abs_root() -> PathBuf {
+        if cfg!(windows) {
+            Path::new("C:\\vault").to_path_buf()
+        } else {
+            Path::new("/vault").to_path_buf()
+        }
+    }
+
+    #[test]
+    fn test_pull_document_diagnostics_empty_while_indexing_incomplete() {
+        let doc_a = parse_document("# Doc A\n\n[[missing-note]]", Path::new("doc-a.md"));
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(abs_root());
+        let uri = "file:///doc-a.md";
+        state.open_docs.insert(
+            uri.to_string(),
+            OpenDocument::new(uri, Path::new("doc-a.md").to_path_buf(), "", 1),
+        );
+
+        // Default `SatzState` starts with `indexing_complete: false` — the initial vault
+        // scan hasn't finished, so a real broken link must not be reported yet.
+        assert!(pull_document_diagnostics(uri, &state).is_empty());
+
+        state.indexing_complete = true;
+        // broken-link (missing-note) + orphan-note (nothing links back to doc-a)
+        assert_eq!(pull_document_diagnostics(uri, &state).len(), 2);
+    }
+
+    #[test]
+    fn test_pull_workspace_diagnostics_empty_while_indexing_incomplete() {
+        let doc_a = parse_document("# Orphan Doc", Path::new("doc-a.md"));
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(abs_root());
+
+        assert!(pull_workspace_diagnostics(&state).is_empty());
+
+        state.indexing_complete = true;
+        assert_eq!(pull_workspace_diagnostics(&state).len(), 1);
     }
 
     #[test]
