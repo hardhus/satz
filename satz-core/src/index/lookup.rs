@@ -332,7 +332,7 @@ impl Index {
     /// Replaces or inserts a document in the index, updating paths, title/aliases, tags, and backlinks.
     pub fn replace_doc(&mut self, new_doc: Document) {
         let id = new_doc.id.clone();
-        tracing::debug!(?id, path = ?new_doc.path, "Index::replace_doc");
+        tracing::trace!(?id, path = ?new_doc.path, "Index::replace_doc");
 
         // If old doc exists, clean up old references
         if let Some(old_doc) = self.docs.get(&id) {

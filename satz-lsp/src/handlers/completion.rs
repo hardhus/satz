@@ -48,13 +48,17 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
             } else if let Some(resolved) = state.index.resolve_link(target_doc_str) {
                 resolved
             } else {
+                tracing::debug!(
+                    target_doc_str,
+                    "completion: returning candidates count=0 (target doc did not resolve)"
+                );
                 return Some(CompletionResponse::Array(vec![]));
             };
 
             if let Some(target_doc) = state.index.get_doc(target_id) {
                 if let Some(_block_prefix) = heading_or_block.strip_prefix('^') {
                     // Block anchor completion: `[[doc#^...`
-                    let items = target_doc
+                    let items: Vec<CompletionItem> = target_doc
                         .blocks
                         .iter()
                         .map(|b| CompletionItem {
@@ -66,6 +70,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                             ..Default::default()
                         })
                         .collect();
+                    tracing::debug!(
+                        count = items.len(),
+                        "completion: returning candidates (block anchors)"
+                    );
                     return Some(CompletionResponse::Array(items));
                 } else {
                     // Heading completion: `[[doc#...`
@@ -95,6 +103,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                         }
                     }
 
+                    tracing::debug!(
+                        count = items.len(),
+                        "completion: returning candidates (headings/blocks for doc)"
+                    );
                     return Some(CompletionResponse::Array(items));
                 }
             }
@@ -167,6 +179,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 }
             }
 
+            tracing::debug!(
+                count = items.len(),
+                "completion: returning candidates (documents/headings/aliases)"
+            );
             return Some(CompletionResponse::Array(items));
         }
     }
@@ -175,7 +191,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     if let Some(open_fn_idx) = line_prefix.rfind("[^") {
         let inside_fn = &line_prefix[open_fn_idx + 2..];
         if !inside_fn.contains(']') {
-            let items = doc
+            let items: Vec<CompletionItem> = doc
                 .footnotes
                 .definitions
                 .iter()
@@ -187,6 +203,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     ..Default::default()
                 })
                 .collect();
+            tracing::debug!(
+                count = items.len(),
+                "completion: returning candidates (footnotes)"
+            );
             return Some(CompletionResponse::Array(items));
         }
     }
@@ -201,7 +221,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
         };
 
         if is_valid_tag_start {
-            let items = state
+            let items: Vec<CompletionItem> = state
                 .index
                 .all_tags()
                 .into_iter()
@@ -213,6 +233,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     ..Default::default()
                 })
                 .collect();
+            tracing::debug!(count = items.len(), "completion: returning candidates (tags)");
             return Some(CompletionResponse::Array(items));
         }
     }

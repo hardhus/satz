@@ -230,7 +230,7 @@ impl SatzState {
         let rel_path = Self::get_rel_path(&path, self.vault_root.as_deref());
         let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
         let doc_id = satz_core::DocId::new(&rel_path_str);
-        tracing::debug!(%uri, ?doc_id, "reparse_open_document");
+        tracing::trace!(%uri, ?doc_id, "reparse_open_document");
 
         let old_keys = self
             .index

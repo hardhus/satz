@@ -10,7 +10,11 @@ async fn main() -> anyhow::Result<()> {
     let (filter_layer, reload_handle) = reload::Layer::new(EnvFilter::new("off"));
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
         .init();
 
     let stdin = tokio::io::stdin();

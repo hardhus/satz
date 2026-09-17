@@ -341,7 +341,7 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
-        tracing::debug!(%uri, version, "did_change");
+        tracing::trace!(%uri, version, "did_change");
 
         let (delay, prev_task) = {
             let mut state = self.state.write().await;
