@@ -2,12 +2,21 @@
 
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
-    MarkupContent, MarkupKind,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
+    Documentation, MarkupContent, MarkupKind, Range, TextEdit,
 };
 
-use crate::convert::lsp_pos_to_satz;
+use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz};
 use crate::state::SatzState;
+
+/// Builds an explicit replace-range `text_edit` covering `[query_start, cursor)` instead of a
+/// bare `insert_text`. Without this, it's up to the client to guess how much of the
+/// already-typed query to replace -- ambiguous and, per one field report, inconsistent between
+/// a document's first and second wikilink completion in the same session (a stray extra `]]`,
+/// or a garbled single-bracket result). An explicit range removes that guesswork entirely.
+fn completion_text_edit(range: Range, new_text: String) -> CompletionTextEdit {
+    CompletionTextEdit::Edit(TextEdit { range, new_text })
+}
 
 pub fn completion(params: CompletionParams, state: &SatzState) -> Option<CompletionResponse> {
     let uri = params.text_document_position.text_document.uri.as_str();
@@ -46,9 +55,11 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     // 1. Check for wikilink completion: `[[...`
     if let Some(open_bracket_idx) = line_prefix.rfind("[[") {
         let inside_wikilink = &line_prefix[open_bracket_idx + 2..];
+        let inside_wikilink_start = line_start_offset + open_bracket_idx + 2;
 
         // Check if inside heading or block reference `[[doc#...` or `[[#...`
         if let Some((target_doc_str, heading_or_block)) = inside_wikilink.split_once('#') {
+            let heading_or_block_start = inside_wikilink_start + target_doc_str.len() + 1;
             let target_id = if target_doc_str.is_empty() {
                 &doc_id
             } else if let Some(resolved) = state.index.resolve_link(target_doc_str) {
@@ -64,16 +75,23 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
             if let Some(target_doc) = state.index.get_doc(target_id) {
                 if let Some(_block_prefix) = heading_or_block.strip_prefix('^') {
                     // Block anchor completion: `[[doc#^...`
+                    let range = byte_range_to_lsp(
+                        satz_core::ByteRange::new(heading_or_block_start + 1, byte_offset),
+                        &live_line_index,
+                    );
                     let items: Vec<CompletionItem> = target_doc
                         .blocks
                         .iter()
-                        .map(|b| CompletionItem {
-                            label: format!("^{}", b.id),
-                            kind: Some(CompletionItemKind::VARIABLE),
-                            detail: Some("Block Anchor".to_string()),
-                            insert_text: Some(format!("^{}{}", b.id, close_suffix)),
-                            filter_text: Some(format!("^{}", b.id)),
-                            ..Default::default()
+                        .map(|b| {
+                            let new_text = format!("^{}{}", b.id, close_suffix);
+                            CompletionItem {
+                                label: format!("^{}", b.id),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some("Block Anchor".to_string()),
+                                text_edit: Some(completion_text_edit(range, new_text)),
+                                filter_text: Some(format!("^{}", b.id)),
+                                ..Default::default()
+                            }
                         })
                         .collect();
                     tracing::debug!(
@@ -83,26 +101,34 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     return Some(CompletionResponse::Array(items));
                 } else {
                     // Heading completion: `[[doc#...`
+                    let range = byte_range_to_lsp(
+                        satz_core::ByteRange::new(heading_or_block_start, byte_offset),
+                        &live_line_index,
+                    );
                     let mut items: Vec<CompletionItem> = target_doc
                         .headings
                         .iter()
-                        .map(|h| CompletionItem {
-                            label: h.text.trim().to_string(),
-                            kind: Some(CompletionItemKind::FIELD),
-                            detail: Some(format!("Level {} Heading", h.level)),
-                            insert_text: Some(format!("{}{}", h.text.trim(), close_suffix)),
-                            ..Default::default()
+                        .map(|h| {
+                            let new_text = format!("{}{}", h.text.trim(), close_suffix);
+                            CompletionItem {
+                                label: h.text.trim().to_string(),
+                                kind: Some(CompletionItemKind::FIELD),
+                                detail: Some(format!("Level {} Heading", h.level)),
+                                text_edit: Some(completion_text_edit(range, new_text)),
+                                ..Default::default()
+                            }
                         })
                         .collect();
 
                     // If query is empty or starts with '^', also suggest blocks
                     if heading_or_block.is_empty() {
                         for b in &target_doc.blocks {
+                            let new_text = format!("^{}{}", b.id, close_suffix);
                             items.push(CompletionItem {
                                 label: format!("^{}", b.id),
                                 kind: Some(CompletionItemKind::VARIABLE),
                                 detail: Some("Block Anchor".to_string()),
-                                insert_text: Some(format!("^{}{}", b.id, close_suffix)),
+                                text_edit: Some(completion_text_edit(range, new_text)),
                                 filter_text: Some(format!("^{}", b.id)),
                                 ..Default::default()
                             });
@@ -119,6 +145,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
         } else {
             // Document / Note completion
             let mut items = Vec::new();
+            let range = byte_range_to_lsp(
+                satz_core::ByteRange::new(inside_wikilink_start, byte_offset),
+                &live_line_index,
+            );
 
             for d in state.index.documents() {
                 // Title completion. `insert_text` is always the document's own vault-relative
@@ -139,7 +169,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     label: title_label.clone(),
                     kind: Some(CompletionItemKind::FILE),
                     detail: Some(d.id.as_str().to_string()),
-                    insert_text: Some(format!("{}{}", insert_base, close_suffix)),
+                    text_edit: Some(completion_text_edit(
+                        range,
+                        format!("{}{}", insert_base, close_suffix),
+                    )),
                     filter_text: Some(title_label.clone()),
                     data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
                     ..Default::default()
@@ -151,7 +184,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                         label: format!("{} (alias)", alias),
                         kind: Some(CompletionItemKind::REFERENCE),
                         detail: Some(format!("Alias for: {}", d.title)),
-                        insert_text: Some(format!("{}{}", alias, close_suffix)),
+                        text_edit: Some(completion_text_edit(
+                            range,
+                            format!("{}{}", alias, close_suffix),
+                        )),
                         filter_text: Some(alias.clone()),
                         data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
                         ..Default::default()
@@ -174,9 +210,9 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                         label: heading_text.to_string(),
                         kind: Some(CompletionItemKind::FIELD),
                         detail: Some(format!("Heading in {}", title_label)),
-                        insert_text: Some(format!(
-                            "{}#{}{}",
-                            insert_base, heading_text, close_suffix
+                        text_edit: Some(completion_text_edit(
+                            range,
+                            format!("{}#{}{}", insert_base, heading_text, close_suffix),
                         )),
                         filter_text: Some(heading_text.to_string()),
                         data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
@@ -197,6 +233,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     if let Some(open_fn_idx) = line_prefix.rfind("[^") {
         let inside_fn = &line_prefix[open_fn_idx + 2..];
         if !inside_fn.contains(']') {
+            let range = byte_range_to_lsp(
+                satz_core::ByteRange::new(line_start_offset + open_fn_idx + 2, byte_offset),
+                &live_line_index,
+            );
             let items: Vec<CompletionItem> = doc
                 .footnotes
                 .definitions
@@ -205,7 +245,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     label: f.label.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
                     detail: Some("Footnote Definition".to_string()),
-                    insert_text: Some(f.label.clone()),
+                    text_edit: Some(completion_text_edit(range, f.label.clone())),
                     ..Default::default()
                 })
                 .collect();
@@ -227,6 +267,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
         };
 
         if is_valid_tag_start {
+            let range = byte_range_to_lsp(
+                satz_core::ByteRange::new(line_start_offset + hash_idx + 1, byte_offset),
+                &live_line_index,
+            );
             let items: Vec<CompletionItem> = state
                 .index
                 .all_tags()
@@ -235,7 +279,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     label: format!("#{}", tag_name),
                     kind: Some(CompletionItemKind::KEYWORD),
                     detail: Some("Tag".to_string()),
-                    insert_text: Some(tag_name.to_string()),
+                    text_edit: Some(completion_text_edit(range, tag_name.to_string())),
                     ..Default::default()
                 })
                 .collect();
@@ -296,6 +340,15 @@ mod tests {
         Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
 
+    /// Test helper: pulls the replacement text out of a completion item's `text_edit`
+    /// (completion no longer sets bare `insert_text` -- see `completion_text_edit`).
+    fn item_new_text(item: &CompletionItem) -> Option<&str> {
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => Some(edit.new_text.as_str()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn test_wikilink_completion() {
         let rel_a = Path::new("doc-a.md");
@@ -338,7 +391,7 @@ mod tests {
                 .iter()
                 .find(|i| i.label == "Target Note")
                 .expect("Target Note item");
-            assert_eq!(target_note.insert_text.as_deref(), Some("doc-b]]"));
+            assert_eq!(item_new_text(target_note), Some("doc-b]]"));
         } else {
             panic!("Expected CompletionResponse::Array");
         }
@@ -389,13 +442,25 @@ mod tests {
         // appended "]]" -- producing a duplicated "]]]]" once the editor's own auto-pair merged
         // in.
         for item in &items {
-            if let Some(text) = &item.insert_text {
+            if let Some(text) = item_new_text(item) {
                 assert!(
                     !text.ends_with("]]"),
-                    "insert_text must not append ]] when the live buffer already has \
+                    "new_text must not append ]] when the live buffer already has \
                      closing brackets after the cursor: {text:?}"
                 );
             }
+        }
+
+        // The replace range must cover exactly the already-typed query ("Olgu", from right
+        // after "[[" to the cursor) -- not the client's own guess. Accepting any item should
+        // replace "Olgu" in place, not insert alongside it.
+        let any_item = items.first().expect("at least one candidate");
+        match &any_item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range.start, Position::new(2, 2));
+                assert_eq!(edit.range.end, Position::new(2, 6));
+            }
+            _ => panic!("expected an explicit text_edit, not a bare insert_text"),
         }
     }
 
@@ -442,14 +507,14 @@ mod tests {
             .iter()
             .find(|i| i.label == "Olgu")
             .expect("heading completion item for 'Olgu'");
-        assert_eq!(olgu_item.insert_text.as_deref(), Some("tlp/sozluk#Olgu]]"));
+        assert_eq!(item_new_text(olgu_item), Some("tlp/sozluk#Olgu]]"));
 
         // The document-level completion for the same file is still path-based.
         assert!(
             items
                 .iter()
-                .any(|i| i.label == "Tractatus Sözlüğü" && i.insert_text.as_deref()
-                    == Some("tlp/sozluk]]"))
+                .any(|i| i.label == "Tractatus Sözlüğü"
+                    && item_new_text(i) == Some("tlp/sozluk]]"))
         );
     }
 
