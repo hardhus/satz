@@ -97,7 +97,14 @@ impl Index {
             return Some(id);
         }
 
-        if let Some(stem) = as_path.file_stem().and_then(|s| s.to_str()) {
+        // `.file_stem()` treats the LAST `.` as an extension separator, which is wrong here:
+        // a dotted-decimal target like "2.0121" has no real extension, but `file_stem()` would
+        // still chop it at the last dot and return "2" — silently matching an unrelated existing
+        // document (e.g. "tlp/2.md") whenever the actual target file doesn't exist yet. Use
+        // `.file_name()` (the whole last path component, untouched) instead, only stripping a
+        // real, explicit ".md" suffix if the link happened to include one.
+        if let Some(file_name) = as_path.file_name().and_then(|s| s.to_str()) {
+            let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
             let stem_lower = fold_key(stem);
             if let Some(id) = self.by_stem.get(&stem_lower) {
                 return Some(id);
@@ -684,6 +691,28 @@ mod tests {
         assert_eq!(
             index.resolve_link("books\\rust.md"),
             Some(&DocId::new("books/rust.md"))
+        );
+    }
+
+    #[test]
+    fn dotted_decimal_target_does_not_falsely_match_shorter_sibling_stem() {
+        // Regression test: "tlp/2.0121" doesn't exist, but "tlp/2.md" does. `file_stem()`
+        // treats the last '.' as an extension separator, so a naive stem fallback would chop
+        // "2.0121" down to "2" and wrongly resolve to "tlp/2.md" instead of reporting the link
+        // as broken.
+        let doc = parse_document("# 2\nİçerik", Path::new("tlp/2.md"));
+        let index = Index::build(vec![doc]);
+
+        assert_eq!(index.resolve_link("tlp/2.0121"), None);
+        // The exact target still resolves once it actually exists.
+        let doc2 = parse_document("# 2.0121\nİçerik", Path::new("tlp/2.0121.md"));
+        let index2 = Index::build(vec![
+            parse_document("# 2\nİçerik", Path::new("tlp/2.md")),
+            doc2,
+        ]);
+        assert_eq!(
+            index2.resolve_link("tlp/2.0121"),
+            Some(&DocId::new("tlp/2.0121.md"))
         );
     }
 }
