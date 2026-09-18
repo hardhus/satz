@@ -12,6 +12,7 @@ pub const TOKEN_TYPES: &[&str] = &[
     "heading",        // 3 - heading
     "embed",          // 4 - ![[embed]]
     "blockAnchor",    // 5 - ^block-anchor
+    "linkDisplay",    // 6 - the `|display` part of a [[target|display]] link, when split
 ];
 
 pub fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -27,6 +28,38 @@ pub fn semantic_tokens_legend() -> SemanticTokensLegend {
 struct RawToken {
     range: satz_core::ByteRange,
     token_type: u32,
+}
+
+/// Pushes one token for `link.range`, or two if `split` is true and the link has a `|display`
+/// part: the first (of `target_token_type`) covers `[[target#heading|` (pipe included), the
+/// second (type 6, `linkDisplay`) covers `display]]`. Splits on the FIRST `|` byte in the link's
+/// source text, matching `inline_scan::split_once('|')`'s own target/display split.
+fn push_link_tokens(
+    raw_tokens: &mut Vec<RawToken>,
+    source: &str,
+    link: &satz_core::Link,
+    target_token_type: u32,
+    split: bool,
+) {
+    if split
+        && link.display.is_some()
+        && let Some(pipe_offset) = source[link.range.start..link.range.end].find('|')
+    {
+        let split_point = link.range.start + pipe_offset + 1;
+        raw_tokens.push(RawToken {
+            range: satz_core::ByteRange::new(link.range.start, split_point),
+            token_type: target_token_type,
+        });
+        raw_tokens.push(RawToken {
+            range: satz_core::ByteRange::new(split_point, link.range.end),
+            token_type: 6,
+        });
+        return;
+    }
+    raw_tokens.push(RawToken {
+        range: link.range,
+        token_type: target_token_type,
+    });
 }
 
 /// Computes SemanticTokens for links, tags, headings, and block anchors across the full document.
@@ -61,7 +94,9 @@ pub fn semantic_tokens_full(
         });
     }
 
-    // 3. Links (type 0 for resolved, 1 for unresolved, 4 for embed)
+    // 3. Links (type 0 for resolved, 1 for unresolved, 4 for embed, 6 for a split `|display`)
+    let split_link_display = state.config.lsp.semantic_tokens.split_link_display;
+    let source = doc.line_index.source();
     for link in &doc.links {
         match link.kind {
             LinkKind::WikiLink | LinkKind::Markdown => {
@@ -79,18 +114,27 @@ pub fn semantic_tokens_full(
                     satz_core::LinkResolution::AnchorMissing { .. }
                     | satz_core::LinkResolution::DocMissing => 1,
                 };
-                raw_tokens.push(RawToken {
-                    range: link.range,
+                push_link_tokens(
+                    &mut raw_tokens,
+                    source,
+                    link,
                     token_type,
-                });
+                    link.kind == LinkKind::WikiLink && split_link_display,
+                );
             }
             LinkKind::Embed => {
+                push_link_tokens(&mut raw_tokens, source, link, 4, split_link_display);
+            }
+            // A `LinkKind::Footnote` only ever exists here for a `[^label]` reference that
+            // already has a matching definition -- pulldown-cmark leaves an undefined reference
+            // as plain text with no event at all, so there's no "unresolved" case reachable to
+            // distinguish; every one gets the plain `link` color instead of no color at all.
+            LinkKind::Footnote => {
                 raw_tokens.push(RawToken {
                     range: link.range,
-                    token_type: 4,
+                    token_type: 0,
                 });
             }
-            LinkKind::Footnote => {}
         }
     }
 
@@ -174,13 +218,14 @@ mod tests {
     #[test]
     fn test_semantic_tokens_legend() {
         let legend = semantic_tokens_legend();
-        assert_eq!(legend.token_types.len(), 6);
+        assert_eq!(legend.token_types.len(), 7);
         assert_eq!(legend.token_types[0].as_str(), "link");
         assert_eq!(legend.token_types[1].as_str(), "unresolvedLink");
         assert_eq!(legend.token_types[2].as_str(), "tag");
         assert_eq!(legend.token_types[3].as_str(), "heading");
         assert_eq!(legend.token_types[4].as_str(), "embed");
         assert_eq!(legend.token_types[5].as_str(), "blockAnchor");
+        assert_eq!(legend.token_types[6].as_str(), "linkDisplay");
     }
 
     #[test]
@@ -273,5 +318,86 @@ mod tests {
         } else {
             panic!("Expected Tokens");
         }
+    }
+
+    /// Builds a single-document `SatzState` (plus an empty `doc-b.md` peer so links to it
+    /// resolve) and runs `semantic_tokens_full` against it, returning the raw token data.
+    fn run_tokens(text: &str, config: satz_core::VaultConfig) -> Vec<SemanticToken> {
+        let rel_path = Path::new("doc-a.md");
+        let doc_a = parse_document(text, rel_path);
+        let doc_b = parse_document("# Doc B", Path::new("doc-b.md"));
+
+        let mut state = SatzState {
+            index: Index::build(vec![doc_a, doc_b]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            config,
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            "file:///doc-a.md".to_string(),
+            crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),
+        );
+
+        let params = SemanticTokensParams {
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            text_document: TextDocumentIdentifier {
+                uri: "file:///doc-a.md".parse().unwrap(),
+            },
+        };
+
+        match semantic_tokens_full(params, &state).expect("Tokens result expected") {
+            SemanticTokensResult::Tokens(tokens) => tokens.data,
+            _ => panic!("Expected Tokens"),
+        }
+    }
+
+    #[test]
+    fn test_wikilink_display_split_default_on() {
+        let data = run_tokens("[[doc-b|Alias]]", satz_core::VaultConfig::default());
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].token_type, 0); // "[[doc-b|" — resolved target
+        assert_eq!(data[0].length, 8);
+        assert_eq!(data[1].token_type, 6); // "Alias]]" — linkDisplay
+        assert_eq!(data[1].length, 7);
+    }
+
+    #[test]
+    fn test_wikilink_display_split_disabled_via_config() {
+        let mut config = satz_core::VaultConfig::default();
+        config.lsp.semantic_tokens.split_link_display = false;
+        let data = run_tokens("[[doc-b|Alias]]", config);
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].token_type, 0);
+        assert_eq!(data[0].length, 15);
+    }
+
+    #[test]
+    fn test_wikilink_without_alias_never_split() {
+        let data = run_tokens("[[doc-b]]", satz_core::VaultConfig::default());
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].token_type, 0);
+        assert_eq!(data[0].length, 9);
+    }
+
+    #[test]
+    fn test_embed_display_split() {
+        let data = run_tokens("![[doc-b|Alias]]", satz_core::VaultConfig::default());
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].token_type, 4); // "![[doc-b|" — embed
+        assert_eq!(data[0].length, 9);
+        assert_eq!(data[1].token_type, 6); // "Alias]]" — linkDisplay
+        assert_eq!(data[1].length, 7);
+    }
+
+    #[test]
+    fn test_footnote_reference_gets_link_color() {
+        // A `[^b]` with no matching `[^b]: ...` definition isn't parsed as a footnote at all by
+        // pulldown-cmark (it's left as literal text, no event fired) -- only a reference that
+        // already resolves ever shows up as a `LinkKind::Footnote` link to color here.
+        let text = "Ref one [^a] and ref two [^b].\n\n[^a]: Definition A.\n";
+        let data = run_tokens(text, satz_core::VaultConfig::default());
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].token_type, 0);
     }
 }

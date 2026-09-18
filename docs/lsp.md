@@ -23,7 +23,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 | Folding ranges | Frontmatter block, and each heading's section (nested by level). |
 | Code lens | "N backlinks" above the document. **Off by default** (`lsp.codelens.enable`). |
 | Inlay hints | Inline note metadata after links. **On by default** (`lsp.inlay_hints.enable`). |
-| Semantic tokens | Full-document only (no range requests). Legend: `link`, `unresolvedLink`, `tag`, `heading`, `embed`, `blockAnchor`. |
+| Semantic tokens | Full-document only (no range requests). Legend: `link`, `unresolvedLink`, `tag`, `heading`, `embed`, `blockAnchor`, `linkDisplay`. Footnote references (`[^label]`) get the `link` color — pulldown-cmark only recognizes a reference as a footnote at all when it already has a matching definition, so there's no "unresolved" case to distinguish here. A `[[target\|display]]`/`![[target\|display]]` link's `\|display` part gets its own `linkDisplay` token by default — see `lsp.semantic_tokens.split_link_display` in [`docs/configuration.md`](configuration.md#lsp--server-wide-lsp-tuning). |
 | Document formatting | Deterministic, structure-aware Markdown formatting (tables, lists, emphasis, thematic breaks, code fences, blockquotes) — see [`docs/configuration.md`](configuration.md#formatter--deterministic-markdown-formatting). |
 | Execute command | `satz.formatWorkspace` — formats every document in the vault in one `workspace/applyEdit`. See [Format the whole workspace](#format-the-whole-workspace). |
 
@@ -39,6 +39,8 @@ Diagnostic codes you'll see in `diagnostic.code`:
 | `duplicate-heading` | Warning | Two headings in the same document slugify to the same value, making `#Heading` links to either of them ambiguous. |
 | `missing-frontmatter-field` | Warning | A field listed in `frontmatter.required_fields` is missing (see [`docs/configuration.md`](configuration.md#frontmatter--used-by-the-lsps-diagnostics)). |
 | `orphan-note` | Hint | Nothing links to this document, and it has at least one link or heading of its own (so brand-new empty notes don't get flagged). Suppressed for notes tagged with any of `diagnostics.moc_tags`. |
+
+> A `[^label]` reference with no matching `[^label]: ...` definition does **not** get a diagnostic — pulldown-cmark leaves an undefined reference as plain text (no footnote event fires at all), so detecting it would need a separate manual text scan independent of the structural parser; not implemented.
 
 ## Code actions
 

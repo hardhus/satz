@@ -168,6 +168,12 @@ pub fn compute_diagnostics(
                     });
                 }
             }
+            // Pulldown-cmark only ever emits a `LinkKind::Footnote` for a `[^label]` reference
+            // that already has a matching `[^label]: ...` definition elsewhere in the document
+            // (an undefined reference is left as plain text, no event at all) -- so there is no
+            // "broken footnote" case reachable here to diagnose from `doc.links`. Catching that
+            // would need a separate manual text scan independent of the structural parser,
+            // similar to `inline_scan.rs`'s wikilink/tag scanning; not attempted here.
             LinkKind::Footnote => {}
         }
     }
@@ -441,6 +447,20 @@ mod tests {
 
         state.indexing_complete = true;
         assert_eq!(pull_workspace_diagnostics(&state).len(), 1);
+    }
+
+    #[test]
+    fn test_resolved_footnote_no_diagnostic() {
+        let doc_a = parse_document(
+            "Ref [^present].\n\n[^present]: Defined.\n",
+            Path::new("doc-a.md"),
+        );
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
+        let config = VaultConfig::default();
+
+        let diagnostics = compute_diagnostics(&doc_a, &index, &config);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

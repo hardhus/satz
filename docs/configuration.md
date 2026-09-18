@@ -111,6 +111,12 @@ This is exactly the built-in default configuration, spelled out. You only need t
 | `inlay_hints.enable` | bool | `true` | Turns on inline hints after links showing the target note's tags (or title, or a "⚠ not found" marker for broken links). |
 | `format_cache_capacity` | integer | `2000` | Maximum number of (content hash → formatted text) entries the `satz.formatWorkspace` command caches, so a repeat call against an unchanged vault does no reformatting work. Not an LRU: once at capacity, new distinct hashes just aren't cached — existing entries keep serving hits. See [`docs/lsp.md`](lsp.md#format-the-whole-workspace). |
 
+#### `[lsp.semantic_tokens]`
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `split_link_display` | bool | `true` | For a `[[target\|display]]`/`![[target\|display]]` link, emits the `\|display` part as its own `linkDisplay` semantic token instead of lumping it into the same token as the target — lets your theme color the alias text differently from the target/heading. Links with no `\|display` are unaffected either way. |
+
 ### `[hover]`
 
 | Key | Type | Default | Effect |

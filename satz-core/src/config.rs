@@ -191,6 +191,7 @@ impl Default for MiscConfig {
 pub struct LspConfig {
     pub codelens: CodelensConfig,
     pub inlay_hints: InlayHintConfig,
+    pub semantic_tokens: SemanticTokensConfig,
     pub reparse_debounce_ms: u64,
     pub reparse_max_wait_ms: u64,
     /// Maximum number of (content hash -> formatted text) entries kept in the
@@ -205,9 +206,27 @@ impl Default for LspConfig {
         Self {
             codelens: CodelensConfig::default(),
             inlay_hints: InlayHintConfig::default(),
+            semantic_tokens: SemanticTokensConfig::default(),
             reparse_debounce_ms: 200,
             reparse_max_wait_ms: 500,
             format_cache_capacity: 2000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SemanticTokensConfig {
+    /// Splits a `[[target|display]]` / `![[target|display]]` link's semantic token in two at the
+    /// `|`, so the displayed alias text can be themed differently from the target/heading part.
+    /// Links with no alias are unaffected either way. Default: true.
+    pub split_link_display: bool,
+}
+
+impl Default for SemanticTokensConfig {
+    fn default() -> Self {
+        Self {
+            split_link_display: true,
         }
     }
 }
@@ -312,6 +331,7 @@ mod tests {
         assert_eq!(cfg.daily_note.format, "%Y-%m-%d");
         assert!(!cfg.lsp.codelens.enable);
         assert!(cfg.lsp.inlay_hints.enable);
+        assert!(cfg.lsp.semantic_tokens.split_link_display);
         assert_eq!(cfg.lsp.reparse_debounce_ms, 200);
         assert_eq!(cfg.lsp.reparse_max_wait_ms, 500);
         assert_eq!(cfg.lsp.format_cache_capacity, 2000);
@@ -361,6 +381,9 @@ enable = true
 [lsp.inlay_hints]
 enable = false
 
+[lsp.semantic_tokens]
+split_link_display = false
+
 [hover]
 preview_lines = 12
 
@@ -403,6 +426,7 @@ link_width_mode = "display"
         assert_eq!(cfg.frontmatter.required_fields, vec!["title", "date"]);
         assert!(cfg.lsp.codelens.enable);
         assert!(!cfg.lsp.inlay_hints.enable);
+        assert!(!cfg.lsp.semantic_tokens.split_link_display);
         assert_eq!(cfg.lsp.reparse_debounce_ms, 300);
         assert_eq!(cfg.lsp.reparse_max_wait_ms, 900);
         assert_eq!(cfg.lsp.format_cache_capacity, 500);
