@@ -1,5 +1,6 @@
 ---
 source: satz-core/tests/parse_test.rs
+assertion_line: 45
 expression: doc
 ---
 id: daily/2024-01-15.md
@@ -79,6 +80,7 @@ footnotes:
       range:
         start: 271
         end: 302
+broken_footnote_refs: []
 blocks: []
 line_index:
   line_starts:

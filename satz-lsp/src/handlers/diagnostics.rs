@@ -168,14 +168,29 @@ pub fn compute_diagnostics(
                     });
                 }
             }
-            // Pulldown-cmark only ever emits a `LinkKind::Footnote` for a `[^label]` reference
-            // that already has a matching `[^label]: ...` definition elsewhere in the document
-            // (an undefined reference is left as plain text, no event at all) -- so there is no
-            // "broken footnote" case reachable here to diagnose from `doc.links`. Catching that
-            // would need a separate manual text scan independent of the structural parser,
-            // similar to `inline_scan.rs`'s wikilink/tag scanning; not attempted here.
+            // Pulldown-cmark only ever emits a `LinkKind::Footnote` here for a `[^label]`
+            // reference that already has a matching definition -- an undefined one is left as
+            // plain text with no event at all, so it can't be caught in this loop. See the
+            // `doc.broken_footnote_refs` loop below instead (populated by a manual text scan).
             LinkKind::Footnote => {}
         }
+    }
+
+    // 1b. Broken footnote references, found by a manual text scan independent of the
+    // structural parser (see `doc.broken_footnote_refs`'s doc comment for why).
+    for link in &doc.broken_footnote_refs {
+        let range = byte_range_to_lsp(link.range, &doc.line_index);
+        diagnostics.push(lsp::Diagnostic {
+            range,
+            severity: Some(lsp::DiagnosticSeverity::WARNING),
+            code: Some(lsp::NumberOrString::String("broken-footnote".to_string())),
+            source: Some("satz".to_string()),
+            message: format!(
+                "Broken footnote reference: '[^{}]' has no matching definition",
+                link.display.as_deref().unwrap_or("")
+            ),
+            ..Default::default()
+        });
     }
 
     // 2. Missing required frontmatter fields
@@ -461,6 +476,24 @@ mod tests {
 
         let diagnostics = compute_diagnostics(&doc_a, &index, &config);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_broken_footnote_diagnostic() {
+        let doc_a = parse_document(
+            "Ref [^missing].\n\n[^present]: Defined.\n",
+            Path::new("doc-a.md"),
+        );
+        let doc_b = parse_document("# Doc B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
+        let config = VaultConfig::default();
+
+        let diagnostics = compute_diagnostics(&doc_a, &index, &config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            Some(lsp::NumberOrString::String("broken-footnote".to_string()))
+        );
     }
 
     #[test]

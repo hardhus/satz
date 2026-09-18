@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::model::document::{DocId, Document};
 use crate::model::footnote::FootnoteTable;
+use crate::model::link::Link;
 use crate::model::range::ByteRange;
 use crate::model::tag::Tag;
 use crate::text::LineIndex;
@@ -101,6 +102,19 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
     links.extend(structure.footnote_refs);
     links.sort_by_key(|link| link.range.start);
 
+    // A footnote candidate is "broken" iff its label has no matching definition -- this also
+    // correctly excludes every already-resolved reference (already counted above via
+    // `structure.footnote_refs`) and each definition's own `[^label]:` marker occurrence, since
+    // both trivially have a matching definition by construction.
+    let broken_footnote_refs: Vec<Link> = inline
+        .footnote_candidates
+        .into_iter()
+        .filter(|candidate| {
+            let label = candidate.display.as_deref().unwrap_or("");
+            !structure.footnote_defs.iter().any(|d| d.label == label)
+        })
+        .collect();
+
     let title = Document::resolve_title(&frontmatter, &structure.headings, path);
     let id = DocId(path.to_string_lossy().replace('\\', "/"));
 
@@ -116,6 +130,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         footnotes: FootnoteTable {
             definitions: structure.footnote_defs,
         },
+        broken_footnote_refs,
         blocks: inline.blocks,
         line_index,
         content_hash,
@@ -177,6 +192,30 @@ Here is a tag: #syntax and a footnote[^1].
         // Footnotes
         assert_eq!(doc.footnotes.definitions.len(), 1);
         assert_eq!(doc.footnotes.definitions[0].label, "1");
+        assert!(doc.broken_footnote_refs.is_empty());
+    }
+
+    #[test]
+    fn test_broken_footnote_ref_detected() {
+        let md = "Ref one [^ok] and ref two [^missing].\n\n[^ok]: Defined.\n";
+        let doc = parse_document(md, Path::new("notes/test.md"));
+
+        assert_eq!(doc.broken_footnote_refs.len(), 1);
+        assert_eq!(
+            doc.broken_footnote_refs[0].display.as_deref(),
+            Some("missing")
+        );
+        // The resolved one stays in `links` as usual, not duplicated into `broken_footnote_refs`.
+        assert!(doc.links.iter().any(|l| l.kind == LinkKind::Footnote));
+    }
+
+    #[test]
+    fn test_broken_footnote_ref_ignored_inside_code_span() {
+        let md = "See `[^fake]` for syntax, but [^real] is undefined too.";
+        let doc = parse_document(md, Path::new("notes/test.md"));
+
+        assert_eq!(doc.broken_footnote_refs.len(), 1);
+        assert_eq!(doc.broken_footnote_refs[0].display.as_deref(), Some("real"));
     }
 
     #[test]

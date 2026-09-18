@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tower_lsp_server::jsonrpc;
-use tower_lsp_server::ls_types::request::WorkspaceDiagnosticRefresh;
+use tower_lsp_server::ls_types::request::{SemanticTokensRefresh, WorkspaceDiagnosticRefresh};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 use tracing_subscriber::EnvFilter;
@@ -193,6 +193,14 @@ impl LanguageServer for Backend {
                                 publish_for(&client, &state_arc, &uri).await;
                             }
                         }
+
+                        // Any document opened before indexing finished had its links colored
+                        // against a still-partial index (peers not yet indexed resolve as
+                        // missing), so its semantic tokens may be stale/wrong now that the full
+                        // index is in place. Unconditional (unlike the diagnostics push above,
+                        // which branches on pull-vs-push support) -- this is a separate
+                        // capability a client simply ignores if it never declared support.
+                        let _ = client.send_request::<SemanticTokensRefresh>(()).await;
                     }
                     Ok(Err(e)) => {
                         tracing::error!(error = %e, "walk_vault: failed");

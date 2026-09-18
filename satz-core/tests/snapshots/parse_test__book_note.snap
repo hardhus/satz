@@ -1,5 +1,6 @@
 ---
 source: satz-core/tests/parse_test.rs
+assertion_line: 90
 expression: doc
 ---
 id: books/tractatus.md
@@ -106,6 +107,7 @@ tags:
       end: 390
 footnotes:
   definitions: []
+broken_footnote_refs: []
 blocks: []
 line_index:
   line_starts:

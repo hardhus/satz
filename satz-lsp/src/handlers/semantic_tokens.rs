@@ -125,10 +125,9 @@ pub fn semantic_tokens_full(
             LinkKind::Embed => {
                 push_link_tokens(&mut raw_tokens, source, link, 4, split_link_display);
             }
-            // A `LinkKind::Footnote` only ever exists here for a `[^label]` reference that
-            // already has a matching definition -- pulldown-cmark leaves an undefined reference
-            // as plain text with no event at all, so there's no "unresolved" case reachable to
-            // distinguish; every one gets the plain `link` color instead of no color at all.
+            // A `LinkKind::Footnote` in `doc.links` only ever exists for a `[^label]` reference
+            // that already has a matching definition (pulldown-cmark leaves an undefined
+            // reference as plain text with no event at all) -- so this is always "resolved".
             LinkKind::Footnote => {
                 raw_tokens.push(RawToken {
                     range: link.range,
@@ -136,6 +135,15 @@ pub fn semantic_tokens_full(
                 });
             }
         }
+    }
+
+    // 3b. Broken footnote references (type 1) -- found by a manual text scan independent of
+    // pulldown-cmark, since an undefined `[^label]` never becomes a `LinkKind::Footnote` link.
+    for link in &doc.broken_footnote_refs {
+        raw_tokens.push(RawToken {
+            range: link.range,
+            token_type: 1,
+        });
     }
 
     // 4. Block anchors (type 5)
@@ -391,13 +399,14 @@ mod tests {
     }
 
     #[test]
-    fn test_footnote_reference_gets_link_color() {
-        // A `[^b]` with no matching `[^b]: ...` definition isn't parsed as a footnote at all by
-        // pulldown-cmark (it's left as literal text, no event fired) -- only a reference that
-        // already resolves ever shows up as a `LinkKind::Footnote` link to color here.
+    fn test_footnote_resolved_and_unresolved() {
+        // `[^a]` has a matching definition and is a real `LinkKind::Footnote` (pulldown-cmark
+        // recognized it) -- `[^b]` doesn't, so it's only caught by the manual scan feeding
+        // `doc.broken_footnote_refs`. Both should get colored, but differently.
         let text = "Ref one [^a] and ref two [^b].\n\n[^a]: Definition A.\n";
         let data = run_tokens(text, satz_core::VaultConfig::default());
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].token_type, 0);
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].token_type, 0); // [^a] resolved
+        assert_eq!(data[1].token_type, 1); // [^b] broken
     }
 }

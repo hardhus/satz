@@ -8,6 +8,12 @@ pub struct InlineScanOutput {
     pub wiki_links: Vec<Link>,
     pub tags: Vec<Tag>,
     pub blocks: Vec<BlockAnchor>,
+    /// Every `[^label]`-shaped occurrence found in the raw text, regardless of whether `label`
+    /// has a matching definition -- unlike `structure::parse_structure()`'s `footnote_refs`
+    /// (which pulldown-cmark only ever populates for a label that's already defined), this scan
+    /// doesn't know or care about resolution. The caller (`parse_document`) cross-references
+    /// against `structure.footnote_defs` to find the genuinely undefined ones.
+    pub footnote_candidates: Vec<Link>,
 }
 
 /// Scans for wikilinks (`[[...]]`), embeds (`![[...]]`), and tags (`#tag`)
@@ -46,6 +52,16 @@ pub fn scan_inline(source: &str, code_spans: &[ByteRange]) -> InlineScanOutput {
                 let overlaps = si < code_spans.len() && code_spans[si].overlaps(&link.range);
                 if !overlaps {
                     output.wiki_links.push(link);
+                }
+                i = next_i;
+                continue;
+            }
+        } else if bytes[i] == b'[' && i + 1 < len && bytes[i + 1] == b'^' {
+            let start = i;
+            if let Some((link, next_i)) = parse_footnote_candidate(source, start) {
+                let overlaps = si < code_spans.len() && code_spans[si].overlaps(&link.range);
+                if !overlaps {
+                    output.footnote_candidates.push(link);
                 }
                 i = next_i;
                 continue;
@@ -170,6 +186,33 @@ fn parse_wikilink(source: &str, start: usize, is_embed: bool) -> Option<(Link, u
             target_heading,
             target_block,
             display,
+            range,
+        ),
+        full_end,
+    ))
+}
+
+/// Attempts to parse a `[^label]`-shaped footnote reference candidate starting at `start`, where
+/// `source[start..start+2] == "[^"`. Doesn't check whether `label` has a matching definition --
+/// that's left to the caller. Fails (no match) if no `]` is found before a newline or EOF.
+fn parse_footnote_candidate(source: &str, start: usize) -> Option<(Link, usize)> {
+    let label_start = start + 2;
+    let rest = &source[label_start..];
+    let end_bracket = rest.find(']')?;
+    let label = &rest[..end_bracket];
+    if label.is_empty() || label.contains('\n') || label.contains('\r') {
+        return None;
+    }
+
+    let full_end = label_start + end_bracket + 1;
+    let range = ByteRange::new(start, full_end);
+    Some((
+        Link::new(
+            LinkKind::Footnote,
+            String::new(),
+            None,
+            None,
+            Some(label.to_string()),
             range,
         ),
         full_end,
@@ -325,5 +368,26 @@ mod tests {
 
         assert_eq!(output.blocks.len(), 1);
         assert_eq!(output.blocks[0].id, "real-block");
+    }
+
+    #[test]
+    fn test_footnote_candidate_scan() {
+        // scan_inline doesn't check resolution -- both a defined-elsewhere and an undefined
+        // label show up identically as candidates; the caller decides which are broken.
+        let text = "Ref one [^a] and ref two [^b].";
+        let output = scan_inline(text, &[]);
+        assert_eq!(output.footnote_candidates.len(), 2);
+        assert_eq!(output.footnote_candidates[0].kind, LinkKind::Footnote);
+        assert_eq!(output.footnote_candidates[0].display.as_deref(), Some("a"));
+        assert_eq!(output.footnote_candidates[1].display.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn test_footnote_candidate_ignores_code_spans() {
+        let text = "Real [^a] but `inline [^fake]` code.";
+        let code_spans = vec![ByteRange::new(14, 30)]; // `inline [^fake]`
+        let output = scan_inline(text, &code_spans);
+        assert_eq!(output.footnote_candidates.len(), 1);
+        assert_eq!(output.footnote_candidates[0].display.as_deref(), Some("a"));
     }
 }

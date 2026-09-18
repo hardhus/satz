@@ -1,5 +1,6 @@
 ---
 source: satz-core/tests/parse_test.rs
+assertion_line: 168
 expression: doc
 ---
 id: tests/edge_case.md
@@ -154,6 +155,7 @@ footnotes:
       range:
         start: 824
         end: 861
+broken_footnote_refs: []
 blocks: []
 line_index:
   line_starts:

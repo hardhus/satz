@@ -41,6 +41,13 @@ pub struct Document {
     pub links: Vec<Link>,
     pub tags: Vec<Tag>,
     pub footnotes: FootnoteTable,
+    /// `[^label]`-shaped references found in the raw text whose `label` has no matching
+    /// definition in `footnotes.definitions`. Kept separate from `links` (rather than mixed in
+    /// as `LinkKind::Footnote` entries) because every `LinkKind::Footnote` in `links` is, by
+    /// construction, already resolved -- pulldown-cmark never emits a footnote-reference event
+    /// for an undefined label in the first place, so mixing an unresolved one in would break
+    /// that implicit invariant for existing consumers (hover, go-to-definition, completion).
+    pub broken_footnote_refs: Vec<Link>,
     pub blocks: Vec<BlockAnchor>,
     pub line_index: LineIndex,
     pub content_hash: u64,
