@@ -4,6 +4,7 @@ pub mod line_pass;
 pub mod list;
 pub mod misc;
 pub mod table;
+pub mod wrap;
 pub mod zones;
 
 use crate::config::FormatterConfig;
@@ -11,18 +12,26 @@ use crate::model::ByteRange;
 
 /// Formats a markdown document deterministically according to the provided `FormatterConfig`.
 ///
-/// Runs one structure-aware pass before the line-based pass: a single `parse_structure` call
-/// gathers every construct's byte ranges (tables, emphasis/strong, list markers, rule lines,
-/// blockquote markers, code fences), each sub-module turns its ranges into replacement text, and
-/// all replacements are spliced into the source in one shot via `zones::splice_ranges`. Only
-/// `line_pass` (trim/blank-line/heading-spacing/final-newline) then runs on the result.
+/// Three stages, in order:
+/// 1. A single `parse_structure` call gathers every construct's byte ranges (tables,
+///    emphasis/strong, list markers, rule lines, blockquote markers, code fences), each
+///    sub-module turns its ranges into replacement text, and all replacements are spliced into
+///    the source in one shot via `zones::splice_ranges`.
+/// 2. `wrap::wrap` (opt-in, off by default — see `WrapConfig`) reflows top-level paragraphs to
+///    `line_width`. This is a genuinely separate pass, re-parsing the already-spliced text from
+///    scratch, rather than another entry in stage 1's replacement list: a paragraph's
+///    whole-span replacement would overlap any emphasis/wikilink replacement already computed
+///    for text inside it, and `splice_ranges` silently drops overlapping ranges rather than
+///    merging them. Running after stage 1 also means wrapping sees the already-normalized
+///    `**bold**`/list-marker/etc. text, not the pre-formatting source.
+/// 3. `line_pass` (trim/blank-line/heading-spacing/final-newline) runs on the result.
 ///
-/// These ranges never overlap by construction: every construct here replaces only marker/fence
-/// bytes or (for tables) a region whose inner content is deliberately reproduced verbatim rather
-/// than re-examined — see `table::parse_table_block`. One consequence of that verbatim-cell
-/// policy: emphasis/list/etc. markers *inside* a table cell are not separately normalized by
-/// this pass (they're copied as-is by the table renderer); this is an accepted, narrow scope
-/// limitation, not a correctness bug.
+/// Stage 1's ranges never overlap each other by construction: every construct there replaces
+/// only marker/fence bytes or (for tables) a region whose inner content is deliberately
+/// reproduced verbatim rather than re-examined — see `table::parse_table_block`. One consequence
+/// of that verbatim-cell policy: emphasis/list/etc. markers *inside* a table cell are not
+/// separately normalized by this pass (they're copied as-is by the table renderer); this is an
+/// accepted, narrow scope limitation, not a correctness bug.
 pub fn format_document(source: &str, config: &FormatterConfig) -> String {
     let structure = crate::parser::structure::parse_structure(source);
     let mut replacements: Vec<(ByteRange, String)> = Vec::new();
@@ -66,8 +75,9 @@ pub fn format_document(source: &str, config: &FormatterConfig) -> String {
 
     replacements.sort_by_key(|(r, _)| r.start);
     let spliced = zones::splice_ranges(source, &replacements);
+    let wrapped = wrap::wrap(&spliced, config);
 
-    line_pass::run(&spliced, config)
+    line_pass::run(&wrapped, config)
 }
 
 #[cfg(test)]

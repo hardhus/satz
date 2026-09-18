@@ -51,6 +51,7 @@ pub struct FormatterConfig {
     pub lists: ListsConfig,
     pub emphasis: EmphasisConfig,
     pub misc: MiscConfig,
+    pub wrap: WrapConfig,
 }
 
 impl Default for FormatterConfig {
@@ -65,6 +66,33 @@ impl Default for FormatterConfig {
             lists: ListsConfig::default(),
             emphasis: EmphasisConfig::default(),
             misc: MiscConfig::default(),
+            wrap: WrapConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WrapConfig {
+    /// Reflow top-level paragraphs to `line_width`. Default: false (opt-in — existing vaults
+    /// are never silently rewrapped; add `[formatter.wrap] enable = true` to turn it on).
+    pub enable: bool,
+    /// How a wikilink's or markdown link's width counts against `line_width`:
+    /// - `"raw"` (default): the full source text (`[[path#heading|display]]`) counts, so the
+    ///   editor's own line never exceeds the limit.
+    /// - `"display"`: only the alias/display text (or the bare target if there's no alias)
+    ///   counts, matching what a rendered viewer would actually show — the raw .md line can
+    ///   still run longer than `line_width` in this mode.
+    ///
+    /// A link is never split either way; see `FormatterConfig` doc comment.
+    pub link_width_mode: String,
+}
+
+impl Default for WrapConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            link_width_mode: "raw".to_string(),
         }
     }
 }
@@ -306,6 +334,8 @@ mod tests {
         assert_eq!(cfg.formatter.misc.hr_style, "---");
         assert_eq!(cfg.formatter.misc.code_fence_style, "```");
         assert!(cfg.formatter.misc.blockquote_single_space);
+        assert!(!cfg.formatter.wrap.enable);
+        assert_eq!(cfg.formatter.wrap.link_width_mode, "raw");
     }
 
     #[test]
@@ -361,6 +391,10 @@ enable = false
 hr_style = "***"
 code_fence_style = "~~~"
 blockquote_single_space = false
+
+[formatter.wrap]
+enable = true
+link_width_mode = "display"
 "#;
         let cfg = VaultConfig::from_toml(toml_str).unwrap();
         assert_eq!(cfg.id_scheme, IdSchemeConfig::Hierarchical);
@@ -391,5 +425,7 @@ blockquote_single_space = false
         assert_eq!(cfg.formatter.misc.hr_style, "***");
         assert_eq!(cfg.formatter.misc.code_fence_style, "~~~");
         assert!(!cfg.formatter.misc.blockquote_single_space);
+        assert!(cfg.formatter.wrap.enable);
+        assert_eq!(cfg.formatter.wrap.link_width_mode, "display");
     }
 }

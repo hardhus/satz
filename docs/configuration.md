@@ -133,7 +133,7 @@ Deterministic, structure-aware Markdown formatting: the same input always produc
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `enabled` | bool | `true` | Master switch for the entire formatter. When `false`, `satz fmt` reports nothing to do and `textDocument/formatting` returns no edits. |
-| `line_width` | integer | `80` | **Reserved, not yet enforced.** The formatter does not currently wrap or rewrap prose to this width. Safe to leave unset. |
+| `line_width` | integer | `80` | Target column width for paragraph reflow. Only takes effect when `[formatter.wrap] enable = true` — see below; otherwise unused. |
 | `blank_lines_around_headings` | integer (0–255) | `1` | Number of blank lines forced before each heading (headings immediately after frontmatter always get exactly one). |
 | `final_newline` | bool | `true` | Whether the formatted document must end with exactly one trailing newline. |
 | `normalize_links` | bool | `true` | Whether `[[  target  \|  display  ]]`-style wikilinks get their whitespace trimmed down to `[[target\|display]]` on format. |
@@ -170,6 +170,26 @@ Deterministic, structure-aware Markdown formatting: the same input always produc
 | `hr_style` | `"---"` \| `"***"` \| `"___"` | `"---"` | Style used for every thematic break (horizontal rule). The YAML frontmatter's own `---` fences are never affected — they're a distinct construct, not a thematic break. |
 | `code_fence_style` | `` "```" `` \| `"~~~"` | `` "```" `` | Style used for fenced code block delimiters. Fence length is preserved unless the code content itself contains a same-or-longer run of the target character, in which case the fence is lengthened just enough to stay unambiguous. An unterminated fence (cut off by EOF) has only its opening delimiter rewritten. |
 | `blockquote_single_space` | bool | `true` | Guarantee exactly one space after every `>` marker, at every nesting level (`>>text` → `> > text`). Lazy-continuation lines (part of a blockquote but not themselves prefixed with `>`) are left untouched. |
+
+#### `[formatter.wrap]`
+
+Reflows top-level paragraphs to `[formatter] line_width`. **Off by default** — existing vaults
+are never silently rewrapped; add `enable = true` to opt in. Scoped to top-level paragraphs only
+(not list items or blockquote text, which would need indentation-aware continuation lines this
+doesn't attempt). A wikilink (`[[...]]`/`![[...]]`), inline code span, or standard Markdown link
+is **never split** across a line break, even if it alone exceeds `line_width` — rescuing an
+unboundedly long line matters more than shaving a few columns off one unavoidably-long link, and
+this isn't configurable.
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `enable` | bool | `false` | Turns paragraph wrapping on. |
+| `link_width_mode` | `"raw"` \| `"display"` | `"raw"` | How a wikilink's/link's width counts against `line_width`. `"raw"`: the full source text (`[[path#heading\|display]]`) counts, so the line you see in the editor never exceeds the limit. `"display"`: only the alias/display text (or the bare target if there's no alias) counts — matching what a rendered viewer would actually show, at the cost of the raw `.md` line sometimes running longer than `line_width`. |
+
+Known limitation: an intentional hard line break (trailing two spaces, or a backslash, before a
+newline) is collapsed like any other soft-wrap inside a reflowed paragraph — `line_pass`'s
+trailing-whitespace trim already discarded the two-space form regardless of this setting, so
+there was no existing guarantee here to preserve.
 
 ## See also
 

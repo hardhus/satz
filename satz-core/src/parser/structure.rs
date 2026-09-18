@@ -66,6 +66,9 @@ pub struct StructureOutput {
     /// Only fenced code blocks (`CodeBlockKind::Fenced`) — indented code blocks have no fence
     /// delimiter to restyle.
     pub code_fence_spans: Vec<ByteRange>,
+    /// Only top-level paragraphs — not inside a list item, blockquote, or table — since wrapping
+    /// those would need indentation-aware continuation lines the wrap pass doesn't attempt yet.
+    pub paragraph_spans: Vec<ByteRange>,
 }
 
 /// Parses the structural markdown components using `pulldown-cmark`.
@@ -118,6 +121,8 @@ pub fn parse_structure(source: &str) -> StructureOutput {
     let mut blockquote_depth: usize = 0;
     let mut blockquote_start = 0usize;
 
+    let mut paragraph_start = 0usize;
+
     for (event, range) in parser.into_offset_iter() {
         match event {
             // --- GFM Tables ---
@@ -133,6 +138,20 @@ pub fn parse_structure(source: &str) -> StructureOutput {
                     output
                         .table_spans
                         .push(ByteRange::new(table_start, range.end));
+                }
+            }
+
+            // --- Top-level paragraphs (for the wrap pass) ---
+            // Only recorded when not nested inside a list item, blockquote, or table -- wrapping
+            // those needs indentation-aware continuation lines this pass doesn't attempt yet.
+            Event::Start(Tag::Paragraph) => {
+                paragraph_start = range.start;
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if list_stack.is_empty() && blockquote_depth == 0 && !in_table {
+                    output
+                        .paragraph_spans
+                        .push(ByteRange::new(paragraph_start, range.end));
                 }
             }
 
@@ -498,6 +517,31 @@ mod tests {
         let structure = parse_structure(md);
         assert_eq!(structure.rule_spans.len(), 1);
         assert!(structure.frontmatter_range.is_some());
+    }
+
+    #[test]
+    fn test_structure_paragraph_spans_top_level_only() {
+        // Two list items separated by a blank line force a "loose" list, so pulldown-cmark
+        // wraps each item's own text in a Paragraph event too -- exactly the case the
+        // list_stack/blockquote_depth guard needs to exclude.
+        let md = "Top paragraph one.\n\nTop paragraph two.\n\n\
+                  - loose item one\n\n- loose item two\n\n\
+                  > quoted text\n\n\
+                  | a | b |\n| - | - |\n| 1 | 2 |\n";
+        let structure = parse_structure(md);
+        assert_eq!(
+            structure.paragraph_spans.len(),
+            2,
+            "list-item and blockquote paragraphs must be excluded, only top-level ones kept"
+        );
+        assert_eq!(
+            md[structure.paragraph_spans[0].start..structure.paragraph_spans[0].end].trim(),
+            "Top paragraph one."
+        );
+        assert_eq!(
+            md[structure.paragraph_spans[1].start..structure.paragraph_spans[1].end].trim(),
+            "Top paragraph two."
+        );
     }
 
     #[test]
