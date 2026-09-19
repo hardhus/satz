@@ -14,7 +14,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 | Find references | Documents, headings, block anchors, tags — see [Reference/highlight targets](#referencehighlight-targets). |
 | Hover | Preview of the link target (section/paragraph-scoped when the link has a heading/block anchor); footnote hover shows the footnote body. |
 | Document highlight | Same-document occurrences of whatever's under the cursor (tag family, heading + links to it, block + links to it). |
-| Completion | Context-aware: note/alias completion inside `[[`, heading completion inside `[[doc#`, block completion inside `[[doc#^` (the `^` you typed is replaced, never doubled), footnote label completion inside `[^`, tag completion after `#`. A `[[` already closed by `]]` earlier on the line is not a link being typed (so tags and footnotes still complete after it), and nothing is offered after a `|` (the display text). Supports `completionItem/resolve` for note previews. |
+| Completion | Context-aware: note/alias completion inside `[[`, heading completion inside `[[doc#`, block completion inside `[[doc#^` (the `^` you typed is replaced, never doubled), footnote label completion inside `[^`, tag completion after `#` (only where a tag can be typed — `# Heading text` is a heading marker — and with the spelling the vault uses most: `#Proje`, not the folded `#proje`). A `[[` already closed by `]]` earlier on the line is not a link being typed (so tags and footnotes still complete after it), and nothing is offered after a `|` (the display text). Supports `completionItem/resolve` for note previews. |
 | Document symbols | Heading outline, nested by level. |
 | Workspace symbols | Fuzzy search (via `nucleo-matcher`) over titles, aliases, and headings across the whole vault; supports a `tag:<name> <query>` prefix to scope the search to a tag. |
 | Rename / prepare rename | Heading renames and document renames (see [Rename](#rename) below). |
@@ -54,6 +54,7 @@ Offered contextually depending on what's under the cursor/selection:
 
 Triggered from a heading definition or from a link:
 
+- **Renaming keeps each link's syntax.** Wikilinks, embeds and Markdown links (`[t](a.md#Heading "title")`) are rewritten in their own form; only the heading fragment, or the last path component of the file name (folders and a `.md` extension are kept; spaces become `%20` in bare Markdown destinations), changes. A note rename rewrites only links that name the FILE — a link that reaches the note through its title or an alias still resolves and is left alone. With duplicate headings, links belong to the first one (that is what they resolve to), so renaming a later duplicate touches no link. Edits are emitted in a stable order (files by URI, edits by position, the file rename last), and a rename that cannot produce a file location fails instead of half-applying.
 - **Renaming a heading** replaces only the heading text in its document (the `#` level, a trailing `^block-id`, closing `#`s, the line ending and a setext underline are kept) and rewrites every same-document and cross-document link whose `#Heading` reference matches it (matched via [heading matching rules](syntax.md#heading-slugs--matching), so case/slug variants are all caught). The edit is scoped to the target document plus its known backlinks — it does not scan the entire vault.
 - **Renaming via a link's target document** emits a `workspace/applyEdit` with a file-rename operation (`ResourceOp::Rename`) for the target file, plus text edits updating every in-scope link (again scoped to backlinks + the target itself, not a full-vault scan).
 
@@ -62,6 +63,8 @@ Triggered from a heading definition or from a link:
 New names are validated and a bad one is reported to the client as an error instead of being silently ignored: heading names may not be empty or contain line breaks, `|`, `[[`, `]]`, `#` or start with `^`; note names may not be empty or contain `/  : * ? " < > | # [ ] ^`, control characters or end with `.`/space, must fit a 255-byte file name (`.md` is stripped once), and must not collide with an existing note in the same folder. Renaming from a link whose heading or note does not exist is an error too (it never falls back to renaming the document). The file rename never overwrites, and text edits are listed before the rename so they address the files by their current paths.
 
 ## Reference/highlight targets
+
+`includeDeclaration: false` removes the declaration (the heading, block or note start) from the result — never the reference under the cursor. Duplicate headings: only the first owns the links that point at it.
 
 Find References and Document Highlight both resolve "what's under the cursor" with the same priority order: **link → block anchor → heading → tag → whole document**. For tags, the search expands hierarchically (referencing `#parent` also surfaces `#parent/child` occurrences). For headings/blocks/documents, results include both the definition (if in the current/target document) and every link that resolves to it, scoped to that target's known backlinks.
 

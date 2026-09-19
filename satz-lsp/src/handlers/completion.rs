@@ -272,28 +272,36 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
 
     // 3. Check for Tag completion: `#...`
     if let Some(hash_idx) = line_prefix.rfind('#') {
-        // Ensure # is at start of line or preceded by whitespace
-        let is_valid_tag_start = if hash_idx == 0 {
-            true
-        } else {
-            line_prefix.as_bytes()[hash_idx - 1].is_ascii_whitespace()
-        };
+        // A tag starts at the line start, after whitespace, or after an opening bracket/quote (the
+        // same set the parser accepts), and only tag characters have been typed since the `#`:
+        // `# Heading text|` is a heading marker, not a tag being typed.
+        let starts_a_tag = line_prefix[..hash_idx].chars().next_back().is_none_or(|c| {
+            c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\'' | '<' | '—' | '–')
+        });
+        let only_tag_characters = line_prefix[hash_idx + 1..]
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'));
 
-        if is_valid_tag_start {
+        if starts_a_tag && only_tag_characters {
             let range = byte_range_to_lsp(
                 satz_core::ByteRange::new(line_start_offset + hash_idx + 1, byte_offset),
                 &live_line_index,
             );
+            let spellings = tag_spellings(state);
             let items: Vec<CompletionItem> = state
                 .index
                 .all_tags()
                 .into_iter()
-                .map(|tag_name| CompletionItem {
-                    label: format!("#{}", tag_name),
-                    kind: Some(CompletionItemKind::KEYWORD),
-                    detail: Some("Tag".to_string()),
-                    text_edit: Some(completion_text_edit(range, tag_name.to_string())),
-                    ..Default::default()
+                .map(|key| {
+                    // The index keys tags folded; complete with the spelling the vault uses.
+                    let tag_name = spellings.get(key).map_or(key, String::as_str);
+                    CompletionItem {
+                        label: format!("#{}", tag_name),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        detail: Some("Tag".to_string()),
+                        text_edit: Some(completion_text_edit(range, tag_name.to_string())),
+                        ..Default::default()
+                    }
                 })
                 .collect();
             tracing::debug!(
@@ -305,6 +313,32 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     }
 
     None
+}
+
+/// For every folded tag key, the spelling used most often across the vault (the alphabetically
+/// first one on a tie, so the result never depends on iteration order).
+fn tag_spellings(state: &SatzState) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for doc in state.index.documents() {
+        for tag in &doc.tags {
+            let name = tag.name.trim_start_matches('#');
+            *counts
+                .entry(satz_core::fold_key(name))
+                .or_default()
+                .entry(name.to_string())
+                .or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(key, spellings)| {
+            spellings
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(spelling, _)| (key, spelling))
+        })
+        .collect()
 }
 
 pub fn completion_resolve(mut item: CompletionItem, state: &SatzState) -> CompletionItem {
@@ -662,6 +696,14 @@ mod tests {
     /// headings Intro/Details, the block `^my-block` and the tags alpha/beta.
     /// Returns the response and the text without the marker.
     fn complete(marked: &str) -> (Option<CompletionResponse>, String) {
+        complete_in(
+            marked,
+            "# Intro\n\nSome text ^my-block\n\n## Details\n\n#alpha #beta\n",
+        )
+    }
+
+    /// Like `complete`, with the text of the peer note `b.md` chosen by the test.
+    fn complete_in(marked: &str, b_text: &str) -> (Option<CompletionResponse>, String) {
         let idx = marked.find(CURSOR).expect("cursor marker");
         let text = marked.replacen(CURSOR, "", 1);
         let before = &marked[..idx];
@@ -669,7 +711,6 @@ mod tests {
         let line_start = before.rfind('\n').map_or(0, |i| i + 1);
         let character = before[line_start..].encode_utf16().count() as u32;
 
-        let b_text = "# Intro\n\nSome text ^my-block\n\n## Details\n\n#alpha #beta\n";
         let mut state = SatzState::default();
         state.index = Index::build(vec![
             parse_document(&text, Path::new("a.md")),
@@ -707,7 +748,15 @@ mod tests {
 
     /// The document text after accepting the item labelled `label`.
     fn accept(marked: &str, label: &str) -> String {
-        let (response, text) = complete(marked);
+        accept_from(complete(marked), marked, label)
+    }
+
+    fn accept_from(
+        completed: (Option<CompletionResponse>, String),
+        marked: &str,
+        label: &str,
+    ) -> String {
+        let (response, text) = completed;
         let Some(CompletionResponse::Array(items)) = response else {
             panic!("no completion items for {marked:?}");
         };
@@ -805,5 +854,65 @@ mod tests {
             accept("text\n[[§\nnext", "Details"),
             "text\n[[b#Details]]\nnext"
         );
+    }
+
+    // ---- tags: only where a tag can be typed, and spelled as the vault spells it ----
+
+    #[test]
+    fn a_heading_marker_is_not_a_tag_being_typed() {
+        for marked in [
+            "# Başlık§",
+            "## Başlık§",
+            "###### x§",
+            "text # not a tag§",
+            "# §",
+            "#\tword§",
+        ] {
+            assert!(
+                complete(marked).0.is_none(),
+                "{marked:?} -> {:?}",
+                complete(marked).0
+            );
+        }
+    }
+
+    #[test]
+    fn tags_are_still_completed_where_they_can_be_typed() {
+        assert_eq!(accept("#§", "#alpha"), "#alpha");
+        assert_eq!(accept("#al§", "#alpha"), "#alpha");
+        assert_eq!(accept("text #al§", "#alpha"), "text #alpha");
+        assert_eq!(accept("## Head #be§", "#beta"), "## Head #beta");
+        assert_eq!(accept("- #be§", "#beta"), "- #beta");
+        assert_eq!(accept("(#al§", "#alpha"), "(#alpha");
+        assert!(items("#§").len() >= 2);
+        // A `#` glued to a word is a fragment, not a tag.
+        assert!(complete("https://a.b/c#fr§").0.is_none());
+    }
+
+    #[test]
+    fn a_tag_is_completed_with_the_spelling_the_vault_uses_most() {
+        let b = "#Proje #Proje\n\n#proje\n\n#Zed/Alt #zed/alt #zed/alt\n\n#İş\n";
+        let done = |marked: &str, label: &str| accept_from(complete_in(marked, b), marked, label);
+        assert_eq!(done("#§", "#Proje"), "#Proje");
+        assert_eq!(done("#pr§", "#Proje"), "#Proje");
+        // The commonest spelling wins, hierarchy included.
+        assert_eq!(done("#§", "#zed/alt"), "#zed/alt");
+        assert_eq!(done("#§", "#İş"), "#İş");
+    }
+
+    #[test]
+    fn equally_common_spellings_resolve_deterministically() {
+        let b = "#Foo #foo\n";
+        let first = accept_from(complete_in("#§", b), "#§", "#Foo");
+        assert_eq!(first, "#Foo");
+        for _ in 0..5 {
+            let labels: Vec<String> = match complete_in("#§", b).0 {
+                Some(CompletionResponse::Array(items)) => {
+                    items.into_iter().map(|i| i.label).collect()
+                }
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(labels, vec!["#Foo".to_string()]);
+        }
     }
 }

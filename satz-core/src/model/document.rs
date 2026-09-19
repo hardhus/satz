@@ -73,6 +73,12 @@ impl Document {
             .collect()
     }
 
+    /// Index of the heading a `#Heading` reference resolves to: the FIRST heading that matches it.
+    /// With duplicate headings every reference therefore belongs to the first one.
+    pub fn resolve_heading(&self, reference: &str) -> Option<usize> {
+        self.headings.iter().position(|h| h.matches(reference))
+    }
+
     /// Resolves the document title according to priority:
     /// 1. `frontmatter.title` (if non-empty)
     /// 2. First level 1 heading (`# Heading 1`)
@@ -101,5 +107,40 @@ impl Document {
         }
 
         "Untitled".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::parse_document;
+    use std::path::Path;
+
+    fn doc(text: &str) -> crate::model::Document {
+        parse_document(text, Path::new("a.md"))
+    }
+
+    #[test]
+    fn a_reference_resolves_to_the_first_matching_heading() {
+        let d = doc("# T\n\n## Notes\n\ntext\n\n## Notes\n\n## Other\n\n## Notes\n");
+        assert_eq!(d.resolve_heading("Notes"), Some(1));
+        assert_eq!(d.resolve_heading("notes"), Some(1));
+        assert_eq!(d.resolve_heading("NOTES"), Some(1));
+        assert_eq!(d.resolve_heading("Other"), Some(3));
+        assert_eq!(d.resolve_heading("T"), Some(0));
+    }
+
+    #[test]
+    fn an_unknown_reference_resolves_to_nothing() {
+        let d = doc("# T\n\n## Notes\n");
+        assert_eq!(d.resolve_heading("Missing"), None);
+        assert_eq!(d.resolve_heading(""), None);
+        assert_eq!(doc("no headings").resolve_heading("x"), None);
+    }
+
+    #[test]
+    fn slug_and_turkish_case_variants_match() {
+        let d = doc("## Günün Özeti\n");
+        assert_eq!(d.resolve_heading("günün özeti"), Some(0));
+        assert_eq!(d.resolve_heading("günün-özeti"), Some(0));
     }
 }

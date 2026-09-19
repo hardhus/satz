@@ -9,8 +9,17 @@ use crate::state::SatzState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CursorTarget {
     Tag(String),
-    Heading { doc: DocId, slug: String },
-    Block { doc: DocId, id: String },
+    /// `index` is the heading it resolves to (the first match; duplicates own no links); `None`
+    /// for a reference to a heading that does not exist.
+    Heading {
+        doc: DocId,
+        slug: String,
+        index: Option<usize>,
+    },
+    Block {
+        doc: DocId,
+        id: String,
+    },
     Doc(DocId),
 }
 
@@ -28,6 +37,7 @@ fn cursor_target(doc: &Document, off: usize, index: &Index) -> Option<CursorTarg
                 id: b.clone(),
             },
             (_, Some(h)) => CursorTarget::Heading {
+                index: index.get_doc(&target).and_then(|d| d.resolve_heading(h)),
                 doc: target,
                 slug: slugify(h),
             },
@@ -42,10 +52,11 @@ fn cursor_target(doc: &Document, off: usize, index: &Index) -> Option<CursorTarg
         });
     }
 
-    if let Some(h) = doc.headings.iter().find(|h| h.range.contains(off)) {
+    if let Some(i) = doc.headings.iter().position(|h| h.range.contains(off)) {
         return Some(CursorTarget::Heading {
             doc: doc.id.clone(),
-            slug: h.slug.clone(),
+            slug: doc.headings[i].slug.clone(),
+            index: Some(i),
         });
     }
 
@@ -84,6 +95,8 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
     let target = cursor_target(doc, byte_offset, &state.index)?;
     let mut locations = Vec::new();
+    // Where the target is declared (the heading, the block, the note's start), if it has a place.
+    let mut declaration: Option<Location> = None;
 
     match target {
         CursorTarget::Tag(ref tag_name) => {
@@ -110,10 +123,9 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                 && let Some(b) = target_doc.blocks.iter().find(|b| &b.id == id)
                 && let Some(u) = doc_uri(target_doc, state.vault_root.as_deref())
             {
-                locations.push(Location::new(
-                    u,
-                    byte_range_to_lsp(b.range, &target_doc.line_index),
-                ));
+                let location = Location::new(u, byte_range_to_lsp(b.range, &target_doc.line_index));
+                declaration = Some(location.clone());
+                locations.push(location);
             }
 
             let mut candidate_ids: Vec<DocId> = state.index.backlinks_of(doc).cloned().collect();
@@ -144,15 +156,22 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                 }
             }
         }
-        CursorTarget::Heading { ref doc, ref slug } => {
-            if let Some(target_doc) = state.index.get_doc(doc)
-                && let Some(h) = target_doc.headings.iter().find(|h| &h.slug == slug)
+        CursorTarget::Heading {
+            ref doc,
+            ref slug,
+            index: heading_index,
+        } => {
+            let target_doc_opt = state.index.get_doc(doc);
+            if let Some(target_doc) = target_doc_opt
+                && let Some(h) = match heading_index {
+                    Some(i) => target_doc.headings.get(i),
+                    None => target_doc.headings.iter().find(|h| &h.slug == slug),
+                }
                 && let Some(u) = doc_uri(target_doc, state.vault_root.as_deref())
             {
-                locations.push(Location::new(
-                    u,
-                    byte_range_to_lsp(h.range, &target_doc.line_index),
-                ));
+                let location = Location::new(u, byte_range_to_lsp(h.range, &target_doc.line_index));
+                declaration = Some(location.clone());
+                locations.push(location);
             }
 
             let mut candidate_ids: Vec<DocId> = state.index.backlinks_of(doc).cloned().collect();
@@ -173,10 +192,17 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                             state.index.resolve_link(&link.target_doc) == Some(doc)
                         };
 
-                        if resolves_to_target
-                            && link.target_heading.as_deref().map(slugify).as_deref()
-                                == Some(slug.as_str())
-                        {
+                        // A reference belongs to the first heading it matches; a later
+                        // duplicate owns none. (An unresolved heading falls back to the slug.)
+                        let owns_link = link.target_heading.as_deref().is_some_and(|th| {
+                            match (heading_index, target_doc_opt) {
+                                (Some(i), Some(target_doc)) => {
+                                    target_doc.resolve_heading(th) == Some(i)
+                                }
+                                _ => slugify(th) == *slug,
+                            }
+                        });
+                        if resolves_to_target && owns_link {
                             locations.push(Location::new(
                                 src_uri.clone(),
                                 byte_range_to_lsp(link.range, &src_doc.line_index),
@@ -195,7 +221,9 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                 } else {
                     byte_range_to_lsp(satz_core::ByteRange::new(0, 0), &target_doc.line_index)
                 };
-                locations.push(Location::new(u, range));
+                let location = Location::new(u, range);
+                declaration = Some(location.clone());
+                locations.push(location);
             }
 
             let mut candidate_ids: Vec<DocId> =
@@ -229,14 +257,12 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
         }
     }
 
-    if !params.context.include_declaration {
-        locations.retain(|loc| {
-            !(loc.uri.as_str() == uri
-                && loc.range.start.line <= pos.line
-                && loc.range.end.line >= pos.line
-                && (loc.range.start.line < pos.line || loc.range.start.character <= pos.character)
-                && (loc.range.end.line > pos.line || loc.range.end.character >= pos.character))
-        });
+    // Without the declaration, drop exactly that location -- not whatever is under the cursor (a
+    // link there is a real reference). Locations compare by `Uri` value, not by spelling.
+    if !params.context.include_declaration
+        && let Some(declaration) = &declaration
+    {
+        locations.retain(|loc| loc != declaration);
     }
 
     locations.sort_by(|a, b| {
@@ -392,5 +418,137 @@ mod tests {
         let refs = find_references(params, &state).expect("References expected");
         // 1 block definition in LSP.md + 1 link in daily.md = 2
         assert_eq!(refs.len(), 2);
+    }
+
+    // ---- harness: references over a small vault ----
+
+    fn root() -> std::path::PathBuf {
+        if cfg!(windows) {
+            Path::new("C:\\vault").to_path_buf()
+        } else {
+            Path::new("/vault").to_path_buf()
+        }
+    }
+
+    fn uri_of(rel: &str) -> String {
+        crate::convert::path_to_uri(&root().join(rel))
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
+    /// `(file, line)` of every reference found from `at` in `open`, sorted as returned.
+    fn refs(
+        files: &[(&str, &str)],
+        open: &str,
+        at: (u32, u32),
+        include_declaration: bool,
+    ) -> Vec<(String, u32)> {
+        let mut state = SatzState::default();
+        state.index = Index::build(
+            files
+                .iter()
+                .map(|(rel, text)| parse_document(text, Path::new(rel)))
+                .collect(),
+        );
+        state.vault_root = Some(root());
+        for (rel, text) in files {
+            let uri = uri_of(rel);
+            state.open_docs.insert(
+                uri.clone(),
+                crate::state::OpenDocument::new(&uri, root().join(rel), *text, 1),
+            );
+        }
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri_of(open).parse().unwrap(),
+                },
+                position: Position::new(at.0, at.1),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration,
+            },
+        };
+        find_references(params, &state)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| {
+                let rel = crate::convert::uri_to_path(l.uri.as_str())
+                    .unwrap()
+                    .strip_prefix(root())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, l.range.start.line)
+            })
+            .collect()
+    }
+
+    fn at(rel: &str, line: u32) -> (String, u32) {
+        (rel.to_string(), line)
+    }
+
+    #[test]
+    fn duplicate_headings_only_the_first_owns_the_links() {
+        let files = [
+            ("a.md", "## Notes\nfirst\n\n## Notes\nsecond\n"),
+            ("b.md", "See [[a#Notes]]\n"),
+        ];
+        assert_eq!(
+            refs(&files, "a.md", (0, 4), true),
+            vec![at("a.md", 0), at("b.md", 0)]
+        );
+        // The second heading is only itself: no link resolves to it.
+        assert_eq!(refs(&files, "a.md", (3, 4), true), vec![at("a.md", 3)]);
+        assert_eq!(
+            refs(&files, "a.md", (3, 4), false),
+            Vec::<(String, u32)>::new()
+        );
+    }
+
+    #[test]
+    fn include_declaration_false_drops_the_declaration_not_the_cursor_spot() {
+        let files = [
+            ("a.md", "## Notes\ntext\n"),
+            ("b.md", "See [[a#Notes]]\n\nAnd [[a#Notes]] again\n"),
+        ];
+        // From a link: the linking spots stay (including the one under the cursor), the heading goes.
+        assert_eq!(
+            refs(&files, "b.md", (0, 8), false),
+            vec![at("b.md", 0), at("b.md", 2)]
+        );
+        assert_eq!(
+            refs(&files, "b.md", (0, 8), true),
+            vec![at("a.md", 0), at("b.md", 0), at("b.md", 2)]
+        );
+        // From the heading itself: links only.
+        assert_eq!(
+            refs(&files, "a.md", (0, 4), false),
+            vec![at("b.md", 0), at("b.md", 2)]
+        );
+    }
+
+    #[test]
+    fn include_declaration_false_for_blocks_and_documents() {
+        let blocks = [("a.md", "# A\n\ntext ^blk\n"), ("b.md", "[[a#^blk]]\n")];
+        assert_eq!(refs(&blocks, "b.md", (0, 3), false), vec![at("b.md", 0)]);
+        assert_eq!(refs(&blocks, "a.md", (2, 7), false), vec![at("b.md", 0)]);
+        assert_eq!(
+            refs(&blocks, "a.md", (2, 7), true),
+            vec![at("a.md", 2), at("b.md", 0)]
+        );
+
+        let docs = [("a.md", "# A\n"), ("b.md", "[[a]] and [[a]]\n")];
+        assert_eq!(
+            refs(&docs, "b.md", (0, 2), false),
+            vec![at("b.md", 0), at("b.md", 0)]
+        );
+        assert_eq!(
+            refs(&docs, "b.md", (0, 2), true),
+            vec![at("a.md", 0), at("b.md", 0), at("b.md", 0)]
+        );
     }
 }

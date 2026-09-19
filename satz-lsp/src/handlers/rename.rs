@@ -224,17 +224,17 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
         };
 
         for l in &src_doc.links {
+            // Only links that name the FILE stop working; one that reaches the note through its
+            // title or an alias keeps resolving and is not touched.
             if !l.target_doc.is_empty()
                 && state.index.resolve_link(&l.target_doc) == Some(target_id)
+                && names_file(&l.target_doc, &target_doc.path)
+                && let Some(new_link_text) = rewritten_link(
+                    src_doc.line_index.source(),
+                    l,
+                    LinkChange::Note(&clean_new_doc_name),
+                )
             {
-                let new_link_text = format_wikilink_doc(
-                    l.kind,
-                    &clean_new_doc_name,
-                    l.target_heading.as_deref(),
-                    l.target_block.as_deref(),
-                    l.display.as_deref(),
-                );
-
                 changes.entry(src_url.clone()).or_default().push(TextEdit {
                     range: byte_range_to_lsp(l.range, &src_doc.line_index),
                     new_text: new_link_text,
@@ -243,43 +243,44 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
         }
     }
 
-    // Also produce file rename operation if possible
-    if let (Some(old_uri), Some(new_uri)) = (path_to_uri(&old_doc_path), path_to_uri(&new_doc_path))
-    {
-        // Text edits first: they address the files by their current URIs, which stop existing
-        // once the rename has been applied.
-        let mut document_changes: Vec<DocumentChangeOperation> = changes
-            .into_iter()
-            .map(|(url, edits)| {
-                DocumentChangeOperation::Edit(TextDocumentEdit {
-                    text_document: OptionalVersionedTextDocumentIdentifier {
-                        uri: url,
-                        version: None,
-                    },
-                    edits: edits.into_iter().map(OneOf::Left).collect(),
-                })
-            })
-            .collect();
-        document_changes.push(DocumentChangeOperation::Op(ResourceOp::Rename(
-            RenameFile {
-                old_uri,
-                new_uri,
-                options: Some(RenameFileOptions {
-                    overwrite: Some(false),
-                    ignore_if_exists: None,
-                }),
-                annotation_id: None,
-            },
-        )));
+    // The file rename. Without file locations the links could be rewritten but the file could not
+    // be renamed, leaving every rewritten link broken: refuse instead.
+    let (Some(old_uri), Some(new_uri)) = (path_to_uri(&old_doc_path), path_to_uri(&new_doc_path))
+    else {
+        return Err(format!(
+            "cannot rename: no file location for '{}'",
+            target_doc.path.display()
+        ));
+    };
 
-        return Ok(Some(WorkspaceEdit {
-            document_changes: Some(DocumentChanges::Operations(document_changes)),
-            ..Default::default()
-        }));
-    }
+    // Text edits first (stable order): they address the files by their current URIs, which stop
+    // existing once the rename has been applied.
+    let mut document_changes: Vec<DocumentChangeOperation> = ordered_edits(changes)
+        .into_iter()
+        .map(|(url, edits)| {
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: url,
+                    version: None,
+                },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            })
+        })
+        .collect();
+    document_changes.push(DocumentChangeOperation::Op(ResourceOp::Rename(
+        RenameFile {
+            old_uri,
+            new_uri,
+            options: Some(RenameFileOptions {
+                overwrite: Some(false),
+                ignore_if_exists: None,
+            }),
+            annotation_id: None,
+        },
+    )));
 
     Ok(Some(WorkspaceEdit {
-        changes: Some(changes),
+        document_changes: Some(DocumentChanges::Operations(document_changes)),
         ..Default::default()
     }))
 }
@@ -333,14 +334,21 @@ fn rename_heading(
             } else {
                 state.index.resolve_link(&l.target_doc) == Some(target_id)
             };
-            let matches_heading = l
-                .target_heading
-                .as_deref()
-                .is_some_and(|th| heading.matches(th));
+            // A reference belongs to the FIRST heading that matches it; a later duplicate owns none.
+            let matches_heading = l.target_heading.as_deref().is_some_and(|th| {
+                target_doc
+                    .resolve_heading(th)
+                    .is_some_and(|i| target_doc.headings[i].range == heading.range)
+            });
 
-            if matches_doc && matches_heading {
-                let new_link_text =
-                    format_wikilink_heading(l.kind, &l.target_doc, new_name, l.display.as_deref());
+            if matches_doc
+                && matches_heading
+                && let Some(new_link_text) = rewritten_link(
+                    src_doc.line_index.source(),
+                    l,
+                    LinkChange::Heading(new_name),
+                )
+            {
                 changes.entry(src_url.clone()).or_default().push(TextEdit {
                     range: byte_range_to_lsp(l.range, &src_doc.line_index),
                     new_text: new_link_text,
@@ -350,7 +358,7 @@ fn rename_heading(
     }
 
     Some(WorkspaceEdit {
-        changes: Some(changes),
+        changes: Some(ordered_edits(changes).into_iter().collect()),
         ..Default::default()
     })
 }
@@ -398,6 +406,134 @@ fn validate_note_name(name: &str) -> Result<String, String> {
         return Err("note name is too long for a file name".to_string());
     }
     Ok(clean.to_string())
+}
+
+/// What a link rewrite is for: a renamed heading (its new text) or a renamed note (its new stem).
+#[derive(Clone, Copy)]
+enum LinkChange<'a> {
+    Heading(&'a str),
+    Note(&'a str),
+}
+
+/// The new source text of `link`, keeping its syntax (wikilink, embed or Markdown link). `None`
+/// when a Markdown link's destination cannot be parsed; such a link is left alone.
+fn rewritten_link(source: &str, link: &satz_core::Link, change: LinkChange) -> Option<String> {
+    match (link.kind, change) {
+        (LinkKind::Markdown, _) => {
+            rewrite_markdown_link(source.get(link.range.start..link.range.end)?, change)
+        }
+        (_, LinkChange::Heading(new_heading)) => Some(format_wikilink_heading(
+            link.kind,
+            &link.target_doc,
+            new_heading,
+            link.display.as_deref(),
+        )),
+        (_, LinkChange::Note(new_stem)) => Some(format_wikilink_doc(
+            link.kind,
+            &replace_last_segment(&link.target_doc, new_stem),
+            link.target_heading.as_deref(),
+            link.target_block.as_deref(),
+            link.display.as_deref(),
+        )),
+    }
+}
+
+/// `sub/a.md` + `c` -> `sub/c.md`: only the last path component changes; folders and a `.md`
+/// extension are kept as the user wrote them.
+fn replace_last_segment(target: &str, new_stem: &str) -> String {
+    let (dir, file) = match target.rfind(['/', '\\']) {
+        Some(i) => (&target[..=i], &target[i + 1..]),
+        None => ("", target),
+    };
+    let ext = if file.len() >= 3 && file[file.len() - 3..].eq_ignore_ascii_case(".md") {
+        &file[file.len() - 3..]
+    } else {
+        ""
+    };
+    format!("{dir}{new_stem}{ext}")
+}
+
+/// Rewrites the destination of `[text](dest "title")`, keeping text, title and bracket style.
+fn rewrite_markdown_link(link_source: &str, change: LinkChange) -> Option<String> {
+    let open = link_source.rfind("](")?;
+    if !link_source.ends_with(')') {
+        return None;
+    }
+    let head = &link_source[..open + 2];
+    let inner = &link_source[open + 2..link_source.len() - 1];
+
+    let (dest, rest, angled) = if let Some(after) = inner.strip_prefix('<') {
+        let end = after.find('>')?;
+        (&after[..end], &after[end + 1..], true)
+    } else {
+        let end = inner.find(char::is_whitespace).unwrap_or(inner.len());
+        (&inner[..end], &inner[end..], false)
+    };
+    let (path, fragment) = match dest.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (dest, None),
+    };
+    // A bare destination cannot hold spaces; `<...>` can.
+    let encode = |text: &str| {
+        if angled {
+            text.to_string()
+        } else {
+            text.replace(' ', "%20")
+        }
+    };
+    let (new_path, new_fragment) = match change {
+        LinkChange::Note(stem) => (
+            replace_last_segment(path, &encode(stem)),
+            fragment.map(str::to_string),
+        ),
+        LinkChange::Heading(heading) => (path.to_string(), Some(encode(heading))),
+    };
+    let mut new_dest = new_path;
+    if let Some(fragment) = new_fragment {
+        new_dest.push('#');
+        new_dest.push_str(&fragment);
+    }
+    let new_dest = if angled {
+        format!("<{new_dest}>")
+    } else {
+        new_dest
+    };
+    Some(format!("{head}{new_dest}{rest})"))
+}
+
+/// Whether a link target names the FILE (its path or its name), as opposed to reaching the note
+/// through its title or an alias. Only the former stops working when the file is renamed.
+fn names_file(target: &str, old_rel_path: &std::path::Path) -> bool {
+    let normalize = |text: &str| {
+        let mut t = text.trim().replace('\\', "/").replace("%20", " ");
+        while let Some(rest) = t.strip_prefix("./").or_else(|| t.strip_prefix("../")) {
+            t = rest.to_string();
+        }
+        let t = match t.len().checked_sub(3) {
+            Some(cut) if t.is_char_boundary(cut) && t[cut..].eq_ignore_ascii_case(".md") => {
+                t[..cut].to_string()
+            }
+            _ => t,
+        };
+        satz_core::fold_key(&t)
+    };
+    let wanted = normalize(target);
+    let full = normalize(&old_rel_path.to_string_lossy());
+    let stem = old_rel_path
+        .file_stem()
+        .map(|s| satz_core::fold_key(&s.to_string_lossy()))
+        .unwrap_or_default();
+    wanted == full || wanted == stem || full.ends_with(&format!("/{wanted}"))
+}
+
+/// Per-file edits in a stable order: files by URI, edits by position.
+fn ordered_edits(changes: HashMap<Uri, Vec<TextEdit>>) -> Vec<(Uri, Vec<TextEdit>)> {
+    let mut files: Vec<(Uri, Vec<TextEdit>)> = changes.into_iter().collect();
+    files.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    for (_, edits) in &mut files {
+        edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
+    }
+    files
 }
 
 fn format_wikilink_heading(
@@ -1090,5 +1226,257 @@ mod tests {
         let v = vault(&[("a.md", "plain text\n\n## H\n")]);
         let out = rename(rename_params("a.md", 0, 3, "New"), &v.state);
         assert_eq!(out, Ok(None));
+    }
+
+    // ---- duplicate headings: links resolve to the first one, so only it owns them ----
+
+    #[test]
+    fn renaming_the_second_of_two_equal_headings_leaves_the_links_alone() {
+        let v = vault(&[
+            ("a.md", "## Notes\nfirst\n\n## Notes\nsecond\n"),
+            ("b.md", "See [[a#Notes]] and [[a#notes]]\n"),
+        ]);
+        let applied = v.rename("a.md", 3, 4, "Other").unwrap();
+        assert_eq!(
+            applied.texts["a.md"],
+            "## Notes\nfirst\n\n## Other\nsecond\n"
+        );
+        assert_eq!(applied.texts["b.md"], "See [[a#Notes]] and [[a#notes]]\n");
+    }
+
+    #[test]
+    fn renaming_the_first_of_two_equal_headings_rewrites_the_links() {
+        let v = vault(&[
+            ("a.md", "## Notes\nfirst\n\n## Notes\nsecond\n"),
+            ("b.md", "See [[a#Notes]]\n"),
+        ]);
+        let applied = v.rename("a.md", 0, 4, "Alpha").unwrap();
+        assert_eq!(
+            applied.texts["a.md"],
+            "## Alpha\nfirst\n\n## Notes\nsecond\n"
+        );
+        assert_eq!(applied.texts["b.md"], "See [[a#Alpha]]\n");
+        // Renaming from the link does the same (the link means the first heading).
+        let from_link = v.rename("b.md", 0, 8, "Alpha").unwrap();
+        assert_eq!(from_link.texts, applied.texts);
+    }
+
+    #[test]
+    fn three_equal_headings_only_the_first_has_links() {
+        let v = vault(&[("a.md", "## N\n\n## N\n\n## N\n"), ("b.md", "[[a#N]]\n")]);
+        for (line, links_change) in [(0u32, true), (2, false), (4, false)] {
+            let applied = v.rename("a.md", line, 4, "X").unwrap();
+            assert_eq!(
+                applied.texts["b.md"] != "[[a#N]]\n",
+                links_change,
+                "heading on line {line}"
+            );
+        }
+    }
+
+    // ---- Markdown links stay Markdown links ----
+
+    #[test]
+    fn heading_rename_rewrites_only_the_fragment_of_markdown_links() {
+        for (before, after) in [
+            ("See [t](a.md#Old) here\n", "See [t](a.md#New) here\n"),
+            ("[t](a.md#Old \"a title\")\n", "[t](a.md#New \"a title\")\n"),
+            (
+                "[[a#Old]] and [t](a.md#Old)\n",
+                "[[a#New]] and [t](a.md#New)\n",
+            ),
+            (
+                "[t](https://example.com/a.md#Old)\n",
+                "[t](https://example.com/a.md#Old)\n",
+            ),
+        ] {
+            let v = vault(&[("a.md", "## Old\ntext\n"), ("b.md", before)]);
+            let applied = v.rename("a.md", 0, 4, "New").unwrap();
+            assert_eq!(applied.texts["b.md"], after, "{before:?}");
+            assert_eq!(applied.texts["a.md"], "## New\ntext\n");
+        }
+    }
+
+    #[test]
+    fn a_heading_with_spaces_is_written_into_markdown_links_safely() {
+        let v = vault(&[
+            ("a.md", "## Old\n"),
+            ("b.md", "[t](a.md#Old) [u](<a.md#Old>)\n"),
+        ]);
+        let applied = v.rename("a.md", 0, 4, "New Name").unwrap();
+        assert_eq!(
+            applied.texts["b.md"],
+            "[t](a.md#New%20Name) [u](<a.md#New Name>)\n"
+        );
+    }
+
+    #[test]
+    fn renaming_from_a_markdown_link_edits_the_heading_and_keeps_link_syntax() {
+        let v = vault(&[
+            ("a.md", "## Old\ntext\n"),
+            ("b.md", "See [t](a.md#Old) here\n"),
+        ]);
+        let applied = v.rename("b.md", 0, 8, "New").unwrap();
+        assert_eq!(applied.texts["a.md"], "## New\ntext\n");
+        assert_eq!(applied.texts["b.md"], "See [t](a.md#New) here\n");
+    }
+
+    #[test]
+    fn note_rename_keeps_markdown_link_syntax_display_fragment_and_title() {
+        for (before, after) in [
+            ("[t](a.md)\n", "[t](c.md)\n"),
+            (
+                "[t](a.md) [u](a.md#H \"ti\")\n",
+                "[t](c.md) [u](c.md#H \"ti\")\n",
+            ),
+            ("[t](a)\n", "[t](c)\n"),
+            ("[t](<a.md>)\n", "[t](<c.md>)\n"),
+        ] {
+            let v = vault(&[("a.md", "# A\n\n## H\n"), ("b.md", before)]);
+            let applied = v.rename("b.md", 0, 2, "c").unwrap();
+            assert_eq!(applied.texts["b.md"], after, "{before:?}");
+        }
+        let v = vault(&[("sub/a.md", "# A\n"), ("b.md", "[t](sub/a.md)\n")]);
+        let applied = v.rename("b.md", 0, 2, "c").unwrap();
+        assert_eq!(applied.texts["b.md"], "[t](sub/c.md)\n");
+    }
+
+    #[test]
+    fn a_new_note_name_with_spaces_is_percent_encoded_in_bare_markdown_links() {
+        let v = vault(&[("a.md", "# A\n"), ("b.md", "[t](a.md) [[a]]\n")]);
+        let applied = v.rename("b.md", 0, 2, "new name").unwrap();
+        assert_eq!(applied.texts["b.md"], "[t](new%20name.md) [[new name]]\n");
+    }
+
+    // ---- a note rename only rewrites links that name the FILE ----
+
+    #[test]
+    fn links_that_resolve_by_title_or_alias_are_left_alone() {
+        let v = vault(&[
+            ("a.md", "---\naliases: [Alpha]\n---\n# A Title\n"),
+            ("b.md", "[[a]] [[Alpha]] [[A Title]] [[a#H|x]] ![[a]]\n"),
+        ]);
+        let applied = v.rename("b.md", 0, 2, "c").unwrap();
+        assert_eq!(
+            applied.texts["b.md"],
+            "[[c]] [[Alpha]] [[A Title]] [[c#H|x]] ![[c]]\n"
+        );
+    }
+
+    #[test]
+    fn folder_prefix_extension_and_letter_case_of_the_old_link_are_kept() {
+        let v = vault(&[
+            ("sub/a.md", "# A\n"),
+            (
+                "b.md",
+                "[[sub/a]] [[a]] [[A]] [[a.md]] [[sub/a.md]] [[SUB/A]]\n",
+            ),
+        ]);
+        let applied = v.rename("b.md", 0, 2, "c").unwrap();
+        assert_eq!(
+            applied.texts["b.md"],
+            "[[sub/c]] [[c]] [[c]] [[c.md]] [[sub/c.md]] [[SUB/c]]\n"
+        );
+        assert_eq!(applied.renames[0].1, "sub/c.md");
+    }
+
+    #[test]
+    fn a_note_can_be_renamed_from_its_own_self_link() {
+        let v = vault(&[("a.md", "# A\n\n[[a#A]] and [[a]]\n")]);
+        let applied = v.rename("a.md", 2, 14, "c").unwrap();
+        assert_eq!(applied.texts["a.md"], "# A\n\n[[c#A]] and [[c]]\n");
+    }
+
+    // ---- deterministic edits, explicit failure ----
+
+    fn many_linking_files() -> Vault {
+        vault(&[
+            ("a.md", "# A\n"),
+            ("b.md", "[[a]] and [[a]]\n"),
+            ("c.md", "[[a]]\n\n[[a]] x [[a]]\n"),
+            ("d.md", "[[a]]\n"),
+            ("e.md", "x [[a]]\n"),
+            ("f.md", "[[a]]\n"),
+        ])
+    }
+
+    fn operations(v: &Vault) -> Vec<DocumentChangeOperation> {
+        let edit = rename(rename_params("b.md", 0, 2, "z"), &v.state)
+            .unwrap()
+            .unwrap();
+        let Some(DocumentChanges::Operations(ops)) = edit.document_changes else {
+            panic!("operations expected");
+        };
+        ops
+    }
+
+    #[test]
+    fn the_same_rename_always_produces_the_same_workspace_edit() {
+        let v = many_linking_files();
+        let first = format!("{:?}", operations(&v));
+        for _ in 0..8 {
+            assert_eq!(format!("{:?}", operations(&v)), first);
+        }
+    }
+
+    #[test]
+    fn edits_are_ordered_by_file_then_position_and_the_file_rename_is_last() {
+        let ops = operations(&many_linking_files());
+        let uris: Vec<String> = ops
+            .iter()
+            .filter_map(|op| match op {
+                DocumentChangeOperation::Edit(e) => Some(e.text_document.uri.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        let mut sorted = uris.clone();
+        sorted.sort();
+        assert_eq!(uris, sorted);
+        assert_eq!(uris.len(), 5);
+        assert!(matches!(
+            ops.last(),
+            Some(DocumentChangeOperation::Op(ResourceOp::Rename(_)))
+        ));
+        for op in &ops {
+            if let DocumentChangeOperation::Edit(e) = op {
+                let starts: Vec<(u32, u32)> = e
+                    .edits
+                    .iter()
+                    .filter_map(|o| match o {
+                        OneOf::Left(t) => Some((t.range.start.line, t.range.start.character)),
+                        OneOf::Right(_) => None,
+                    })
+                    .collect();
+                let mut sorted = starts.clone();
+                sorted.sort();
+                assert_eq!(starts, sorted);
+            }
+        }
+    }
+
+    #[test]
+    fn a_note_rename_that_cannot_name_the_file_fails_instead_of_half_applying() {
+        // Relative paths and no vault root: no file URI can be built.
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document("# A\n", Path::new("a.md")),
+            parse_document("[[a]]\n", Path::new("b.md")),
+        ]);
+        state.open_docs.insert(
+            "file:///b.md".to_string(),
+            crate::state::OpenDocument::new("file:///b.md", "b.md".into(), "[[a]]\n", 1),
+        );
+        let params = RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: "file:///b.md".parse().unwrap(),
+                },
+                position: Position::new(0, 2),
+            },
+            new_name: "z".to_string(),
+            work_done_progress_params: Default::default(),
+        };
+        let out = rename(params, &state);
+        assert!(out.is_err(), "{out:?}");
     }
 }
