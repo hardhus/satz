@@ -85,10 +85,19 @@ The backlink-count CodeLens's command is `satz.showBacklinks`, which the server 
 
 A background file watcher (`notify`, polling every 500ms with a further 200ms debounce) keeps the in-memory index in sync without needing to restart the server:
 
-- Creating, modifying, or deleting a `.md` file outside the editor (e.g. `git checkout`, another tool writing to the vault) triggers a re-index of just that file — unless it's currently open in the client, in which case the editor's own buffer stays authoritative.
+- Creating, modifying, or deleting a `.md` file outside the editor (e.g. `git checkout`, another tool writing to the vault) triggers a re-index of just that file — unless it's currently open in the client, in which case the editor's own buffer stays authoritative. Open documents are matched by their vault-relative, case-folded path (so a differently spelled path from the file system watcher still counts), and a briefly missing file (save-by-rename) never drops an open document from the index.
 - Editing and saving the vault root's `.satz.toml` on disk reloads the whole configuration live; the client is notified to refresh diagnostics afterward. A `.satz.toml` in a subfolder, or a file named `satz.toml`, is ignored.
 - If `.satz.toml` is invalid (at startup or after an edit) the editor shows a warning with the file name and line, and formatting (format-on-save, *Format Document*, the *Format entire vault* action and `satz.formatWorkspace`) is turned off until the file is valid again; see [When the file is invalid](configuration.md#when-the-file-is-invalid).
 - Whether diagnostics are then pushed or the client is asked to re-pull depends on whether the client advertised diagnostic pull support during `initialize`.
+
+## Document sync and closing
+
+- Positions follow the LSP definition: only `
+`, `
+` and `` end a line (U+2028, VT, FF and the like do not), and a column past the end of a line means the end of that line, never the next one.
+- A `didChange` carrying an older document version than the buffer already has is ignored.
+- Closing a document puts the index back to what is on disk (or drops the entry if there is no file), so unsaved edits that were discarded no longer shape links and diagnostics.
+- The other open documents' diagnostics are refreshed whenever an edit changes what they depend on: the note's title/aliases/name, the notes it links to (orphan status), or its headings and block ids (anchor warnings) — not on every keystroke.
 
 Two config fields control edit-triggered (as opposed to file-watcher-triggered) reparsing latency: `lsp.reparse_debounce_ms` and `lsp.reparse_max_wait_ms` — see [`docs/configuration.md`](configuration.md#lsp--server-wide-lsp-tuning).
 

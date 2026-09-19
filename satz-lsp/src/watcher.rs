@@ -129,29 +129,8 @@ async fn process_file_event(
             }
         }
     } else {
-        let rel_path = crate::state::SatzState::get_rel_path(path, Some(vault_root));
-        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-        let doc_id = satz_core::DocId::new(&rel_path_str);
-
-        if !path.exists() {
-            // File was deleted
-            let mut s = state.write().await;
-            s.index.remove_doc(&doc_id);
-            tracing::info!("Watcher: removed deleted document {}", doc_id);
-        } else {
-            // File created or modified
-            let is_open = {
-                let s = state.read().await;
-                s.open_docs.values().any(|d| d.path == path)
-            };
-
-            if !is_open && let Ok(content) = std::fs::read_to_string(path) {
-                let new_doc = satz_core::parse_document(&content, &rel_path);
-                let mut s = state.write().await;
-                s.index.replace_doc(new_doc);
-                tracing::info!("Watcher: re-indexed {}", doc_id);
-            }
-        }
+        let mut s = state.write().await;
+        apply_fs_change(&mut s, vault_root, path);
     }
 
     let (supports_pull, uris) = {
@@ -169,6 +148,39 @@ async fn process_file_event(
             crate::backend::publish_for(client, state, &uri).await;
         }
     }
+}
+
+/// What an on-disk change did to the index.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FsChange {
+    Removed,
+    Reindexed,
+    Skipped,
+}
+
+/// Brings the index in line with a created/modified/deleted markdown file.
+pub(crate) fn apply_fs_change(state: &mut SatzState, vault_root: &Path, path: &Path) -> FsChange {
+    let rel_path = crate::state::SatzState::get_rel_path(path, Some(vault_root));
+    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+    let doc_id = satz_core::DocId::new(&rel_path_str);
+
+    // An open document is owned by the editor's buffer, not by the file: it stays indexed when
+    // its file is briefly missing (save-by-rename) and is not overwritten by what is on disk.
+    if state.is_open_path(path) {
+        return FsChange::Skipped;
+    }
+    if !path.exists() {
+        state.index.remove_doc(&doc_id);
+        tracing::info!("Watcher: removed deleted document {}", doc_id);
+        return FsChange::Removed;
+    }
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let new_doc = satz_core::parse_document(&content, &rel_path);
+        state.index.replace_doc(new_doc);
+        tracing::info!("Watcher: re-indexed {}", doc_id);
+        return FsChange::Reindexed;
+    }
+    FsChange::Skipped
 }
 
 fn is_markdown_file(path: &Path) -> bool {
@@ -240,6 +252,7 @@ fn is_ignored_path(path: &Path, root: &Path) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -400,5 +413,135 @@ mod tests {
 
         assert!(matches!(outcome, ReloadOutcome::Failed(_)), "{outcome:?}");
         assert!(state.config_error.is_some());
+    }
+
+    // ---- on-disk changes vs. open documents ----
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "satz-watch-{}-{}-{}",
+            std::process::id(),
+            tag,
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state_in(dir: &Path) -> SatzState {
+        let mut state = SatzState::default();
+        state.vault_root = Some(dir.to_path_buf());
+        state.indexing_complete = true;
+        state
+    }
+
+    fn targets(state: &SatzState, id: &str) -> Option<Vec<String>> {
+        state
+            .index
+            .get_doc(&satz_core::DocId::new(id))
+            .map(|d| d.links.iter().map(|l| l.target_doc.clone()).collect())
+    }
+
+    #[test]
+    fn a_closed_note_is_reindexed_on_change_and_dropped_on_delete() {
+        let dir = temp_dir("closed");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "# A\n\n[[one]]\n").unwrap();
+        let mut state = state_in(&dir);
+
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &path),
+            FsChange::Reindexed
+        );
+        assert_eq!(targets(&state, "a.md"), Some(vec!["one".into()]));
+
+        std::fs::write(&path, "# A\n\n[[two]]\n").unwrap();
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &path),
+            FsChange::Reindexed
+        );
+        assert_eq!(targets(&state, "a.md"), Some(vec!["two".into()]));
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(apply_fs_change(&mut state, &dir, &path), FsChange::Removed);
+        assert_eq!(targets(&state, "a.md"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_open_note_is_never_dropped_when_its_file_briefly_disappears() {
+        // Editors that save by writing a temp file and renaming leave a window with no file.
+        let dir = temp_dir("open-missing");
+        let path = dir.join("a.md");
+        let mut state = state_in(&dir);
+        state.open_document("file:///a.md", "# A\n\n[[buffer]]\n", &path, 1);
+        assert!(!path.exists());
+
+        assert_eq!(apply_fs_change(&mut state, &dir, &path), FsChange::Skipped);
+
+        assert_eq!(targets(&state, "a.md"), Some(vec!["buffer".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_open_note_is_not_overwritten_by_its_file_on_disk() {
+        let dir = temp_dir("open-modify");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "# A\n\n[[disk]]\n").unwrap();
+        let mut state = state_in(&dir);
+        state.open_document("file:///a.md", "# A\n\n[[buffer]]\n", &path, 1);
+
+        assert_eq!(apply_fs_change(&mut state, &dir, &path), FsChange::Skipped);
+
+        assert_eq!(targets(&state, "a.md"), Some(vec!["buffer".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_differently_spelled_event_path_still_finds_the_open_note() {
+        // notify may report the path with other casing (Windows) than the client's URI gave.
+        let dir = temp_dir("open-case");
+        let path = dir.join("Notes.md");
+        std::fs::write(&path, "# N\n\n[[disk]]\n").unwrap();
+        let mut state = state_in(&dir);
+        state.open_document("file:///n.md", "# N\n\n[[buffer]]\n", &path, 1);
+
+        let event_path = dir.join("NOTES.md");
+        let expected = if event_path.exists() {
+            // Case-insensitive file system: the same file, spelled differently.
+            FsChange::Skipped
+        } else {
+            // Case-sensitive: a different path; only the open-note check is being probed, so
+            // stop here rather than assert on a file that does not exist.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        assert_eq!(apply_fs_change(&mut state, &dir, &event_path), expected);
+        assert_eq!(targets(&state, "Notes.md"), Some(vec!["buffer".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_path_matching_ignores_case_and_separator_spelling() {
+        let mut state = SatzState::default();
+        state.vault_root = Some(PathBuf::from("/Vault"));
+        state.open_document("file:///x", "# X\n", Path::new("/Vault/Sub/X.md"), 1);
+        assert!(state.is_open_path(Path::new("/Vault/Sub/X.md")));
+        assert!(state.is_open_path(Path::new("/vault/sub/x.md")));
+        assert!(!state.is_open_path(Path::new("/Vault/Sub/Y.md")));
+        assert!(!state.is_open_path(Path::new("/Vault/Other/X.md")));
+    }
+
+    #[test]
+    fn an_unreadable_path_is_skipped_without_touching_the_index() {
+        let dir = temp_dir("unreadable");
+        let path = dir.join("a.md");
+        std::fs::create_dir_all(&path).unwrap(); // exists, but is a directory
+        let mut state = state_in(&dir);
+        assert_eq!(apply_fs_change(&mut state, &dir, &path), FsChange::Skipped);
+        assert_eq!(targets(&state, "a.md"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

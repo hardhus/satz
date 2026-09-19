@@ -48,6 +48,23 @@ impl OpenDocument {
             pending_task: None,
         }
     }
+
+    /// Applies a `didChange` to the buffer. A change carrying an older version than the buffer
+    /// already has is stale (LSP versions only increase) and must not be applied; returns whether
+    /// it was.
+    pub fn apply_change_events(
+        &mut self,
+        version: i32,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) -> bool {
+        if version < self.version {
+            tracing::warn!(uri = %self.uri, version, current = self.version, "ignoring stale didChange");
+            return false;
+        }
+        crate::sync::apply_changes_to_rope(&mut self.rope, changes);
+        self.version = version;
+        true
+    }
 }
 
 /// Simple (non-LRU) cache mapping a document's content hash to its already-computed formatted
@@ -136,6 +153,34 @@ pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<Strin
     d.identity_keys()
 }
 
+/// Everything about a document that OTHER open documents' diagnostics depend on: the keys they can
+/// link by (title, aliases, stem), which notes it links to (their orphan status), and its headings
+/// and block ids (their anchor-missing warnings). When it changes, peers must be refreshed.
+pub fn peer_signature(d: &satz_core::Document) -> std::collections::HashSet<String> {
+    use satz_core::model::LinkKind;
+    let mut signature: std::collections::HashSet<String> = d
+        .identity_keys()
+        .into_iter()
+        .map(|k| format!("key:{k}"))
+        .collect();
+    for link in &d.links {
+        if matches!(
+            link.kind,
+            LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
+        ) && !link.target_doc.is_empty()
+            && !satz_core::model::link::is_external_target(&link.target_doc)
+        {
+            signature.insert(format!(
+                "link:{}",
+                satz_core::slug::fold_key(&link.target_doc)
+            ));
+        }
+    }
+    signature.extend(d.headings.iter().map(|h| format!("heading:{}", h.slug)));
+    signature.extend(d.blocks.iter().map(|b| format!("block:{}", b.id)));
+    signature
+}
+
 /// The text shown to the user (as a `window/showMessage` warning) when `.satz.toml` can't be
 /// used. `error` already names the file and, for TOML errors, the line and column; `fallback`
 /// says which settings are in effect meanwhile ("default" at startup, "the previous" on reload).
@@ -170,7 +215,10 @@ impl SatzState {
         );
 
         let docs = walk_vault(&vault_root)?;
-        tracing::debug!(doc_count = docs.len(), "initialize_index: walk_vault returned docs");
+        tracing::debug!(
+            doc_count = docs.len(),
+            "initialize_index: walk_vault returned docs"
+        );
         let index = Index::build(docs);
         let format_cache = FormatCache::new(config.lsp.format_cache_capacity);
 
@@ -185,6 +233,25 @@ impl SatzState {
             format_cache,
             indexing_complete: true,
         })
+    }
+
+    /// Whether `path` is the file of a currently open document.
+    ///
+    /// Compared by vault-relative, case-folded, `/`-separated path: the file system watcher and
+    /// the editor can spell the same file differently (drive letter case, `\\?\` prefix, letter
+    /// case on Windows/macOS), and mistaking an open, possibly unsaved document for a closed one
+    /// would replace its buffer contents in the index with the disk version.
+    pub fn is_open_path(&self, path: &Path) -> bool {
+        let root = self.vault_root.as_deref();
+        let key = |p: &Path| {
+            satz_core::slug::fold_key(
+                &Self::get_rel_path(p, root)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
+        };
+        let wanted = key(path);
+        self.open_docs.values().any(|d| key(&d.path) == wanted)
     }
 
     pub fn get_rel_path(path: &Path, root: Option<&Path>) -> PathBuf {
@@ -221,10 +288,10 @@ impl SatzState {
         let old_keys = self
             .index
             .get_doc(&doc_id)
-            .map(identity_keys)
+            .map(peer_signature)
             .unwrap_or_default();
         let new_doc = satz_core::parse_document(content, &rel_path);
-        let new_keys = identity_keys(&new_doc);
+        let new_keys = peer_signature(&new_doc);
 
         // A document not yet in the index has empty `old_keys`, which correctly counts as a
         // change: a note that was just created (e.g. via "Create note") can now resolve links
@@ -258,10 +325,10 @@ impl SatzState {
         let old_keys = self
             .index
             .get_doc(&doc_id)
-            .map(identity_keys)
+            .map(peer_signature)
             .unwrap_or_default();
         let new_doc = satz_core::parse_document(&content, &rel_path);
-        let new_keys = identity_keys(&new_doc);
+        let new_keys = peer_signature(&new_doc);
 
         if old_keys != new_keys {
             self.peers_dirty = true;
@@ -295,17 +362,51 @@ impl SatzState {
     }
 
     /// Closes and untracks an open document, aborting any background debounce tasks.
+    ///
+    /// The index held the buffer's text while the document was open; once closed, what counts is
+    /// the file, so the index is put back to the disk version (or the entry dropped if there is no
+    /// file). Unsaved edits that were thrown away must not keep shaping links and diagnostics.
     pub fn close_document(&mut self, uri: &str) {
         tracing::debug!(%uri, "close_document");
-        if let Some(mut doc) = self.open_docs.remove(uri)
-            && let Some(task) = doc.pending_task.take()
-        {
+        let Some(mut doc) = self.open_docs.remove(uri) else {
+            return;
+        };
+        if let Some(task) = doc.pending_task.take() {
             task.abort();
+        }
+
+        let rel_path = Self::get_rel_path(&doc.path, self.vault_root.as_deref());
+        let doc_id = satz_core::DocId::new(rel_path.to_string_lossy().replace('\\', "/"));
+        let old_signature = self
+            .index
+            .get_doc(&doc_id)
+            .map(peer_signature)
+            .unwrap_or_default();
+        let new_signature = match std::fs::read_to_string(&doc.path) {
+            Ok(content) => {
+                let disk_doc = satz_core::parse_document(&content, &rel_path);
+                let signature = peer_signature(&disk_doc);
+                self.index.replace_doc(disk_doc);
+                signature
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.index.remove_doc(&doc_id);
+                Default::default()
+            }
+            Err(e) => {
+                // Unreadable right now: keep what the index has rather than guess.
+                tracing::warn!(path = ?doc.path, "close_document: cannot read file: {e}");
+                return;
+            }
+        };
+        if old_signature != new_signature {
+            self.peers_dirty = true;
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -601,5 +702,213 @@ mod tests {
         assert!(msg.to_lowercase().contains("formatting"), "{msg}");
         let msg = config_error_message("x", "the previous");
         assert!(msg.contains("the previous settings"), "{msg}");
+    }
+
+    // ---- peers_dirty follows everything another open document's diagnostics depend on ----
+
+    /// An open `a.md` (`before`), settled, then re-parsed as `after`; returns `peers_dirty`.
+    fn dirty_after_edit(before: &str, after: &str) -> bool {
+        let mut state = SatzState::default();
+        state.open_document("file:///a.md", before, Path::new("a.md"), 1);
+        state.peers_dirty = false;
+        state.open_document("file:///a.md", after, Path::new("a.md"), 2);
+        state.peers_dirty
+    }
+
+    #[test]
+    fn a_new_or_removed_link_marks_peers_dirty() {
+        // The target's orphan status depends on who links to it.
+        assert!(dirty_after_edit("# A\n", "# A\n\nSee [[b]].\n"));
+        assert!(dirty_after_edit("# A\n\nSee [[b]].\n", "# A\n"));
+        assert!(dirty_after_edit(
+            "# A\n\nSee [[b]].\n",
+            "# A\n\nSee [[c]].\n"
+        ));
+        assert!(dirty_after_edit("# A\n", "# A\n\n![[img]]\n"));
+        assert!(dirty_after_edit("# A\n", "# A\n\n[t](b.md)\n"));
+    }
+
+    #[test]
+    fn headings_and_block_anchors_mark_peers_dirty() {
+        // Anchor diagnostics elsewhere (`[[a#Section]]`) depend on them.
+        assert!(dirty_after_edit("# A\n", "# A\n\n## Section\n"));
+        assert!(dirty_after_edit("# A\n\n## One\n", "# A\n\n## Two\n"));
+        assert!(dirty_after_edit("# A\n\ntext\n", "# A\n\ntext ^blk\n"));
+    }
+
+    #[test]
+    fn ordinary_edits_do_not_mark_peers_dirty() {
+        assert!(!dirty_after_edit(
+            "# A\n\nsome text\n",
+            "# A\n\nsome more text\n"
+        ));
+        assert!(!dirty_after_edit(
+            "# A\n\nSee [[b]].\n",
+            "# A\n\nSee [[b]] and words.\n"
+        ));
+        // Display text and link kind spelling are irrelevant to peers.
+        assert!(!dirty_after_edit(
+            "# A\n\nSee [[b]].\n",
+            "# A\n\nSee [[b|shown]].\n"
+        ));
+        // External links never involve another note.
+        assert!(!dirty_after_edit(
+            "# A\n",
+            "# A\n\n[m](mailto:a@b.c) [w](https://a.b)\n"
+        ));
+        // Same content parsed again.
+        assert!(!dirty_after_edit(
+            "# A\n\nSee [[b]].\n",
+            "# A\n\nSee [[b]].\n"
+        ));
+    }
+
+    #[test]
+    fn a_link_added_to_one_open_note_removes_the_orphan_hint_of_another() {
+        use crate::handlers::diagnostics::compute_diagnostics;
+        let mut state = SatzState::default();
+        state.open_document("file:///a.md", "# A\n", Path::new("a.md"), 1);
+        state.open_document("file:///b.md", "# B\n", Path::new("b.md"), 1);
+        let orphan = |state: &SatzState| {
+            let b = state.index.get_doc(&satz_core::DocId::new("b.md")).unwrap();
+            compute_diagnostics(b, &state.index, &state.config)
+                .iter()
+                .any(|d| {
+                    d.code
+                        == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                            "orphan-note".into(),
+                        ))
+                })
+        };
+        assert!(orphan(&state));
+        state.peers_dirty = false;
+        state.open_document("file:///a.md", "# A\n\nSee [[b]].\n", Path::new("a.md"), 2);
+        assert!(state.peers_dirty, "the peers must be told to refresh");
+        assert!(!orphan(&state));
+    }
+
+    // ---- closing a document returns the index to what is on disk ----
+
+    /// A fresh, empty directory under the system temp dir (removed by the caller).
+    pub(crate) fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "satz-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state_for(dir: &Path) -> SatzState {
+        let mut state = SatzState::default();
+        state.vault_root = Some(dir.to_path_buf());
+        state.indexing_complete = true;
+        state
+    }
+
+    fn link_targets(state: &SatzState, id: &str) -> Vec<String> {
+        state
+            .index
+            .get_doc(&satz_core::DocId::new(id))
+            .map(|d| d.links.iter().map(|l| l.target_doc.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn closing_an_unsaved_buffer_puts_the_disk_version_back_in_the_index() {
+        let dir = temp_dir("close-dirty");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "# A\n\ndisk [[x]]\n").unwrap();
+        let mut state = state_for(&dir);
+        state.open_document("file:///a.md", "# A\n\nunsaved [[y]]\n", &path, 1);
+        assert_eq!(link_targets(&state, "a.md"), vec!["y"]);
+
+        state.close_document("file:///a.md");
+
+        assert!(state.open_docs.is_empty());
+        assert_eq!(link_targets(&state, "a.md"), vec!["x"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_a_buffer_whose_file_does_not_exist_removes_it_from_the_index() {
+        let dir = temp_dir("close-missing");
+        let path = dir.join("never-saved.md");
+        let mut state = state_for(&dir);
+        state.open_document("file:///n.md", "# N\n", &path, 1);
+        assert!(
+            state
+                .index
+                .get_doc(&satz_core::DocId::new("never-saved.md"))
+                .is_some()
+        );
+
+        state.close_document("file:///n.md");
+
+        assert!(
+            state
+                .index
+                .get_doc(&satz_core::DocId::new("never-saved.md"))
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_marks_peers_dirty_only_when_what_they_see_changed() {
+        let dir = temp_dir("close-peers");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "# A\n\nSee [[b]].\n").unwrap();
+
+        // Buffer identical to disk: nothing changes for anyone.
+        let mut state = state_for(&dir);
+        state.open_document("file:///a.md", "# A\n\nSee [[b]].\n", &path, 1);
+        state.peers_dirty = false;
+        state.close_document("file:///a.md");
+        assert!(!state.peers_dirty);
+
+        // Unsaved edit changed a link and a heading: closing reverts them, peers must refresh.
+        let mut state = state_for(&dir);
+        state.open_document("file:///a.md", "# A\n\n## New\n\nSee [[c]].\n", &path, 1);
+        state.peers_dirty = false;
+        state.close_document("file:///a.md");
+        assert!(state.peers_dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_twice_or_closing_an_unknown_uri_is_harmless() {
+        let dir = temp_dir("close-twice");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "# A\n").unwrap();
+        let mut state = state_for(&dir);
+        state.open_document("file:///a.md", "# A\n", &path, 1);
+        state.close_document("file:///a.md");
+        state.close_document("file:///a.md");
+        state.close_document("file:///never-opened.md");
+        assert!(
+            state
+                .index
+                .get_doc(&satz_core::DocId::new("a.md"))
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_leaves_the_index_alone_on_close() {
+        let dir = temp_dir("close-unreadable");
+        // A directory where the file should be: exists, but read_to_string fails.
+        let path = dir.join("a.md");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut state = state_for(&dir);
+        state.open_document("file:///a.md", "# A\n\n[[kept]]\n", &path, 1);
+        state.close_document("file:///a.md");
+        assert_eq!(link_targets(&state, "a.md"), vec!["kept"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

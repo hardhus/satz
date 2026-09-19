@@ -369,8 +369,9 @@ impl LanguageServer for Backend {
                 return;
             };
 
-            crate::sync::apply_changes_to_rope(&mut open_doc.rope, params.content_changes);
-            open_doc.version = version;
+            if !open_doc.apply_change_events(version, params.content_changes) {
+                return;
+            }
 
             let now = std::time::Instant::now();
             let first = open_doc.first_change_at.get_or_insert(now);
@@ -475,11 +476,32 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let lsp_uri = params.text_document.uri;
         tracing::debug!(%uri, "did_close");
-        {
+        let (peers_dirty, supports_pull, other_uris) = {
             let mut state = self.state.write().await;
             state.close_document(&uri);
-        }
+            let dirty = state.peers_dirty;
+            state.peers_dirty = false;
+            (
+                dirty,
+                state.client_supports_pull_diagnostics,
+                state.open_docs.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
         self.client.publish_diagnostics(lsp_uri, vec![], None).await;
+
+        // Discarded unsaved edits change what the remaining documents' diagnostics should say.
+        if peers_dirty {
+            if supports_pull {
+                let _ = self
+                    .client
+                    .send_request::<WorkspaceDiagnosticRefresh>(())
+                    .await;
+            } else {
+                for other_uri in other_uris {
+                    publish_for(&self.client, &self.state, &other_uri).await;
+                }
+            }
+        }
     }
 
     async fn goto_definition(
