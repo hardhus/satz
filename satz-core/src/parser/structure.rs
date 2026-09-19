@@ -148,7 +148,7 @@ pub fn parse_structure(source: &str) -> StructureOutput {
                 paragraph_start = range.start;
             }
             Event::End(TagEnd::Paragraph) => {
-                if list_stack.is_empty() && blockquote_depth == 0 && !in_table {
+                if list_stack.is_empty() && blockquote_depth == 0 && !in_table && !in_footnote_def {
                     output
                         .paragraph_spans
                         .push(ByteRange::new(paragraph_start, range.end));
@@ -517,6 +517,18 @@ mod tests {
         let structure = parse_structure(md);
         assert_eq!(structure.rule_spans.len(), 1);
         assert!(structure.frontmatter_range.is_some());
+    }
+
+    #[test]
+    fn test_structure_paragraph_spans_exclude_footnote_definitions() {
+        let md = "Top paragraph.[^1]\n\n[^1]: Footnote body.\n\n    Second footnote paragraph.\n";
+        let out = parse_structure(md);
+        let spans: Vec<&str> = out
+            .paragraph_spans
+            .iter()
+            .map(|r| md[r.start..r.end].trim())
+            .collect();
+        assert_eq!(spans, vec!["Top paragraph.[^1]"]);
     }
 
     #[test]

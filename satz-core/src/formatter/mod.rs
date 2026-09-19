@@ -113,6 +113,44 @@ mod tests {
         }
     }
 
+    /// Same idempotency guarantee with paragraph wrapping ON, over every fixture plus paragraphs
+    /// built to provoke the wrap pass (block markers at wrap points, hard breaks, long links,
+    /// footnotes) at several widths.
+    #[test]
+    fn test_idempotent_with_wrap_enabled_over_fixtures_and_tricky_paragraphs() {
+        let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut sources: Vec<(String, String)> = collect_markdown_files(&fixtures_root)
+            .into_iter()
+            .map(|p| {
+                let s = std::fs::read_to_string(&p).unwrap();
+                (p.display().to_string(), s)
+            })
+            .collect();
+        for tricky in [
+            "aaaa bbbb cccc dddd - eeee 1. ffff # gggg > hhhh --- iiii\n",
+            "first\\\nsecond line that has to wrap around a narrow width\n",
+            "aaaa bbbb\\ cccc dddd eeee ffff gggg\n",
+            "x [[tlp/sozluk#Olgu Bağlamı|olgu bağlamlarının]] y z w v u t s r q p o n m\n",
+            "Body[^1] text goes on for a while here.\n\n[^1]: note text that is fairly long indeed.\n",
+        ] {
+            sources.push(("tricky".to_string(), tricky.to_string()));
+        }
+
+        for width in [20usize, 40, 80] {
+            let mut config = FormatterConfig::default();
+            config.wrap.enable = true;
+            config.line_width = width;
+            for (name, source) in &sources {
+                let pass1 = format_document(source, &config);
+                let pass2 = format_document(&pass1, &config);
+                assert_eq!(
+                    pass1, pass2,
+                    "not idempotent with wrap at width {width}: {name} ({source:?})"
+                );
+            }
+        }
+    }
+
     fn collect_markdown_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];

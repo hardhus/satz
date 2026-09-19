@@ -1,3 +1,5 @@
+use pulldown_cmark::{Event, Options, Parser, Tag};
+
 use crate::config::FormatterConfig;
 use crate::model::ByteRange;
 use crate::parser::inline_scan;
@@ -17,12 +19,13 @@ use crate::parser::structure::{self, StructureOutput};
 /// drop. Running after splicing avoids the conflict and also means wrapping is computed against
 /// the already-normalized emphasis/list/table text, not the pre-formatting source.
 ///
-/// Known, deliberate limitation: a paragraph containing an actual hard line break (trailing two
-/// spaces, or a backslash, before a newline) has that break silently collapsed like any other
-/// internal soft-wrap -- `line_pass::run`'s per-line `trim_end()` already destroys
-/// trailing-space hard breaks unconditionally today regardless of this pass, so there was no
-/// existing guarantee to preserve here; backslash hard breaks aren't specially preserved either,
-/// for the same not-worth-the-complexity reason (none of this vault's own content uses them).
+/// Backslash hard breaks (`text\` + newline) are preserved. Trailing-space hard breaks are NOT:
+/// `line_pass::run`'s per-line `trim_end()` destroys them unconditionally regardless of this pass
+/// (tracked separately), and by the time this pass runs the spaces are already gone.
+///
+/// A wrapped paragraph is only written back if re-parsing it still yields exactly one paragraph
+/// with the same words (`is_single_paragraph` / `same_words`), so a construct the wrapping rules
+/// don't anticipate leaves the paragraph as it was rather than corrupting it.
 pub fn wrap(source: &str, config: &FormatterConfig) -> String {
     if !config.wrap.enable {
         return source.to_string();
@@ -55,7 +58,10 @@ pub fn wrap(source: &str, config: &FormatterConfig) -> String {
             continue; // nothing to possibly wrap
         }
         let wrapped = render_wrapped(source, &tokens, config.line_width);
-        if wrapped != body {
+        // Safety net, independent of the rules in `render_wrapped`: a paragraph is only replaced
+        // if re-parsing the result still yields exactly one paragraph with the same words.
+        // Anything that slips past the rules keeps its original text instead of being corrupted.
+        if wrapped != body && same_words(body, &wrapped) && is_single_paragraph(&wrapped) {
             replacements.push((body_range, wrapped));
         }
     }
@@ -178,25 +184,130 @@ fn tokenize_with_width(
 /// its own is never split -- it simply becomes an over-length line by itself (the line-width
 /// limit is best-effort, not a hard guarantee, by explicit design: rescuing unbounded lines
 /// matters far more than shaving a few columns off one unavoidably-long link).
+///
+/// Three things override the width rule, because a newline is not always just whitespace in
+/// Markdown:
+/// - A backslash hard break in the original (`text\` + newline) is kept as a forced newline.
+/// - A newline is never placed right after a token ending in a literal backslash, which would
+///   silently turn it into a hard break.
+/// - A token that would start a different block if it began a line (`#`, `-`, `1.`, `>`, ...)
+///   stays on the previous line instead, even if that overruns the width.
 fn render_wrapped(source: &str, tokens: &[(ByteRange, usize)], line_width: usize) -> String {
     let mut out = String::new();
     let mut current_width = 0usize;
     for (idx, (range, width)) in tokens.iter().enumerate() {
+        let text = &source[range.start..range.end];
         if idx == 0 {
-            out.push_str(&source[range.start..range.end]);
+            out.push_str(text);
             current_width = *width;
             continue;
         }
-        if current_width + 1 + width > line_width {
+
+        let (prev_range, _) = tokens[idx - 1];
+        let prev = &source[prev_range.start..prev_range.end];
+        let prev_ends_in_backslash = ends_with_odd_backslashes(prev);
+        let hard_break = prev_ends_in_backslash
+            && (source[prev_range.end..].starts_with('\n')
+                || source[prev_range.end..].starts_with("\r\n"));
+
+        let overflows = current_width + 1 + width > line_width;
+        let may_break = !prev_ends_in_backslash && !would_start_block(text);
+        if hard_break || (overflows && may_break) {
             out.push('\n');
             current_width = *width;
         } else {
             out.push(' ');
             current_width += 1 + width;
         }
-        out.push_str(&source[range.start..range.end]);
+        out.push_str(text);
     }
     out
+}
+
+/// True if `token` ends in an odd number of backslashes, i.e. the last one is an unescaped `\`
+/// (an even count is just escaped backslashes, `\\`).
+fn ends_with_odd_backslashes(token: &str) -> bool {
+    token.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+}
+
+/// True if starting a line with `token` could make the line (and the paragraph around it) a
+/// different kind of block. Conservative on purpose: wrongly keeping a token on the previous
+/// line only overruns the width; wrongly moving it to a new line corrupts the document.
+fn would_start_block(token: &str) -> bool {
+    let only = |set: &[char]| !token.is_empty() && token.chars().all(|c| set.contains(&c));
+
+    // ATX heading: 1-6 `#` on their own.
+    if token.len() <= 6 && only(&['#']) {
+        return true;
+    }
+    // Bullet marker, thematic break, setext underline, table delimiter cell: runs made only of
+    // `- + * _ =` (and `:`/`|` for table delimiters).
+    if only(&['-', '+', '*', '_', '=']) || (only(&['-', ':', '|']) && token.contains('-')) {
+        return true;
+    }
+    // Ordered list marker. Only one starting at 1 can interrupt a paragraph, so `2024.` at a
+    // sentence end is left free to wrap.
+    if let Some(digits) = token.strip_suffix(['.', ')'])
+        && !digits.is_empty()
+        && digits.len() <= 9
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && digits.parse::<u32>() == Ok(1)
+    {
+        return true;
+    }
+    // Blockquote, code fence, math block, table row.
+    if token.starts_with('>')
+        || token.starts_with("```")
+        || token.starts_with("~~~")
+        || token.starts_with("$$")
+        || token.starts_with('|')
+    {
+        return true;
+    }
+    // HTML block start (`<div>`, `</p>`, `<!-- -->`, `<?php`).
+    if let Some(rest) = token.strip_prefix('<')
+        && rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'))
+    {
+        return true;
+    }
+    // Footnote / link-reference definition marker: `[^x]:` / `[x]:`.
+    token.starts_with('[') && token.ends_with("]:")
+}
+
+/// True if both texts have exactly the same whitespace-separated words in the same order.
+fn same_words(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
+/// True if `text`, parsed on its own, is exactly one plain paragraph -- no heading, list, quote,
+/// rule, code, table, or HTML block anywhere in it.
+fn is_single_paragraph(text: &str) -> bool {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+
+    let mut paragraphs = 0usize;
+    let mut depth = 0usize;
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(Tag::Paragraph) if depth == 0 => {
+                paragraphs += 1;
+                depth += 1;
+            }
+            // Any other block opening at the top level (heading, list, quote, table, code...).
+            Event::Start(_) if depth == 0 => return false,
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            Event::Rule | Event::Html(_) => return false,
+            _ => {}
+        }
+    }
+    paragraphs == 1
 }
 
 #[cfg(test)]
@@ -298,6 +409,134 @@ mod tests {
         let config = enabled_config(15);
         let out = wrapped(input, &config);
         assert!(out.contains("`cargo test --workspace --all-targets`"));
+    }
+
+    /// Tokens that, if wrapping left one at the START of a continuation line, would turn the
+    /// paragraph into a heading, list, quote, rule, code fence, HTML/table/definition block, ...
+    const BLOCK_STARTERS: &[&str] = &[
+        "#", "###", "-", "+", "*", "1.", "1)", ">", ">>", "---", "===", "***", "___", "```", "~~~",
+        "<div>", "</p>", "|", "|---|", ":--", "[^x]:", "[ref]:", "$$",
+    ];
+
+    #[test]
+    fn test_wrap_never_starts_a_line_with_a_block_marker() {
+        for marker in BLOCK_STARTERS {
+            // "aaaa bbbb cccc dddd" is exactly 19 columns, so a naive greedy wrap at width 19
+            // would put the marker at the start of the second line.
+            let input = format!("aaaa bbbb cccc dddd {marker} eeee ffff\n");
+            let out = wrapped(&input, &enabled_config(19));
+            assert!(
+                out.trim_end().contains('\n'),
+                "expected the paragraph to be wrapped somewhere for {marker:?}: {out:?}"
+            );
+            for line in out.lines().skip(1) {
+                assert!(
+                    !line.starts_with(marker),
+                    "{marker:?} landed at the start of a line: {out:?}"
+                );
+            }
+            assert_eq!(
+                out.split_whitespace().collect::<Vec<_>>(),
+                input.split_whitespace().collect::<Vec<_>>(),
+                "content changed for {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_backslash_hard_break_is_preserved() {
+        let input = "first line\\\nsecond line is long enough that it has to wrap around\n";
+        let out = wrapped(input, &enabled_config(20));
+        assert!(
+            out.starts_with("first line\\\n"),
+            "hard break lost: {out:?}"
+        );
+        assert!(
+            !out.contains("\\ "),
+            "backslash left dangling in text: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_wrap_never_turns_a_literal_backslash_into_a_hard_break() {
+        // `bbbb\` followed by a SPACE is a literal backslash; wrapping must not put a newline
+        // right after it, because backslash + newline IS a hard break.
+        let input = "aaaa bbbb\\ cccc dddd eeee\n";
+        let out = wrapped(input, &enabled_config(9));
+        assert!(
+            !out.contains("\\\n"),
+            "literal backslash became a hard break: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_single_paragraph_classifies_block_shapes() {
+        for ok in [
+            "plain words",
+            "two\nlines of one paragraph",
+            "with **emphasis\nacross** lines and [[a link|alias]]",
+            "inline `code` and <b>html</b> and a footnote[^1]",
+            "hard\\\nbreak stays a paragraph",
+        ] {
+            assert!(is_single_paragraph(ok), "should be one paragraph: {ok:?}");
+        }
+        for bad in [
+            "a\n# heading",
+            "a\n- item",
+            "a\n1. item",
+            "a\n> quote",
+            "a\n---",
+            "a\n===",
+            "a\n```\ncode\n```",
+            "a\n\nb",
+            "a\n<div>x</div>",
+            "| a | b |\n|---|---|\n| 1 | 2 |",
+            "",
+        ] {
+            assert!(
+                !is_single_paragraph(bad),
+                "should NOT be one paragraph: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_same_words_ignores_whitespace_but_not_content() {
+        assert!(same_words("a b  c", "a\nb c"));
+        assert!(!same_words("a b c", "a bc"));
+        assert!(!same_words("a b c", "a b"));
+    }
+
+    #[test]
+    fn test_every_token_that_actually_breaks_a_paragraph_is_guarded() {
+        // Cross-checks the hand-written `would_start_block` rules against the real parser: any
+        // token that, at the start of a continuation line, makes pulldown-cmark stop treating
+        // the text as a single paragraph MUST be guarded.
+        let extras = [
+            "word", "2024.", "2.", "10)", "1.5", "01.", "#tag", "#", "#######", ">=", "<b>", "<3",
+            "**bold**", "*em*", "[x](y)", "![i](u)", ":", "|a|", "---x", "-x", "+x", "====", "~",
+            "~~x~~", "1986.", "*", "+", "-", "---", "***", "___", "\\#", "a:b",
+        ];
+        for token in BLOCK_STARTERS.iter().chain(extras.iter()) {
+            let breaks = !is_single_paragraph(&format!("aaaa\n{token} bbbb"));
+            if breaks {
+                assert!(
+                    would_start_block(token),
+                    "{token:?} turns a paragraph into another block but is not guarded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_footnote_definition_paragraph_is_not_wrapped() {
+        let def = "[^1]: A long footnote definition text that would certainly exceed the width.";
+        let input = format!("Body text.[^1]\n\n{def}\n");
+        let out = wrapped(&input, &enabled_config(20));
+        assert!(
+            out.contains(def),
+            "footnote definition was reflowed: {out:?}"
+        );
     }
 
     #[test]

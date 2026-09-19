@@ -192,10 +192,18 @@ this isn't configurable.
 | `enable` | bool | `false` | Turns paragraph wrapping on. |
 | `link_width_mode` | `"raw"` \| `"display"` | `"raw"` | How a wikilink's/link's width counts against `line_width`. `"raw"`: the full source text (`[[path#heading\|display]]`) counts, so the line you see in the editor never exceeds the limit. `"display"`: only the alias/display text (or the bare target if there's no alias) counts — matching what a rendered viewer would actually show, at the cost of the raw `.md` line sometimes running longer than `line_width`. |
 
-Known limitation: an intentional hard line break (trailing two spaces, or a backslash, before a
-newline) is collapsed like any other soft-wrap inside a reflowed paragraph — `line_pass`'s
-trailing-whitespace trim already discarded the two-space form regardless of this setting, so
-there was no existing guarantee here to preserve.
+Wrapping never changes what a paragraph *is*:
+- A token that would start a different block if it began a line (`#`, `-`, `+`, `*`, `1.`, `>`,
+  `---`, `===`, a code fence, an HTML tag, a `|` table row, `[^x]:`, `$$`) stays on the previous
+  line even when that overruns `line_width`.
+- A backslash hard break (`text\` followed by a newline) is kept, and a literal backslash is never
+  followed by a newline (which would turn it into a hard break).
+- Footnote definitions are not reflowed.
+- As a final check, a paragraph is only rewritten if re-parsing the wrapped text still gives
+  exactly one paragraph with the same words; otherwise it is left as you wrote it.
+
+Known limitation: a trailing-two-spaces hard break is *not* preserved — `line_pass`'s
+trailing-whitespace trim discards it regardless of this setting.
 
 ## See also
 
