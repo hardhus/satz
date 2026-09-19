@@ -141,7 +141,7 @@ This is exactly the built-in default configuration, spelled out (a test keeps it
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `preview_lines` | integer | `8` | Maximum number of lines shown in a hover preview before it's truncated with a "… (N satır daha)" ("… (N more lines)") footer. |
+| `preview_lines` | integer | `8` | Maximum number of lines shown in a hover preview before it's truncated with a "… (N more lines)" footer. |
 
 ### `[diagnostics]`
 

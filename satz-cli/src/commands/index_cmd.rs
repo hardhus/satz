@@ -1,5 +1,4 @@
 use anyhow::Result;
-use satz_core::{Index, walk_vault};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -12,9 +11,8 @@ pub struct IndexArgs {
 
 pub fn run(args: IndexArgs) -> Result<()> {
     let t0 = Instant::now();
-    let docs = walk_vault(&args.path)?;
-    let doc_count = docs.len();
-    let index = Index::build(docs);
+    let index = super::load_index(&args.path)?;
+    let doc_count = index.doc_count();
     let elapsed = t0.elapsed();
     let stats = index.stats();
 

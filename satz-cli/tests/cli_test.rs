@@ -130,7 +130,9 @@ fn test_satz_list_broken_command() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Fixtures contain broken links to non-existent notes
-    assert!(stdout.contains("— dosya bulunamadı") || stdout.contains("— dosya var, başlık yok"));
+    assert!(
+        stdout.contains("— file not found") || stdout.contains("— file exists, heading not found")
+    );
 }
 
 #[test]
@@ -831,4 +833,231 @@ fn fmt_write_keeps_the_byte_order_mark() {
     expected.extend_from_slice(b"---\ntitle: T\n---\n\n# Title\n\ntext\n");
     assert_eq!(after, expected);
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ---- `satz list`: filters combine with `--broken`, reasons are English ----
+
+fn sorted_lines(output: &std::process::Output) -> Vec<String> {
+    let mut lines: Vec<String> = out(output).lines().map(str::to_string).collect();
+    lines.sort();
+    lines
+}
+
+fn broken_vault(tag: &str) -> TempDir {
+    let v = TempDir::new(tag);
+    v.write("a.md", "# A\n\n#x [[missing]] [[b#Nope]]\n");
+    v.write("b.md", "# B\n\n[[missing2]]\n");
+    v.write("c.md", "# C\n\n#x #y [[a]]\n");
+    v
+}
+
+#[test]
+fn list_broken_names_each_problem_in_english() {
+    let v = broken_vault("broken_en");
+    let o = satz(&["list", "--vault", v.str(), "--broken"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        sorted_lines(&o),
+        vec![
+            "a.md:3\t[[b#Nope]]\t— file exists, heading not found".to_string(),
+            "a.md:3\t[[missing]]\t— file not found".to_string(),
+            "b.md:3\t[[missing2]]\t— file not found".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn list_broken_honours_tag_and_orphan_filters() {
+    let v = broken_vault("broken_filters");
+
+    // Only notes tagged x: a.md (c.md has no broken links).
+    let tagged = sorted_lines(&satz(&["list", "-v", v.str(), "--broken", "--tag", "x"]));
+    assert_eq!(tagged.len(), 2, "{tagged:?}");
+    assert!(tagged.iter().all(|l| l.starts_with("a.md:")), "{tagged:?}");
+
+    // Intersection of tags: only c.md has both x and y, and it has nothing broken.
+    let both = satz(&[
+        "list",
+        "-v",
+        v.str(),
+        "--broken",
+        "--tag",
+        "x",
+        "--tag",
+        "y",
+    ]);
+    assert!(both.status.success());
+    assert!(sorted_lines(&both).is_empty());
+
+    // Orphans: only c.md (nothing links to it) -- again nothing broken there.
+    let orphans = satz(&["list", "-v", v.str(), "--broken", "--orphans"]);
+    assert!(orphans.status.success());
+    assert!(sorted_lines(&orphans).is_empty());
+
+    // A tag nobody has.
+    let none = satz(&["list", "-v", v.str(), "--broken", "--tag", "nope"]);
+    assert!(none.status.success());
+    assert!(sorted_lines(&none).is_empty());
+}
+
+// ---- every vault command reports a bad vault path the same way ----
+
+#[test]
+fn every_vault_command_rejects_a_missing_or_non_directory_vault_alike() {
+    let dir = TempDir::new("badvault");
+    dir.write("plain.md", "# x\n");
+    let missing = dir.path().join("does-not-exist");
+    let missing = missing.to_str().unwrap();
+    let file = dir.path().join("plain.md");
+    let file = file.to_str().unwrap();
+
+    let commands: Vec<Vec<&str>> = vec![
+        vec!["index", "PATH"],
+        vec!["stats", "-v", "PATH"],
+        vec!["list", "-v", "PATH"],
+        vec!["resolve", "-v", "PATH", "x"],
+        vec!["graph", "-v", "PATH"],
+        vec!["fmt", "PATH", "--check"],
+    ];
+    for template in &commands {
+        for (bad, expected) in [
+            (missing, "vault path does not exist"),
+            (file, "is not a directory"),
+        ] {
+            let args: Vec<&str> = template
+                .iter()
+                .map(|a| if *a == "PATH" { bad } else { *a })
+                .collect();
+            let o = satz(&args);
+            assert_eq!(o.status.code(), Some(1), "{args:?}: {}", err(&o));
+            assert!(err(&o).contains(expected), "{args:?}: {}", err(&o));
+        }
+    }
+}
+
+// ---- edge cases of the query commands ----
+
+fn small_vault(tag: &str) -> TempDir {
+    let v = TempDir::new(tag);
+    v.write("a.md", "# A\n\n#x #y [[b]]\n");
+    v.write("b.md", "# B\n\n#x text\n");
+    v.write("c.md", "# C\n\nlonely note\n");
+    v
+}
+
+#[test]
+fn list_tag_filters_intersect_and_unknown_tags_give_nothing() {
+    let v = small_vault("list_tags");
+    assert_eq!(
+        sorted_lines(&satz(&["list", "-v", v.str(), "--tag", "x"])),
+        vec!["a.md", "b.md"]
+    );
+    assert_eq!(
+        sorted_lines(&satz(&["list", "-v", v.str(), "--tag", "x", "--tag", "y"])),
+        vec!["a.md"]
+    );
+    let none = satz(&["list", "-v", v.str(), "--tag", "nope"]);
+    assert!(none.status.success());
+    assert!(sorted_lines(&none).is_empty());
+}
+
+#[test]
+fn list_orphans_shows_notes_nobody_links_to() {
+    let v = small_vault("list_orphans");
+    // a.md links to b.md; nothing links to a.md or c.md.
+    assert_eq!(
+        sorted_lines(&satz(&["list", "-v", v.str(), "--orphans"])),
+        vec!["a.md", "c.md"]
+    );
+    assert_eq!(
+        sorted_lines(&satz(&["list", "-v", v.str(), "--orphans", "--tag", "x"])),
+        vec!["a.md"]
+    );
+}
+
+#[test]
+fn graph_writes_dot_to_a_file_and_json_to_stdout() {
+    let v = small_vault("graph_out");
+    let target = v.path().join("graph.dot");
+    let o = satz(&[
+        "graph",
+        "-v",
+        v.str(),
+        "-f",
+        "dot",
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).is_empty(),
+        "nothing on stdout when writing to a file"
+    );
+    assert!(err(&o).contains("3 nodes"), "{}", err(&o));
+    let dot = std::fs::read_to_string(&target).unwrap();
+    assert!(dot.starts_with("digraph"), "{dot}");
+    assert!(dot.contains("->"), "{dot}");
+
+    let json = satz(&["graph", "-v", v.str(), "-f", "json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out(&json)).unwrap();
+    assert_eq!(parsed["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!(parsed["edges"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn graph_rejects_an_unknown_format() {
+    let v = small_vault("graph_bad_format");
+    let o = satz(&["graph", "-v", v.str(), "-f", "svg"]);
+    assert_eq!(o.status.code(), Some(2), "clap usage errors exit with 2");
+    assert!(err(&o).contains("svg"), "{}", err(&o));
+}
+
+#[test]
+fn stats_text_output_lists_the_counts() {
+    let v = small_vault("stats_text");
+    let o = satz(&["stats", "-v", v.str()]);
+    assert!(o.status.success());
+    let text = out(&o);
+    for line in [
+        "  Documents:    3",
+        "  Total links:  1",
+        "  Broken links: 0",
+        "  Unique tags:  2",
+        "  Orphan docs:  2",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+}
+
+#[test]
+fn resolve_finds_a_note_and_fails_cleanly_for_a_missing_one() {
+    let v = small_vault("resolve_edge");
+    let found = satz(&["resolve", "-v", v.str(), "[[b]]"]);
+    assert!(found.status.success());
+    assert!(out(&found).trim().ends_with("b.md"), "{}", out(&found));
+    let bare = satz(&["resolve", "-v", v.str(), "b"]);
+    assert_eq!(out(&bare), out(&found));
+    let missing = satz(&["resolve", "-v", v.str(), "[[nothing-here]]"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(err(&missing).contains("not found"), "{}", err(&missing));
+}
+
+#[test]
+fn fmt_follows_the_vault_configuration() {
+    let v = TempDir::new("fmt_config_driven");
+    v.write(".satz.toml", "[formatter.lists]\nmarker = \"*\"\n");
+    v.write("n.md", "- a\n- b\n");
+    let o = satz(&["fmt", v.str()]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        std::fs::read_to_string(v.path().join("n.md")).unwrap(),
+        "* a\n* b\n"
+    );
+    // And with the setting turned off nothing is rewritten.
+    v.write(".satz.toml", "[formatter]\nenabled = false\n");
+    v.write("n.md", "- a\n-   b  \n");
+    let before = snapshot(v.path());
+    let off = satz(&["fmt", v.str()]);
+    assert!(off.status.success());
+    assert_eq!(snapshot(v.path()), before);
 }

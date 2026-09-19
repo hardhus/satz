@@ -1,5 +1,7 @@
 pub mod commands;
 
+use std::process::ExitCode;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -33,15 +35,19 @@ pub enum Commands {
     Stats(commands::stats_cmd::StatsArgs),
 }
 
-/// Runs the parsed CLI command.
-pub fn run(cli: Cli) -> Result<()> {
+/// Runs the parsed CLI command and returns the process exit code.
+pub fn run(cli: Cli) -> Result<ExitCode> {
+    let ok = ExitCode::SUCCESS;
     match cli.command {
-        Commands::Daily(args) => commands::daily_cmd::run(args),
-        Commands::Fmt(args) => commands::fmt_cmd::run(args),
-        Commands::Graph(args) => commands::graph_cmd::run(args),
-        Commands::Index(args) => commands::index_cmd::run(args),
-        Commands::List(args) => commands::list_cmd::run(args),
-        Commands::Resolve(args) => commands::resolve_cmd::run(args),
-        Commands::Stats(args) => commands::stats_cmd::run(args),
+        Commands::Daily(args) => commands::daily_cmd::run(args).map(|()| ok),
+        Commands::Fmt(args) => commands::fmt_cmd::run(args).map(|outcome| match outcome {
+            commands::fmt_cmd::Outcome::Clean => ok,
+            commands::fmt_cmd::Outcome::NeedsFormatting => ExitCode::from(1),
+        }),
+        Commands::Graph(args) => commands::graph_cmd::run(args).map(|()| ok),
+        Commands::Index(args) => commands::index_cmd::run(args).map(|()| ok),
+        Commands::List(args) => commands::list_cmd::run(args).map(|()| ok),
+        Commands::Resolve(args) => commands::resolve_cmd::run(args).map(|()| ok),
+        Commands::Stats(args) => commands::stats_cmd::run(args).map(|()| ok),
     }
 }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::ValueEnum;
-use satz_core::{Index, VaultGraph, walk_vault};
+use satz_core::VaultGraph;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum GraphFormat {
@@ -26,8 +26,7 @@ pub struct GraphArgs {
 }
 
 pub fn run(args: GraphArgs) -> Result<()> {
-    let docs = walk_vault(&args.vault)?;
-    let index = Index::build(docs);
+    let index = super::load_index(&args.vault)?;
     let graph = VaultGraph::build(&index);
 
     let output_str = match args.format {

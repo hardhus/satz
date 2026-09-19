@@ -95,7 +95,7 @@ fn format_hover_content(
     let mut value = format!("# {}\n\n", target_doc.title);
 
     if let Some(missing) = missing_anchor {
-        value.push_str(&format!("⚠ '{}' bulunamadı\n\n", missing));
+        value.push_str(&format!("⚠ '{}' not found\n\n", missing));
     }
 
     let source = target_doc.line_index.source();
@@ -131,21 +131,36 @@ fn format_hover_content(
     let trimmed = slice.trim();
     if !trimmed.is_empty() {
         let all_lines: Vec<&str> = trimmed.lines().collect();
-        if all_lines.len() <= preview_lines_limit {
-            value.push_str("```markdown\n");
-            value.push_str(&all_lines.join("\n"));
-            value.push_str("\n```");
-        } else {
-            let preview = all_lines[..preview_lines_limit].join("\n");
-            let remaining = all_lines.len() - preview_lines_limit;
-            value.push_str("```markdown\n");
-            value.push_str(&preview);
-            value.push_str("\n```\n");
-            value.push_str(&format!("… ({} satır daha)", remaining));
+        let shown = &all_lines[..all_lines.len().min(preview_lines_limit)];
+        let preview = shown.join("\n");
+        // The preview is Markdown that may itself contain code fences: fence it with a longer one
+        // than any backtick run inside, or the first ``` in the text would close it early.
+        let fence = "`".repeat((longest_backtick_run(&preview) + 1).max(3));
+        value.push_str(&format!("{fence}markdown\n{preview}\n{fence}"));
+        if all_lines.len() > preview_lines_limit {
+            value.push_str(&format!(
+                "\n… ({} more lines)",
+                all_lines.len() - preview_lines_limit
+            ));
         }
     }
 
     value
+}
+
+/// Length of the longest run of consecutive backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for c in text.chars() {
+        if c == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 /// The paragraph around `start..end`: the run of non-blank lines containing it. A blank line is
@@ -472,7 +487,7 @@ mod tests {
 
         let hover = hover(params, &state).expect("Hover should return Some");
         if let HoverContents::Markup(m) = hover.contents {
-            assert!(m.value.contains("⚠ 'Olmayan Başlık' bulunamadı"));
+            assert!(m.value.contains("⚠ 'Olmayan Başlık' not found"));
             assert!(m.value.contains("Genel içerik."));
         } else {
             panic!("Expected markup content");
@@ -533,7 +548,7 @@ mod tests {
         let hover = hover(params, &state).expect("Hover should return Some");
         if let HoverContents::Markup(m) = hover.contents {
             assert!(m.value.contains("Satır 1\nSatır 2\nSatır 3\nSatır 4"));
-            assert!(m.value.contains("… (8 satır daha)"));
+            assert!(m.value.contains("… (8 more lines)"));
         } else {
             panic!("Expected markup content");
         }
@@ -612,5 +627,68 @@ mod tests {
             &["line one", "line two"],
             &["Prev", "Next"],
         );
+    }
+
+    // ---- the hover text is English and its code fence cannot be closed from inside ----
+
+    fn preview_of(source: &str, limit: usize) -> String {
+        let target = parse_document(source, Path::new("t.md"));
+        let link = satz_core::Link::new(
+            satz_core::LinkKind::WikiLink,
+            "t".to_string(),
+            None,
+            None,
+            None,
+            satz_core::ByteRange::new(0, 0),
+        );
+        format_hover_content(&target, &link, None, limit)
+    }
+
+    #[test]
+    fn a_preview_containing_a_fence_is_wrapped_in_a_longer_one() {
+        let with_three = "# T\n\n```rust\ncode\n```\n\nafter\n";
+        let out = preview_of(with_three, 50);
+        assert!(out.contains("````markdown\n"), "{out}");
+        assert!(out.ends_with("\n````"), "{out}");
+        assert!(out.contains("```rust"), "{out}");
+
+        let with_four = "# T\n\n````\ninner ```\n````\n";
+        let out = preview_of(with_four, 50);
+        assert!(out.contains("`````markdown\n"), "{out}");
+        assert!(out.ends_with("\n`````"), "{out}");
+    }
+
+    #[test]
+    fn a_preview_without_backticks_keeps_the_plain_three_backtick_fence() {
+        let out = preview_of("# T\n\nplain text\nmore `inline` code\n", 50);
+        assert!(out.contains("```markdown\n"), "{out}");
+        assert!(out.ends_with("\n```"), "{out}");
+        assert!(!out.contains("````"), "{out}");
+    }
+
+    #[test]
+    fn a_truncated_preview_still_counts_the_hidden_lines_and_closes_its_fence() {
+        let body: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let out = preview_of(&format!("# T\n\n{body}"), 5);
+        assert!(out.contains("… (7 more lines)"), "{out}");
+        assert!(out.contains("line 5\n```\n"), "{out}");
+        assert!(!out.contains("line 6"), "{out}");
+        assert!(!out.contains("satır"), "{out}");
+    }
+
+    #[test]
+    fn a_missing_anchor_warning_is_english() {
+        let target = parse_document("# T\n\ntext\n", Path::new("t.md"));
+        let link = satz_core::Link::new(
+            satz_core::LinkKind::WikiLink,
+            "t".to_string(),
+            Some("Nope".to_string()),
+            None,
+            None,
+            satz_core::ByteRange::new(0, 0),
+        );
+        let out = format_hover_content(&target, &link, Some("Nope"), 8);
+        assert!(out.contains("⚠ 'Nope' not found"), "{out}");
+        assert!(!out.contains("bulunamadı"), "{out}");
     }
 }

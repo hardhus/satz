@@ -1,5 +1,4 @@
 use anyhow::Result;
-use satz_core::{Index, walk_vault};
 use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
@@ -14,8 +13,7 @@ pub struct StatsArgs {
 }
 
 pub fn run(args: StatsArgs) -> Result<()> {
-    let docs = walk_vault(&args.vault)?;
-    let index = Index::build(docs);
+    let index = super::load_index(&args.vault)?;
     let stats = index.stats();
 
     if args.json {

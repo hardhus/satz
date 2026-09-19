@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
+/// Validates the vault directory and indexes every note in it: the loading step shared by `index`,
+/// `stats`, `list`, `resolve` and `graph`, so all of them report a bad vault path the same way.
+pub(crate) fn load_index(path: &Path) -> Result<satz_core::Index> {
+    let root = vault_dir(path)?;
+    Ok(satz_core::Index::build(satz_core::walk_vault(&root)?))
+}
+
 /// Resolves the `path` argument of a command that works on a vault (`fmt`, `daily`).
 ///
 /// The vault root must be an existing DIRECTORY: `.satz.toml` is looked up inside it, so a file

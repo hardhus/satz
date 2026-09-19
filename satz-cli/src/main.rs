@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

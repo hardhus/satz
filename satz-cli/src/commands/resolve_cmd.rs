@@ -1,5 +1,4 @@
 use anyhow::Result;
-use satz_core::{Index, walk_vault};
 use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
@@ -13,8 +12,7 @@ pub struct ResolveArgs {
 }
 
 pub fn run(args: ResolveArgs) -> Result<()> {
-    let docs = walk_vault(&args.vault)?;
-    let index = Index::build(docs);
+    let index = super::load_index(&args.vault)?;
 
     // Strip [[ and ]] if present
     let raw = args
@@ -35,7 +33,7 @@ pub fn run(args: ResolveArgs) -> Result<()> {
     };
 
     let doc = index.get_doc(doc_id).expect("doc must exist in index");
-    let abs_path = args.vault.join(&doc.path);
+    let path = args.vault.join(&doc.path);
 
     if let Some(heading_text) = heading {
         if let Some(h) = doc
@@ -44,12 +42,12 @@ pub fn run(args: ResolveArgs) -> Result<()> {
             .find(|h| h.slug == heading_text || h.text.eq_ignore_ascii_case(heading_text))
         {
             let pos = doc.line_index.byte_to_position(h.range.start);
-            println!("{}:{}", abs_path.display(), pos.line + 1);
+            println!("{}:{}", path.display(), pos.line + 1);
         } else {
-            println!("{}", abs_path.display());
+            println!("{}", path.display());
         }
     } else {
-        println!("{}", abs_path.display());
+        println!("{}", path.display());
     }
 
     Ok(())

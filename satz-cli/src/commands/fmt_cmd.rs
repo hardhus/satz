@@ -23,6 +23,15 @@ pub struct FmtArgs {
     pub write: bool,
 }
 
+/// How a `fmt` run ended, apart from errors: `--check` found files that need formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Nothing to report (formatted, or everything was already clean).
+    Clean,
+    /// `--check` found files that would change.
+    NeedsFormatting,
+}
+
 struct FileResult {
     rel_path: PathBuf,
     /// The formatted text differs from what is on disk.
@@ -31,7 +40,7 @@ struct FileResult {
     write_error: Option<String>,
 }
 
-pub fn run(args: FmtArgs) -> Result<()> {
+pub fn run(args: FmtArgs) -> Result<Outcome> {
     let vault_root = super::vault_dir(&args.path)?;
 
     // A config that exists but can't be used must stop the run: formatting with defaults would
@@ -40,7 +49,7 @@ pub fn run(args: FmtArgs) -> Result<()> {
 
     if !config.formatter.enabled {
         println!("Formatter is disabled (formatter.enabled = false in .satz.toml); nothing to do.");
-        return Ok(());
+        return Ok(Outcome::Clean);
     }
 
     let t0 = Instant::now();
@@ -107,7 +116,7 @@ pub fn run(args: FmtArgs) -> Result<()> {
                 clean_count,
                 elapsed.as_millis()
             );
-            std::process::exit(1);
+            return Ok(Outcome::NeedsFormatting);
         }
 
         println!(
@@ -136,5 +145,65 @@ pub fn run(args: FmtArgs) -> Result<()> {
         bail!("{} file(s) could not be written", failures.len());
     }
 
-    Ok(())
+    Ok(Outcome::Clean)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vault(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("satz_fmt_unit_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (name, text) in files {
+            fs::write(dir.join(name), text).unwrap();
+        }
+        dir
+    }
+
+    fn args(path: &std::path::Path, check: bool) -> FmtArgs {
+        FmtArgs {
+            path: path.to_path_buf(),
+            check,
+            write: false,
+        }
+    }
+
+    #[test]
+    fn check_reports_dirty_files_without_touching_them() {
+        let dir = vault("dirty", &[("n.md", "# T  \n\ntext\n")]);
+        let outcome = run(args(&dir, true)).unwrap();
+        assert_eq!(outcome, Outcome::NeedsFormatting);
+        assert_eq!(
+            fs::read_to_string(dir.join("n.md")).unwrap(),
+            "# T  \n\ntext\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_on_clean_files_is_clean() {
+        let dir = vault("clean", &[("n.md", "# T\n\ntext\n")]);
+        assert_eq!(run(args(&dir, true)).unwrap(), Outcome::Clean);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writing_formats_and_reports_clean() {
+        let dir = vault("write", &[("n.md", "# T  \n\ntext\n")]);
+        assert_eq!(run(args(&dir, false)).unwrap(), Outcome::Clean);
+        assert_eq!(
+            fs::read_to_string(dir.join("n.md")).unwrap(),
+            "# T\n\ntext\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_vault_is_clean() {
+        let dir = vault("empty", &[]);
+        assert_eq!(run(args(&dir, true)).unwrap(), Outcome::Clean);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

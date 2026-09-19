@@ -9,7 +9,6 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 
 /// In-memory representation of an open text document with a Rope buffer.
-#[allow(dead_code)]
 pub struct OpenDocument {
     pub uri: String,
     pub path: PathBuf,
@@ -30,7 +29,6 @@ impl std::fmt::Debug for OpenDocument {
     }
 }
 
-#[allow(dead_code)]
 impl OpenDocument {
     pub fn new(
         uri: impl Into<String>,
@@ -335,30 +333,6 @@ impl SatzState {
         }
 
         self.index.replace_doc(new_doc);
-    }
-
-    /// Re-parses a single document upon changes (full text) and updates the index.
-    #[allow(dead_code)]
-    pub fn reparse_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
-        self.open_document(uri, content, path, version);
-    }
-
-    /// Applies incremental changes to an open document and updates the index.
-    #[allow(dead_code)]
-    pub fn apply_changes(
-        &mut self,
-        uri: &str,
-        changes: Vec<TextDocumentContentChangeEvent>,
-        version: i32,
-    ) {
-        let Some(open_doc) = self.open_docs.get_mut(uri) else {
-            return;
-        };
-
-        crate::sync::apply_changes_to_rope(&mut open_doc.rope, changes);
-        open_doc.version = version;
-
-        self.reparse_open_document(uri);
     }
 
     /// Closes and untracks an open document, aborting any background debounce tasks.

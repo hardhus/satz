@@ -57,7 +57,7 @@ satz stats --vault . --json
 
 ## `satz list`
 
-Lists documents, optionally filtered. Filters can combine (`--tag` + `--orphans`), except `--broken` which takes over the entire output.
+Lists documents, optionally filtered. Filters combine (`--tag` + `--orphans`); with `--broken` they choose which documents' broken links are listed.
 
 ```
 satz list --vault . --tag felsefe --tag wittgenstein   # AND of both tags
@@ -68,20 +68,20 @@ satz list --vault . --broken
 `--broken` output format (one line per broken link occurrence):
 
 ```
-books/tractatus.md:14	[[missing-note]]	— dosya bulunamadı
-notes/index.md:3	[[other#Section]]	— dosya var, başlık yok
+books/tractatus.md:14	[[missing-note]]	— file not found
+notes/index.md:3	[[other#Section]]	— file exists, heading not found
 ```
 
-Fields are tab-separated: `path:line`, the raw link text as it appears in the source, and a reason. The reason strings are currently emitted in Turkish:
-- `dosya bulunamadı` — the target document could not be found at all.
-- `dosya var, başlık yok` — the target document exists, but the requested `#heading` or `#^block` anchor doesn't.
+Fields are tab-separated: `path:line`, the raw link text as it appears in the source, and a reason. The reason is one of:
+- `file not found` — the target document could not be found at all.
+- `file exists, heading not found` — the target document exists, but the requested `#heading` or `#^block` anchor doesn't.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-v, --vault <path>` | `.` | Vault root. |
 | `--tag <name>` | none | Only show documents with this tag (hierarchical prefix match, e.g. `--tag project` also matches `project/sub`). Repeatable; repeated flags are AND'd together. |
 | `--orphans` | off | Only show documents with no incoming backlinks (self-links don't count). |
-| `--broken` | off | Instead of listing documents, list every broken wikilink/embed/markdown link occurrence across the vault. Takes precedence over `--tag`/`--orphans`. |
+| `--broken` | off | Instead of listing documents, list every broken wikilink/embed/markdown link occurrence in the documents the other filters leave (all of them without `--tag`/`--orphans`). |
 
 ## `satz resolve <target>`
 
