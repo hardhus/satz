@@ -2,7 +2,7 @@
 
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command,
-    CreateFile, DocumentChangeOperation, DocumentChanges, OneOf,
+    CreateFile, CreateFileOptions, DocumentChangeOperation, DocumentChanges, OneOf,
     OptionalVersionedTextDocumentIdentifier, Range, ResourceOp, TextDocumentEdit, TextEdit,
     WorkspaceEdit,
 };
@@ -10,6 +10,46 @@ use tower_lsp_server::ls_types::{
 use crate::convert::{lsp_pos_to_satz, path_to_uri};
 use crate::state::SatzState;
 use satz_core::model::LinkKind;
+
+/// The vault-relative path components (`.md` appended to the last) a broken link target may be
+/// turned into, or `None` when the target is not a plain note name: it would leave the vault
+/// (`..`, drive letters, URL schemes), name a non-note file (`image.png`), or contain characters
+/// no file name can hold.
+fn note_components(target: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = target
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    let last = parts.last_mut()?;
+    if let Some(stripped) = last.strip_suffix(".md") {
+        *last = stripped.to_string();
+    }
+    for part in &parts {
+        let bad_char = |c: char| c.is_control() || ":*?\"<>|".contains(c);
+        if part == "." || part == ".." || part.chars().any(bad_char) {
+            return None;
+        }
+        if part.len() > 255 || part.ends_with(['.', ' ']) {
+            return None;
+        }
+    }
+    // A dotted final component is a file extension unless it reads as a version or a sentence
+    // (`2.0121`, `Dr. Smith`); a real extension means the target is not a note.
+    let last = parts.last()?;
+    if last.is_empty() {
+        return None;
+    }
+    if let Some((_, ext)) = last.rsplit_once('.')
+        && ext.chars().any(char::is_alphabetic)
+        && !ext.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    let last = parts.last_mut()?;
+    last.push_str(".md");
+    Some(parts)
+}
 
 pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeActionResponse> {
     let uri = params.text_document.uri.as_str();
@@ -48,21 +88,35 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
         {
             match state.index.resolve_link_full(link, Some(doc)) {
                 satz_core::LinkResolution::DocMissing if !link.target_doc.is_empty() => {
-                    let clean_name = link.target_doc.trim_end_matches(".md");
-                    let target_filename = format!("{}.md", clean_name);
-                    let target_path = match &state.vault_root {
-                        Some(root) => root.join(&target_filename),
-                        None => std::path::PathBuf::from(&target_filename),
-                    };
+                    let components = note_components(&link.target_doc);
+                    let target_path = components.as_ref().map(|parts| {
+                        let mut path = match &state.vault_root {
+                            Some(root) => root.clone(),
+                            None => std::path::PathBuf::new(),
+                        };
+                        path.extend(parts);
+                        path
+                    });
 
-                    if let Some(target_uri) = path_to_uri(&target_path) {
-                        let initial_content =
-                            satz_core::generate_document_template(clean_name, None);
+                    if let (Some(parts), Some(target_path)) = (components, target_path)
+                        && let Some(target_uri) = path_to_uri(&target_path)
+                    {
+                        let clean_name = parts.join("/");
+                        let clean_name = clean_name.trim_end_matches(".md");
+                        let title = parts
+                            .last()
+                            .map_or(clean_name, |last| last.strip_suffix(".md").unwrap_or(last));
+                        let initial_content = satz_core::generate_document_template(title, None);
 
                         let ops = vec![
                             DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
                                 uri: target_uri.clone(),
-                                options: None,
+                                // A file that exists but is not indexed yet must not fail the whole
+                                // edit, and must never be overwritten.
+                                options: Some(CreateFileOptions {
+                                    overwrite: Some(false),
+                                    ignore_if_exists: Some(true),
+                                }),
                                 annotation_id: None,
                             })),
                             DocumentChangeOperation::Edit(TextDocumentEdit {
@@ -230,7 +284,9 @@ mod tests {
     use super::*;
     use satz_core::{Index, parse_document};
     use std::path::Path;
-    use tower_lsp_server::ls_types::{CodeActionContext, Position, TextDocumentIdentifier};
+    use tower_lsp_server::ls_types::{
+        CodeActionContext, CreateFileOptions, Position, TextDocumentIdentifier,
+    };
 
     #[test]
     fn test_code_action_create_missing_note() {
@@ -300,6 +356,177 @@ mod tests {
         assert!(quickfix.title.contains("Create note: \"missing-note\""));
         assert!(quickfix.edit.is_some());
         assert_source_action_present(&response);
+    }
+
+    // ---- create-note: which files may be created, and where ----
+
+    fn vault_root() -> std::path::PathBuf {
+        if cfg!(windows) {
+            Path::new("C:\\vault").to_path_buf()
+        } else {
+            Path::new("/vault").to_path_buf()
+        }
+    }
+
+    /// The "Create note" quickfix offered for a broken `[[target]]`, if any.
+    fn create_note_action(target: &str) -> Option<CodeAction> {
+        let text = format!("Link to [[{target}]] here");
+        let rel_a = Path::new("doc-a.md");
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![parse_document(&text, rel_a)]);
+        state.vault_root = Some(vault_root());
+        let (uri_str, abs) = if cfg!(windows) {
+            ("file:///C:/vault/doc-a.md", "C:\\vault\\doc-a.md")
+        } else {
+            ("file:///vault/doc-a.md", "/vault/doc-a.md")
+        };
+        state.open_docs.insert(
+            uri_str.to_string(),
+            crate::state::OpenDocument::new(uri_str, Path::new(abs).to_path_buf(), &text, 1),
+        );
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri_str.parse().unwrap(),
+            },
+            range: Range::new(Position::new(0, 10), Position::new(0, 10)),
+            context: CodeActionContext::default(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        code_action(params, &state)?
+            .into_iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca)
+                    if ca.kind == Some(CodeActionKind::QUICKFIX)
+                        && ca.title.starts_with("Create note") =>
+                {
+                    Some(ca)
+                }
+                _ => None,
+            })
+    }
+
+    /// `(created file path relative to the vault, CreateFile options, new file content)`.
+    fn created_file(action: &CodeAction) -> (String, Option<CreateFileOptions>, String) {
+        let Some(DocumentChanges::Operations(ops)) =
+            &action.edit.as_ref().unwrap().document_changes
+        else {
+            panic!("expected document change operations");
+        };
+        let mut create = None;
+        let mut content = String::new();
+        for op in ops {
+            match op {
+                DocumentChangeOperation::Op(ResourceOp::Create(c)) => create = Some(c),
+                DocumentChangeOperation::Edit(e) => {
+                    if let Some(OneOf::Left(edit)) = e.edits.first() {
+                        content = edit.new_text.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        let create = create.expect("a CreateFile operation");
+        let path = crate::convert::uri_to_path(create.uri.as_str()).expect("file URI");
+        let rel = path
+            .strip_prefix(vault_root())
+            .unwrap_or_else(|_| panic!("{path:?} is outside the vault {:?}", vault_root()))
+            .to_string_lossy()
+            .replace('\\', "/");
+        (rel, create.options.clone(), content)
+    }
+
+    #[test]
+    fn create_note_puts_the_file_where_the_link_says_inside_the_vault() {
+        for (target, expected) in [
+            ("new", "new.md"),
+            ("a/b/c", "a/b/c.md"),
+            ("tlp/2.0121", "tlp/2.0121.md"),
+            ("v1.2.3", "v1.2.3.md"),
+            ("Türkçe Not", "Türkçe Not.md"),
+            ("with.md", "with.md"),
+            ("sub\\name", "sub/name.md"),
+            ("a//b", "a/b.md"),
+            ("/abs", "abs.md"),
+            ("note with   spaces", "note with   spaces.md"),
+        ] {
+            let action = create_note_action(target)
+                .unwrap_or_else(|| panic!("{target:?} should offer a create-note fix"));
+            let (rel, _, _) = created_file(&action);
+            assert_eq!(rel, expected, "target {target:?}");
+        }
+    }
+
+    #[test]
+    fn create_note_is_not_offered_for_targets_that_are_not_safe_note_names() {
+        for target in [
+            // escaping the vault
+            "../../x",
+            "a/../../x",
+            "..",
+            ".",
+            "./x",
+            "..\\..\\x",
+            // drive letters / URL schemes / stream names
+            "C:x",
+            "C:\\x",
+            "a:b",
+            "mailto:a@b.c",
+            // not a note: has a file extension
+            "image.png",
+            "doc.pdf",
+            "archive.tar.gz",
+            "photo.JPG",
+            // characters Windows forbids in file names
+            "con*",
+            "a?b",
+            "a<b",
+            "a>b",
+            "quote\"",
+            // trailing dot
+            "trailing.",
+            "dir./name",
+        ] {
+            assert!(
+                create_note_action(target).is_none(),
+                "{target:?} must not offer to create a file"
+            );
+        }
+        // Over-long names.
+        assert!(create_note_action(&"a".repeat(256)).is_none());
+        assert!(create_note_action(&"a".repeat(255)).is_some());
+    }
+
+    #[test]
+    fn create_note_never_overwrites_and_tolerates_an_existing_unindexed_file() {
+        let action = create_note_action("new").unwrap();
+        let (_, options, _) = created_file(&action);
+        let options = options.expect("explicit CreateFile options");
+        assert_eq!(options.overwrite, Some(false));
+        assert_eq!(options.ignore_if_exists, Some(true));
+    }
+
+    #[test]
+    fn the_created_note_has_valid_frontmatter_even_for_awkward_names() {
+        for (target, title) in [
+            ("new", "new"),
+            ("Q- what", "Q- what"),
+            ("2.01231", "2.01231"),
+            ("yes", "yes"),
+            ("Türkçe Not", "Türkçe Not"),
+            ("a/b/c", "c"),
+        ] {
+            let action = create_note_action(target).unwrap();
+            let (_, _, content) = created_file(&action);
+            let parsed = parse_document(&content, Path::new("n.md"));
+            assert!(parsed.frontmatter_range.is_some(), "{target:?}:\n{content}");
+            assert_eq!(
+                parsed.frontmatter.title.as_deref(),
+                Some(title),
+                "{target:?}:\n{content}"
+            );
+            assert!(parsed.frontmatter.aliases.is_empty(), "{target:?}");
+        }
     }
 
     #[test]

@@ -545,7 +545,7 @@ impl LanguageServer for Backend {
 
     async fn rename(&self, params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {
         let state = self.state.read().await;
-        Ok(crate::handlers::rename::rename(params, &state))
+        crate::handlers::rename::rename(params, &state).map_err(jsonrpc::Error::invalid_params)
     }
 
     async fn document_highlight(

@@ -53,9 +53,18 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     let close_suffix = if !has_closing_brackets { "]]" } else { "" };
 
     // 1. Check for wikilink completion: `[[...`
-    if let Some(open_bracket_idx) = line_prefix.rfind("[[") {
+    // A `[[` that a `]]` has already closed on this line is finished text, not a link being typed.
+    let open_bracket = line_prefix
+        .rfind("[[")
+        .filter(|idx| !line_prefix[idx + 2..].contains("]]"));
+    if let Some(open_bracket_idx) = open_bracket {
         let inside_wikilink = &line_prefix[open_bracket_idx + 2..];
         let inside_wikilink_start = line_start_offset + open_bracket_idx + 2;
+
+        // After `|` the user is writing the link's display text: nothing to complete.
+        if inside_wikilink.contains('|') {
+            return Some(CompletionResponse::Array(vec![]));
+        }
 
         // Check if inside heading or block reference `[[doc#...` or `[[#...`
         if let Some((target_doc_str, heading_or_block)) = inside_wikilink.split_once('#') {
@@ -74,9 +83,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
 
             if let Some(target_doc) = state.index.get_doc(target_id) {
                 if let Some(_block_prefix) = heading_or_block.strip_prefix('^') {
-                    // Block anchor completion: `[[doc#^...`
+                    // Block anchor completion: `[[doc#^...`. The replaced range includes the
+                    // typed `^` because every new text starts with its own.
                     let range = byte_range_to_lsp(
-                        satz_core::ByteRange::new(heading_or_block_start + 1, byte_offset),
+                        satz_core::ByteRange::new(heading_or_block_start, byte_offset),
                         &live_line_index,
                     );
                     let items: Vec<CompletionItem> = target_doc
@@ -163,7 +173,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     d.id.as_str().to_string()
                 };
                 let path_str = d.path.to_string_lossy().replace('\\', "/");
-                let insert_base = path_str.strip_suffix(".md").unwrap_or(&path_str).to_string();
+                let insert_base = path_str
+                    .strip_suffix(".md")
+                    .unwrap_or(&path_str)
+                    .to_string();
 
                 items.push(CompletionItem {
                     label: title_label.clone(),
@@ -283,7 +296,10 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     ..Default::default()
                 })
                 .collect();
-            tracing::debug!(count = items.len(), "completion: returning candidates (tags)");
+            tracing::debug!(
+                count = items.len(),
+                "completion: returning candidates (tags)"
+            );
             return Some(CompletionResponse::Array(items));
         }
     }
@@ -628,5 +644,166 @@ mod tests {
         } else {
             panic!("Expected CompletionResponse::Array");
         }
+    }
+
+    // ---- applied-result harness: complete at `§`, apply the chosen edit, compare the text ----
+
+    const CURSOR: char = '§';
+
+    fn vault_root() -> std::path::PathBuf {
+        if cfg!(windows) {
+            Path::new("C:\\vault").to_path_buf()
+        } else {
+            Path::new("/vault").to_path_buf()
+        }
+    }
+
+    /// Runs completion in `a.md` whose text is `marked` with the cursor at `§`. `b.md` has the
+    /// headings Intro/Details, the block `^my-block` and the tags alpha/beta.
+    /// Returns the response and the text without the marker.
+    fn complete(marked: &str) -> (Option<CompletionResponse>, String) {
+        let idx = marked.find(CURSOR).expect("cursor marker");
+        let text = marked.replacen(CURSOR, "", 1);
+        let before = &marked[..idx];
+        let line = before.matches('\n').count() as u32;
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        let character = before[line_start..].encode_utf16().count() as u32;
+
+        let b_text = "# Intro\n\nSome text ^my-block\n\n## Details\n\n#alpha #beta\n";
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document(&text, Path::new("a.md")),
+            parse_document(b_text, Path::new("b.md")),
+        ]);
+        state.vault_root = Some(vault_root());
+        let uri = crate::convert::path_to_uri(&vault_root().join("a.md"))
+            .unwrap()
+            .as_str()
+            .to_string();
+        state.open_docs.insert(
+            uri.clone(),
+            crate::state::OpenDocument::new(&uri, vault_root().join("a.md"), &text, 1),
+        );
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                position: Position::new(line, character),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        (completion(params, &state), text)
+    }
+
+    fn items(marked: &str) -> Vec<CompletionItem> {
+        match complete(marked).0 {
+            Some(CompletionResponse::Array(items)) => items,
+            other => panic!("expected an item array for {marked:?}, got {other:?}"),
+        }
+    }
+
+    /// The document text after accepting the item labelled `label`.
+    fn accept(marked: &str, label: &str) -> String {
+        let (response, text) = complete(marked);
+        let Some(CompletionResponse::Array(items)) = response else {
+            panic!("no completion items for {marked:?}");
+        };
+        let item = items.iter().find(|i| i.label == label).unwrap_or_else(|| {
+            panic!(
+                "no item {label:?} for {marked:?}; have {:?}",
+                items.iter().map(|i| &i.label).collect::<Vec<_>>()
+            )
+        });
+        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("item without text edit");
+        };
+        crate::convert::apply_text_edits(&text, std::slice::from_ref(edit))
+    }
+
+    #[test]
+    fn block_anchor_completion_yields_a_single_caret() {
+        assert_eq!(accept("[[b#^§", "^my-block"), "[[b#^my-block]]");
+        assert_eq!(accept("[[b#^my§", "^my-block"), "[[b#^my-block]]");
+        assert_eq!(accept("![[b#^§", "^my-block"), "![[b#^my-block]]");
+        // Closing brackets that are already there are not duplicated.
+        assert_eq!(accept("[[b#^§]]", "^my-block"), "[[b#^my-block]]");
+        assert_eq!(accept("x [[b#^§]] y", "^my-block"), "x [[b#^my-block]] y");
+    }
+
+    #[test]
+    fn heading_completion_replaces_the_typed_query() {
+        assert_eq!(accept("[[b#§", "Intro"), "[[b#Intro]]");
+        assert_eq!(accept("[[b#In§", "Intro"), "[[b#Intro]]");
+        assert_eq!(accept("[[b#§]]", "Details"), "[[b#Details]]");
+        assert_eq!(accept("[[b#§", "^my-block"), "[[b#^my-block]]");
+    }
+
+    #[test]
+    fn a_closed_wikilink_earlier_on_the_line_is_not_the_context() {
+        // Tags still work after a finished link.
+        assert_eq!(
+            accept("see [[b]] and #al§", "#alpha"),
+            "see [[b]] and #alpha"
+        );
+        assert_eq!(accept("[[b#Intro]] #§", "#beta"), "[[b#Intro]] #beta");
+        // Nothing to complete in plain text after a finished link.
+        assert!(complete("[[b]] bar§").0.is_none());
+        assert!(complete("![[b]] and [[b#Intro]] text§").0.is_none());
+        // Footnotes still work after a finished link.
+        assert_eq!(
+            accept("[[b]] text[^§\n\n[^1]: note\n", "1"),
+            "[[b]] text[^1\n\n[^1]: note\n"
+        );
+    }
+
+    #[test]
+    fn a_second_and_third_link_on_the_same_line_complete_fully() {
+        assert_eq!(accept("[[b]] [[§", "Details"), "[[b]] [[b#Details]]");
+        assert_eq!(
+            accept("[[b]] [[b]] [[b#In§", "Intro"),
+            "[[b]] [[b]] [[b#Intro]]"
+        );
+        assert_eq!(
+            accept("[[b]] and [[b#^§", "^my-block"),
+            "[[b]] and [[b#^my-block]]"
+        );
+    }
+
+    #[test]
+    fn nothing_is_offered_inside_the_display_text_part() {
+        for marked in ["[[b|My al§", "[[b#Intro|al§", "[[b#^my-block|x§", "![[b|§"] {
+            assert!(items(marked).is_empty(), "{marked:?}");
+        }
+    }
+
+    #[test]
+    fn unicode_prefixes_and_crlf_lines_are_positioned_correctly() {
+        assert_eq!(accept("Türkçe 🎉 [[b#§", "Intro"), "Türkçe 🎉 [[b#Intro]]");
+        assert_eq!(
+            accept("Türkçe 🎉 [[b#^§", "^my-block"),
+            "Türkçe 🎉 [[b#^my-block]]"
+        );
+        assert_eq!(
+            accept("first line\r\n[[b#^§", "^my-block"),
+            "first line\r\n[[b#^my-block]]"
+        );
+        assert_eq!(
+            accept("first\r\n[[b]] #al§\r\nlast", "#alpha"),
+            "first\r\n[[b]] #alpha\r\nlast"
+        );
+    }
+
+    #[test]
+    fn unresolved_target_gives_no_items_and_open_brackets_at_line_edges_work() {
+        assert!(items("[[missing#§").is_empty());
+        assert!(items("[[missing#^§").is_empty());
+        assert_eq!(accept("[[§", "Details"), "[[b#Details]]");
+        assert_eq!(
+            accept("text\n[[§\nnext", "Details"),
+            "text\n[[b#Details]]\nnext"
+        );
     }
 }

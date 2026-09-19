@@ -316,7 +316,9 @@ fn zettel_vault_rename_heading_and_doc() {
         },
         &state,
     );
-    let we = edit.expect("Heading rename should produce WorkspaceEdit");
+    let we = edit
+        .expect("Heading rename should be accepted")
+        .expect("Heading rename should produce WorkspaceEdit");
     let changes = we.changes.expect("Changes should be present");
     assert!(
         changes

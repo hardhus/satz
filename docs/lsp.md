@@ -14,7 +14,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 | Find references | Documents, headings, block anchors, tags — see [Reference/highlight targets](#referencehighlight-targets). |
 | Hover | Preview of the link target (section/paragraph-scoped when the link has a heading/block anchor); footnote hover shows the footnote body. |
 | Document highlight | Same-document occurrences of whatever's under the cursor (tag family, heading + links to it, block + links to it). |
-| Completion | Context-aware: note/alias completion inside `[[`, heading completion inside `[[doc#`, block completion inside `[[doc#^`, footnote label completion inside `[^`, tag completion after `#`. Supports `completionItem/resolve` for note previews. |
+| Completion | Context-aware: note/alias completion inside `[[`, heading completion inside `[[doc#`, block completion inside `[[doc#^` (the `^` you typed is replaced, never doubled), footnote label completion inside `[^`, tag completion after `#`. A `[[` already closed by `]]` earlier on the line is not a link being typed (so tags and footnotes still complete after it), and nothing is offered after a `|` (the display text). Supports `completionItem/resolve` for note previews. |
 | Document symbols | Heading outline, nested by level. |
 | Workspace symbols | Fuzzy search (via `nucleo-matcher`) over titles, aliases, and headings across the whole vault; supports a `tag:<name> <query>` prefix to scope the search to a tag. |
 | Rename / prepare rename | Heading renames and document renames (see [Rename](#rename) below). |
@@ -45,7 +45,7 @@ Diagnostic codes you'll see in `diagnostic.code`:
 
 Offered contextually depending on what's under the cursor/selection:
 
-- **Create note** — offered on a broken wikilink/embed/markdown link; creates the target `.md` file (with a generated frontmatter + heading template) and opens it via a `workspace/applyEdit` create-then-edit operation.
+- **Create note** — offered on a broken wikilink/embed/markdown link; creates the target `.md` file (with a generated frontmatter + heading template) and opens it via a `workspace/applyEdit` create-then-edit operation. The target is only offered when it is a plain note name: `a/b/c` creates the folders, but `..`, `.`, drive letters (`C:x`), URL schemes (`mailto:`), names with a real file extension (`image.png`, `doc.pdf` — while `tlp/2.0121` is fine), Windows-forbidden characters (`* ? " < > |`), a trailing dot or a component over 255 bytes get no quick fix, so a file is never created outside the vault. An existing file is never overwritten. The title is written to YAML quoted when needed (`Q: what` becomes `title: "Q: what"`), so the frontmatter always stays valid.
 - **Add heading** — offered on a broken `#Heading` reference where the target document exists; appends `## <Heading>` to the end of the target document.
 - **Insert frontmatter template** — offered when the document has no `---` frontmatter block yet; inserts a title/date/aliases/tags template at the top.
 - **Format entire vault** (`CodeActionKind::SOURCE`) — always offered (whenever `formatter.enabled` is true), regardless of cursor position; runs the same `satz.formatWorkspace` command described below. Some clients surface source actions in the code action menu more discoverably than a command palette entry, hence offering both.
@@ -54,10 +54,12 @@ Offered contextually depending on what's under the cursor/selection:
 
 Triggered from a heading definition or from a link:
 
-- **Renaming a heading** rewrites the `#` line in its document and rewrites every same-document and cross-document link whose `#Heading` reference matches it (matched via [heading matching rules](syntax.md#heading-slugs--matching), so case/slug variants are all caught). The edit is scoped to the target document plus its known backlinks — it does not scan the entire vault.
+- **Renaming a heading** replaces only the heading text in its document (the `#` level, a trailing `^block-id`, closing `#`s, the line ending and a setext underline are kept) and rewrites every same-document and cross-document link whose `#Heading` reference matches it (matched via [heading matching rules](syntax.md#heading-slugs--matching), so case/slug variants are all caught). The edit is scoped to the target document plus its known backlinks — it does not scan the entire vault.
 - **Renaming via a link's target document** emits a `workspace/applyEdit` with a file-rename operation (`ResourceOp::Rename`) for the target file, plus text edits updating every in-scope link (again scoped to backlinks + the target itself, not a full-vault scan).
 
-`textDocument/prepareRename` is implemented, so clients get the correct placeholder text (the current heading text, or the current link target) before you type a new name.
+`textDocument/prepareRename` is implemented, so clients get the correct placeholder text (the current heading text, or the current link target) before you type a new name. The range it returns is exactly the heading text.
+
+New names are validated and a bad one is reported to the client as an error instead of being silently ignored: heading names may not be empty or contain line breaks, `|`, `[[`, `]]`, `#` or start with `^`; note names may not be empty or contain `/  : * ? " < > | # [ ] ^`, control characters or end with `.`/space, must fit a 255-byte file name (`.md` is stripped once), and must not collide with an existing note in the same folder. Renaming from a link whose heading or note does not exist is an error too (it never falls back to renaming the document). The file rename never overwrites, and text edits are listed before the rename so they address the files by their current paths.
 
 ## Reference/highlight targets
 
