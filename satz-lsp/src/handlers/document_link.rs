@@ -38,7 +38,7 @@ pub fn document_link(params: DocumentLinkParams, state: &SatzState) -> Option<Ve
             l.kind,
             LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
         ) {
-            match state.index.resolve_link_full(l, Some(doc)) {
+            match state.resolve(l, doc) {
                 satz_core::LinkResolution::Resolved {
                     doc: target_doc, ..
                 }

@@ -25,7 +25,7 @@ enum CursorTarget {
 
 fn cursor_target(doc: &Document, off: usize, index: &Index) -> Option<CursorTarget> {
     // Priority order: link > block > heading > tag > document
-    if let Some(l) = doc.links.iter().find(|l| l.range.contains(off)) {
+    if let Some(l) = doc.link_at(off) {
         let target = if l.target_doc.is_empty() {
             doc.id.clone()
         } else {
@@ -120,7 +120,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
         }
         CursorTarget::Block { ref doc, ref id } => {
             if let Some(target_doc) = state.index.get_doc(doc)
-                && let Some(b) = target_doc.blocks.iter().find(|b| &b.id == id)
+                && let Some(b) = target_doc.resolve_block(id).map(|i| &target_doc.blocks[i])
                 && let Some(u) = doc_uri(target_doc, state.vault_root.as_deref())
             {
                 let location = Location::new(u, byte_range_to_lsp(b.range, &target_doc.line_index));
@@ -146,7 +146,12 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                             state.index.resolve_link(&link.target_doc) == Some(doc)
                         };
 
-                        if resolves_to_target && link.target_block.as_deref() == Some(id.as_str()) {
+                        if resolves_to_target
+                            && link
+                                .target_block
+                                .as_deref()
+                                .is_some_and(|b| b.eq_ignore_ascii_case(id))
+                        {
                             locations.push(Location::new(
                                 src_uri.clone(),
                                 byte_range_to_lsp(link.range, &src_doc.line_index),

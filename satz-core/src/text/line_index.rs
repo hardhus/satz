@@ -35,7 +35,11 @@ impl LineIndex {
         let mut line_starts = vec![0];
         for (i, b) in source.bytes().enumerate() {
             if b == b'\n' {
-                line_starts.push((i + 1) as u32);
+                // A document past 4 GiB keeps the lines it can address; the rest is one long last line.
+                let Ok(start) = u32::try_from(i + 1) else {
+                    break;
+                };
+                line_starts.push(start);
             }
         }
         Self {
@@ -93,7 +97,10 @@ impl LineIndex {
             return 0;
         }
 
-        let line_idx = (pos.line as usize).min(self.line_starts.len() - 1);
+        if pos.line as usize >= self.line_starts.len() {
+            return self.source.len();
+        }
+        let line_idx = pos.line as usize;
         let line_start = self.line_starts[line_idx] as usize;
         let line_end = self
             .line_starts
@@ -111,6 +118,9 @@ impl LineIndex {
             }
             if c == '\n' || c == '\r' {
                 break;
+            }
+            if cur_utf16 + c.len_utf16() as u32 > pos.character {
+                break; // inside a surrogate pair: stay at the start of the character
             }
             cur_utf16 += c.len_utf16() as u32;
             byte_offset_in_line += c.len_utf8();
@@ -231,5 +241,66 @@ mod tests {
         // 'w' is at byte 7
         assert_eq!(index.byte_to_position(7), Position::new(1, 0));
         assert_eq!(index.position_to_byte(Position::new(1, 0)), 7);
+    }
+    #[test]
+    fn a_line_past_the_end_is_the_end_of_the_document() {
+        let index = LineIndex::new("ab\ncd");
+        assert_eq!(index.position_to_byte(Position::new(9, 0)), 5);
+        assert_eq!(index.position_to_byte(Position::new(2, 0)), 5);
+        assert_eq!(index.position_to_byte(Position::new(u32::MAX, u32::MAX)), 5);
+        // A trailing newline starts a real (empty) last line: that is the end as well.
+        let index = LineIndex::new("ab\n");
+        assert_eq!(index.position_to_byte(Position::new(1, 0)), 3);
+        assert_eq!(index.position_to_byte(Position::new(7, 3)), 3);
+        // The last existing line is still clamped by column, not treated as past the end.
+        let index = LineIndex::new("ab\ncd");
+        assert_eq!(index.position_to_byte(Position::new(1, 1)), 4);
+        assert_eq!(index.position_to_byte(Position::new(1, 99)), 5);
+        assert_eq!(index.position_to_byte(Position::new(0, 99)), 2);
+    }
+
+    #[test]
+    fn a_column_never_lands_inside_a_line_ending_or_a_surrogate_pair() {
+        let index = LineIndex::new("ab\r\ncd");
+        assert_eq!(
+            index.position_to_byte(Position::new(0, 99)),
+            2,
+            "before the \r"
+        );
+        assert_eq!(index.position_to_byte(Position::new(1, 0)), 4);
+        // Column 2 is the middle of the emoji's surrogate pair: it stays at the emoji's start.
+        let index = LineIndex::new("a😀b");
+        assert_eq!(index.position_to_byte(Position::new(0, 1)), 1);
+        assert_eq!(index.position_to_byte(Position::new(0, 2)), 1);
+        assert_eq!(index.position_to_byte(Position::new(0, 3)), 5);
+        assert_eq!(index.position_to_byte(Position::new(0, 4)), 6);
+    }
+
+    #[test]
+    fn byte_and_position_round_trip_on_every_char_boundary() {
+        for text in [
+            "",
+            "plain\ntext\n",
+            "ığ😀[[x]]\r\nşık\r\n\r\n",
+            "\n\n\n",
+            "a😀😀b\n🦀",
+            "tek satır, sonu yok",
+        ] {
+            let index = LineIndex::new(text);
+            for byte in 0..=text.len() {
+                if !text.is_char_boundary(byte) {
+                    continue;
+                }
+                let pos = index.byte_to_position(byte);
+                let back = index.position_to_byte(pos);
+                // Positions inside a CRLF pair map to the byte before the `\r`.
+                let expected = if text[..byte].ends_with('\r') && text[byte..].starts_with('\n') {
+                    byte - 1
+                } else {
+                    byte
+                };
+                assert_eq!(back, expected, "{text:?} @ {byte}");
+            }
+        }
     }
 }

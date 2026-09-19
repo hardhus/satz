@@ -29,7 +29,7 @@ pub fn goto_definition(
     let byte_offset = doc.line_index.position_to_byte(satz_pos);
 
     // Find the link under the cursor
-    let link = doc.links.iter().find(|l| l.range.contains(byte_offset))?;
+    let link = doc.link_at(byte_offset)?;
 
     // Special case for footnotes: jump to definition in the SAME document
     if link.kind == LinkKind::Footnote
@@ -357,6 +357,29 @@ mod tests {
         assert_eq!(
             definition_file(&files, "sub/a.md", (0, 7)),
             Some("b.md".into())
+        );
+    }
+
+    #[test]
+    fn the_innermost_of_nested_links_is_the_one_followed() {
+        let files = [
+            ("a.md", "[see [[inner]]](outer.md)\n"),
+            ("inner.md", "# inner\n"),
+            ("outer.md", "# outer\n"),
+        ];
+        // On the wikilink inside the label.
+        assert_eq!(
+            definition_file(&files, "a.md", (0, 8)),
+            Some("inner.md".into())
+        );
+        // On the label text and on the destination: the outer link.
+        assert_eq!(
+            definition_file(&files, "a.md", (0, 2)),
+            Some("outer.md".into())
+        );
+        assert_eq!(
+            definition_file(&files, "a.md", (0, 20)),
+            Some("outer.md".into())
         );
     }
 }

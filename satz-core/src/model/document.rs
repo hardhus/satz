@@ -80,7 +80,27 @@ impl Document {
     /// Index of the heading a `#Heading` reference resolves to: the FIRST heading that matches it.
     /// With duplicate headings every reference therefore belongs to the first one.
     pub fn resolve_heading(&self, reference: &str) -> Option<usize> {
-        self.headings.iter().position(|h| h.matches(reference))
+        let slug = crate::slug::slugify(reference);
+        self.headings
+            .iter()
+            .position(|h| h.matches_with_slug(reference, &slug))
+    }
+
+    /// The link under a byte offset. Links can nest (`[see [[x]]](y.md)`): the innermost one wins,
+    /// and of equally wide ones the first.
+    pub fn link_at(&self, byte: usize) -> Option<&Link> {
+        self.links
+            .iter()
+            .filter(|l| l.range.contains(byte))
+            .min_by_key(|l| l.range.end - l.range.start)
+    }
+
+    /// Index of the block a `#^id` reference resolves to. Block ids are ASCII (`[A-Za-z0-9-]`) and
+    /// matched ignoring case, like Obsidian; with duplicates the first one wins.
+    pub fn resolve_block(&self, id: &str) -> Option<usize> {
+        self.blocks
+            .iter()
+            .position(|b| b.id.eq_ignore_ascii_case(id))
     }
 
     /// Resolves the document title according to priority:

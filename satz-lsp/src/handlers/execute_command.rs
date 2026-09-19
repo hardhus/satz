@@ -1,12 +1,73 @@
 use std::collections::HashMap;
 
-use tower_lsp_server::ls_types::{TextEdit, Uri, WorkspaceEdit};
+use tower_lsp_server::ls_types::{Location, TextEdit, Uri, WorkspaceEdit};
 
 use crate::convert::{line_edits_to_text_edits, path_to_uri};
 use crate::state::SatzState;
 use satz_core::formatter::diff::line_diff;
 
 pub const FORMAT_WORKSPACE_COMMAND: &str = "satz.formatWorkspace";
+
+pub const SHOW_BACKLINKS_COMMAND: &str = "satz.showBacklinks";
+
+/// Every command `workspace/executeCommand` accepts (advertised in the server capabilities).
+pub const SUPPORTED_COMMANDS: [&str; 2] = [FORMAT_WORKSPACE_COMMAND, SHOW_BACKLINKS_COMMAND];
+
+/// The links in other notes that point at the note whose URI is the first argument (the same
+/// notes the backlink CodeLens counts; a link from the note to itself is not a backlink).
+/// `Err` carries the reason when the arguments are unusable; an unknown note gives no locations.
+pub fn show_backlinks(
+    state: &SatzState,
+    arguments: &[serde_json::Value],
+) -> Result<Vec<Location>, String> {
+    let uri = arguments
+        .first()
+        .and_then(|a| a.as_str())
+        .ok_or("satz.showBacklinks expects the note's URI as its first argument")?;
+    let path = crate::convert::uri_to_path(uri)
+        .ok_or_else(|| format!("satz.showBacklinks: '{uri}' is not a file URI"))?;
+    let rel_path = SatzState::get_rel_path(&path, state.vault_root.as_deref());
+    let target = satz_core::DocId::new(rel_path.to_string_lossy().replace('\\', "/"));
+    if state.index.get_doc(&target).is_none() {
+        return Ok(Vec::new());
+    }
+
+    let mut locations = Vec::new();
+    for source_id in state.index.incoming_from_others(&target) {
+        let Some(source) = state.index.get_doc(source_id) else {
+            continue;
+        };
+        let source_path = match &state.vault_root {
+            Some(root) if !source.path.is_absolute() => root.join(&source.path),
+            _ => source.path.clone(),
+        };
+        let Some(source_uri) = path_to_uri(&source_path) else {
+            continue;
+        };
+        for link in &source.links {
+            let points_here = matches!(
+                state.resolve(link, source),
+                satz_core::LinkResolution::Resolved { doc, .. }
+                    | satz_core::LinkResolution::AnchorMissing { doc } if doc.id == target
+            ) && link.kind != satz_core::LinkKind::Footnote
+                && !link.target_doc.is_empty();
+            if points_here {
+                locations.push(Location::new(
+                    source_uri.clone(),
+                    crate::convert::byte_range_to_lsp(link.range, &source.line_index),
+                ));
+            }
+        }
+    }
+    locations.sort_by(|a, b| {
+        (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+            b.uri.as_str(),
+            b.range.start.line,
+            b.range.start.character,
+        ))
+    });
+    Ok(locations)
+}
 
 /// One document's computed formatting result: its client URI, the full replacement text (used to
 /// keep an open document's in-memory rope in sync after the client confirms the edit), and the
@@ -255,5 +316,120 @@ mod tests {
             second.cache_updates.is_empty(),
             "nothing new to compute on a warm cache"
         );
+    }
+
+    fn backlinks_of_a(
+        files: &[(&str, &str)],
+        arg: serde_json::Value,
+    ) -> Result<Vec<Location>, String> {
+        let state = state_with(
+            files
+                .iter()
+                .map(|(p, t)| parse_document(t, Path::new(p)))
+                .collect(),
+        );
+        show_backlinks(&state, &[arg])
+    }
+
+    fn uri_for(state_root_file: &str) -> String {
+        let root = if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
+        } else {
+            Path::new("/").to_path_buf()
+        };
+        path_to_uri(&root.join(state_root_file))
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
+    #[test]
+    fn both_commands_are_advertised() {
+        assert!(SUPPORTED_COMMANDS.contains(&FORMAT_WORKSPACE_COMMAND));
+        assert!(SUPPORTED_COMMANDS.contains(&SHOW_BACKLINKS_COMMAND));
+        assert_eq!(SHOW_BACKLINKS_COMMAND, "satz.showBacklinks");
+    }
+
+    #[test]
+    fn backlinks_are_the_links_in_other_notes_that_point_at_the_note() {
+        let files = [
+            ("a.md", "# A\n\nself [[a]]\n"),
+            ("b.md", "# B\n\nsee [[a]] and [t](a.md)\n"),
+            ("c.md", "# C\n\n[[b]] only\n"),
+            ("d.md", "# D\n\n[[a#Yok]] and [x](https://example.com)\n"),
+        ];
+        let found = backlinks_of_a(&files, serde_json::json!(uri_for("a.md"))).unwrap();
+        let mut spots: Vec<(String, u32, u32, u32)> = found
+            .iter()
+            .map(|l| {
+                (
+                    l.uri.as_str().rsplit('/').next().unwrap().to_string(),
+                    l.range.start.line,
+                    l.range.start.character,
+                    l.range.end.character,
+                )
+            })
+            .collect();
+        spots.sort();
+        // b.md: `[[a]]` at 4..9 and `[t](a.md)` at 14..23; d.md: `[[a#Yok]]`; never a.md itself.
+        assert_eq!(
+            spots,
+            vec![
+                ("b.md".to_string(), 2, 4, 9),
+                ("b.md".to_string(), 2, 14, 23),
+                ("d.md".to_string(), 2, 0, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_answer_covers_the_same_notes_the_lens_counts() {
+        let files = [
+            ("a.md", "# A\n"),
+            ("b.md", "[[a]] [[a]]\n"),
+            ("c.md", "[[a]]\n"),
+            ("d.md", "no link\n"),
+        ];
+        let state = state_with(
+            files
+                .iter()
+                .map(|(p, t)| parse_document(t, Path::new(p)))
+                .collect(),
+        );
+        let found = show_backlinks(&state, &[serde_json::json!(uri_for("a.md"))]).unwrap();
+        let notes: std::collections::BTreeSet<&str> =
+            found.iter().map(|l| l.uri.as_str()).collect();
+        let id = satz_core::DocId::new("a.md");
+        assert_eq!(notes.len(), state.index.incoming_from_others(&id).count());
+        assert_eq!(found.len(), 3, "one location per link");
+    }
+
+    #[test]
+    fn an_unknown_note_or_a_note_without_backlinks_gives_an_empty_answer() {
+        let files = [("a.md", "# A\n"), ("b.md", "# B\n")];
+        assert_eq!(
+            backlinks_of_a(&files, serde_json::json!(uri_for("nope.md"))).unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            backlinks_of_a(&files, serde_json::json!(uri_for("a.md"))).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn bad_arguments_are_rejected_with_a_reason() {
+        let state = state_with(vec![parse_document("# A\n", Path::new("a.md"))]);
+        for args in [
+            vec![],
+            vec![serde_json::json!(42)],
+            vec![serde_json::json!(null)],
+            vec![serde_json::json!(["a"])],
+            vec![serde_json::json!("")],
+            vec![serde_json::json!("not a uri at all")],
+        ] {
+            let err = show_backlinks(&state, &args).unwrap_err();
+            assert!(!err.is_empty(), "{args:?}");
+        }
     }
 }

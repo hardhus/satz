@@ -25,7 +25,7 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
     let satz_pos = lsp_pos_to_satz(pos);
     let byte_offset = doc.line_index.position_to_byte(satz_pos);
 
-    let link = doc.links.iter().find(|l| l.range.contains(byte_offset))?;
+    let link = doc.link_at(byte_offset)?;
 
     if link.kind == LinkKind::Footnote {
         if let Some(label) = &link.display {
@@ -103,7 +103,10 @@ fn format_hover_content(
     let slice = if missing_anchor.is_none() && link.target_heading.is_some() {
         // Section preview: from matching heading to next heading of same or higher level
         let heading_name = link.target_heading.as_deref().unwrap();
-        if let Some(h) = target_doc.headings.iter().find(|h| h.matches(heading_name)) {
+        if let Some(h) = target_doc
+            .resolve_heading(heading_name)
+            .map(|i| &target_doc.headings[i])
+        {
             let next_heading = target_doc
                 .headings
                 .iter()
@@ -118,7 +121,10 @@ fn format_hover_content(
     } else if missing_anchor.is_none() && link.target_block.is_some() {
         // Block preview: show the paragraph containing the block
         let block_id = link.target_block.as_deref().unwrap();
-        if let Some(b) = target_doc.blocks.iter().find(|b| b.id == block_id) {
+        if let Some(b) = target_doc
+            .resolve_block(block_id)
+            .map(|i| &target_doc.blocks[i])
+        {
             let (p_start, p_end) = paragraph_bounds(source, b.range.start, b.range.end);
             &source[p_start..p_end]
         } else {

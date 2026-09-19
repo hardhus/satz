@@ -22,7 +22,7 @@ pub use model::{
     Tag,
 };
 pub use parser::parse_document;
-pub use slug::{fold_key, heading_matches, slugify};
+pub use slug::{fold_key, slugify};
 pub use template::{generate_document_template, generate_frontmatter_block};
 pub use text::{LineIndex, Position};
 pub use walk::walk_vault;

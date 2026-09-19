@@ -80,7 +80,10 @@ pub fn compute_diagnostics(
     // 1. Link diagnostics (broken wikilinks, broken heading references, broken internal markdown links)
     for link in &doc.links {
         match link.kind {
-            LinkKind::WikiLink | LinkKind::Embed => {
+            LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown => {
+                if satz_core::model::link::is_external_target(&link.target_doc) {
+                    continue;
+                }
                 let range = byte_range_to_lsp(link.range, &doc.line_index);
                 match index.resolve_link_full_with_config(link, Some(doc), Some(config)) {
                     satz_core::LinkResolution::DocMissing => {
@@ -141,30 +144,6 @@ pub fn compute_diagnostics(
                         });
                     }
                     satz_core::LinkResolution::Resolved { .. } => {}
-                }
-            }
-            LinkKind::Markdown => {
-                if satz_core::model::link::is_external_target(&link.target_doc)
-                    || link.target_doc.is_empty()
-                {
-                    continue;
-                }
-                let range = byte_range_to_lsp(link.range, &doc.line_index);
-                if matches!(
-                    index.resolve_link_full(link, Some(doc)),
-                    satz_core::LinkResolution::DocMissing
-                ) {
-                    diagnostics.push(lsp::Diagnostic {
-                        range,
-                        severity: Some(lsp::DiagnosticSeverity::WARNING),
-                        code: Some(lsp::NumberOrString::String("broken-link".to_string())),
-                        source: Some("satz".to_string()),
-                        message: format!(
-                            "Broken link: '{}' could not be resolved",
-                            link.target_doc
-                        ),
-                        ..Default::default()
-                    });
                 }
             }
             // Pulldown-cmark only ever emits a `LinkKind::Footnote` here for a `[^label]`

@@ -26,8 +26,8 @@ pub fn code_lens(params: CodeLensParams, state: &SatzState) -> Option<Vec<CodeLe
         range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         command: Some(Command {
             title,
-            command: "satz.showBacklinks".to_string(),
-            arguments: None,
+            command: crate::handlers::execute_command::SHOW_BACKLINKS_COMMAND.to_string(),
+            arguments: Some(vec![serde_json::json!(uri)]),
         }),
         data: None,
     }])
@@ -133,6 +133,49 @@ mod tests {
         };
         let result = code_lens(params, &state).expect("CodeLens expected");
         result[0].command.as_ref().unwrap().title.clone()
+    }
+
+    #[test]
+    fn the_lens_command_is_the_advertised_one_and_carries_the_note_uri() {
+        let mut config = VaultConfig::default();
+        config.lsp.codelens.enable = true;
+        let mut state = SatzState {
+            index: Index::build(vec![parse_document(
+                "# A
+",
+                Path::new("doc-a.md"),
+            )]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            config,
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            "file:///doc-a.md".to_string(),
+            crate::state::OpenDocument::new(
+                "file:///doc-a.md",
+                Path::new("doc-a.md").to_path_buf(),
+                "# A
+",
+                1,
+            ),
+        );
+        let params = CodeLensParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///doc-a.md".parse().unwrap(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let lens = code_lens(params, &state).unwrap();
+        let command = lens[0].command.as_ref().unwrap();
+        assert!(
+            crate::handlers::execute_command::SUPPORTED_COMMANDS
+                .contains(&command.command.as_str())
+        );
+        assert_eq!(
+            command.arguments,
+            Some(vec![serde_json::json!("file:///doc-a.md")])
+        );
     }
 
     #[test]

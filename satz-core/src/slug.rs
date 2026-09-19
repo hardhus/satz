@@ -76,11 +76,6 @@ pub fn fold_key(s: &str) -> String {
     fold_key_ext(s, false)
 }
 
-/// Checks if a link heading target (raw text or slug) matches a heading.
-pub fn heading_matches(link_heading: &str, h: &crate::model::Heading) -> bool {
-    h.matches(link_heading)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

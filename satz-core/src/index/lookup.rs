@@ -267,7 +267,10 @@ impl Index {
         };
 
         if let Some(block_id) = &link.target_block {
-            if let Some(b) = target_doc.blocks.iter().find(|b| &b.id == block_id) {
+            if let Some(b) = target_doc
+                .resolve_block(block_id)
+                .map(|i| &target_doc.blocks[i])
+            {
                 LinkResolution::Resolved {
                     doc: target_doc,
                     anchor: Some(b.range),
@@ -280,7 +283,7 @@ impl Index {
             if let Some(h) = target_doc
                 .headings
                 .iter()
-                .find(|h| h.matches_slug(&link_slug) || h.matches(heading_ref))
+                .find(|h| h.matches_with_slug(heading_ref, &link_slug))
             {
                 LinkResolution::Resolved {
                     doc: target_doc,

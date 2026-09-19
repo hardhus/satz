@@ -48,7 +48,7 @@ pub fn inlay_hint(params: InlayHintParams, state: &SatzState) -> Option<Vec<Inla
                     continue;
                 }
 
-                let resolution = state.index.resolve_link_full(link, Some(doc));
+                let resolution = state.resolve(link, doc);
                 if same_note
                     && !matches!(resolution, satz_core::LinkResolution::AnchorMissing { .. })
                 {

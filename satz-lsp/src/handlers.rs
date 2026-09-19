@@ -15,3 +15,6 @@ pub mod references;
 pub mod rename;
 pub mod semantic_tokens;
 pub mod workspace_symbol;
+
+#[cfg(test)]
+mod consistency_tests;

@@ -13,7 +13,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 | Go to definition | Wikilinks, embeds, markdown links, footnote references. |
 | Find references | Documents, headings, block anchors, tags — see [Reference/highlight targets](#referencehighlight-targets). |
 | Hover | Preview of the link target (section/paragraph-scoped when the link has a heading/block anchor); footnote hover shows the footnote body. |
-| Document highlight | Same-document occurrences of whatever's under the cursor (tag family, heading + links to it, block + links to it). |
+| Document highlight | Same-document occurrences of whatever is under the cursor (the narrowest thing wins: a tag inside a heading is a tag): the tag family, a heading + links to it, a block + links to it, a footnote (every reference and its definition), or links to the same missing note. Links are resolved exactly like everywhere else (folder-relative Markdown paths, relative daily aliases). |
 | Completion | Context-aware: note/alias completion inside `[[`, heading completion inside `[[doc#`, block completion inside `[[doc#^` (the `^` you typed is replaced, never doubled), footnote label completion inside `[^`, tag completion after `#` (only where a tag can be typed — `# Heading text` is a heading marker — and with the spelling the vault uses most: `#Proje`, not the folded `#proje`). A `[[` already closed by `]]` earlier on the line is not a link being typed (so tags and footnotes still complete after it), and nothing is offered after a `|` (the display text). Supports `completionItem/resolve` for note previews. |
 | Document symbols | Heading outline, nested by level. Each symbol spans its whole section (children lie inside it); its selection is the heading line; an empty heading is named `(empty heading)`. |
 | Workspace symbols | Fuzzy search (via `nucleo-matcher`) over titles, aliases, and headings across the whole vault; supports a `tag:<name> <query>` prefix to scope the search to a tag. |
@@ -21,7 +21,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 | Code actions | Create a missing note, add a missing heading to a target document, insert a frontmatter template. |
 | Document links | Clickable ranges for every resolvable link, plus external `http(s)://` links. |
 | Folding ranges | The frontmatter block the parser found, and each heading's section (nested by level; the last section ends at the last content line). |
-| Code lens | "N backlinks" above the document. **Off by default** (`lsp.codelens.enable`). |
+| Code lens | "N backlinks" above the document; clicking it runs `satz.showBacklinks` (see [Show backlinks](#show-backlinks)). **Off by default** (`lsp.codelens.enable`). |
 | Inlay hints | Inline note metadata after links (only for links inside the requested range); `⚠ not found`, `⚠ heading not found` or `⚠ block not found` for broken ones, also for links to a heading of the same note. **On by default** (`lsp.inlay_hints.enable`). |
 | Semantic tokens | Full-document only (no range requests). Legend: `link`, `unresolvedLink`, `tag`, `heading`, `embed`, `blockAnchor`, `linkDisplay`. Footnote references (`[^label]`) get `link` when a matching definition exists, `unresolvedLink` when it doesn't (via a manual text scan — see the `broken-footnote` diagnostic below). A `[[target\|display]]`/`![[target\|display]]` link's `\|display` part gets its own `linkDisplay` token by default — see `lsp.semantic_tokens.split_link_display` in [`docs/configuration.md`](configuration.md#lsp--server-wide-lsp-tuning). Tokens never overlap and never span lines: inside a heading the link/tag/anchor tokens win and the heading colour covers the rest of the line, and a link that wraps across lines is coloured on each line. Refreshed automatically once initial vault indexing finishes, so a document opened before indexing completed gets recolored rather than staying stuck with mis-resolved links. Also refreshed after every debounced re-parse of an edited document (as is a pull client's diagnostics), so results are never one edit behind. |
 | Document formatting | Deterministic, structure-aware Markdown formatting (tables, lists, emphasis, thematic breaks, code fences, blockquotes) — see [`docs/configuration.md`](configuration.md#formatter--deterministic-markdown-formatting). |
@@ -67,7 +67,7 @@ New names are validated and a bad one is reported to the client as an error inst
 
 `includeDeclaration: false` removes the declaration (the heading, block or note start) from the result — never the reference under the cursor. Duplicate headings: only the first owns the links that point at it.
 
-Find References and Document Highlight both resolve "what's under the cursor" with the same priority order: **link → block anchor → heading → tag → whole document**. For tags, the search expands hierarchically (referencing `#parent` also surfaces `#parent/child` occurrences). For headings/blocks/documents, results include both the definition (if in the current/target document) and every link that resolves to it, scoped to that target's known backlinks.
+Find References and Document Highlight both resolve "what's under the cursor" with the same priority order: **the narrowest thing covering the cursor** (a link, block anchor, heading, tag or footnote; when they nest, the innermost one — `# Title #tag` on the tag is the tag, `[see [[x]]](y.md)` on `[[x]]` is `x`). For tags, the search expands hierarchically (referencing `#parent` also surfaces `#parent/child` occurrences). For headings/blocks/documents, results include both the definition (if in the current/target document) and every link that resolves to it, scoped to that target's known backlinks.
 
 ## Format the whole workspace
 
@@ -83,9 +83,9 @@ The workspace-format cache is dropped whenever `.satz.toml` is reloaded, so a ch
 
 `textDocument/formatting` (single-file formatting) uses the same minimal-diff approach, but never consults the workspace-format cache — you're actively editing that one file, so a cache would rarely help.
 
-## Code lens caveat
+## Show backlinks
 
-The backlink-count CodeLens's command is `satz.showBacklinks`, which the server does **not** implement (unlike `satz.formatWorkspace` above) — clicking it does nothing unless your editor/extension separately binds that command to some client-side action (e.g. opening a references panel). Treat it as an informational count unless you've wired up a client-side handler.
+The backlink CodeLens runs `satz.showBacklinks` with the note's URI as its only argument. The server answers with a `Location[]`: one location per link, in the other notes that point at this one (the notes the lens counts; a link from the note to itself is not a backlink). An unknown note gives an empty list, a missing or non-URI argument an `InvalidParams` error. The client decides how to show the list (for example a references panel).
 
 ## Live reindexing & config hot-reload
 

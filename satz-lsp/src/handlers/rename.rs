@@ -101,7 +101,7 @@ pub fn prepare_rename(
     }
 
     // 2. Link
-    if let Some(link) = doc.links.iter().find(|l| l.range.contains(byte_offset)) {
+    if let Some(link) = doc.link_at(byte_offset) {
         if let Some(target_heading) = &link.target_heading {
             return Some(PrepareRenameResponse::RangeWithPlaceholder {
                 range: byte_range_to_lsp(link.range, &doc.line_index),
@@ -150,7 +150,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
     }
 
     // 2. Cursor on a link
-    let Some(link) = doc.links.iter().find(|l| l.range.contains(byte_offset)) else {
+    let Some(link) = doc.link_at(byte_offset) else {
         return Ok(None);
     };
 

@@ -13,9 +13,3 @@ pub struct Frontmatter {
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
 }
-
-impl Frontmatter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}

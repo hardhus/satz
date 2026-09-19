@@ -288,9 +288,10 @@ impl LanguageServer for Backend {
                 ),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![
-                        crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND.to_string(),
-                    ],
+                    commands: crate::handlers::execute_command::SUPPORTED_COMMANDS
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect(),
                     work_done_progress_options: Default::default(),
                 }),
                 ..Default::default()
@@ -644,6 +645,16 @@ impl LanguageServer for Backend {
         params: ExecuteCommandParams,
     ) -> jsonrpc::Result<Option<serde_json::Value>> {
         tracing::debug!(command = %params.command, "execute_command");
+        if params.command == crate::handlers::execute_command::SHOW_BACKLINKS_COMMAND {
+            let state = self.state.read().await;
+            return match crate::handlers::execute_command::show_backlinks(&state, &params.arguments)
+            {
+                Ok(locations) => Ok(Some(
+                    serde_json::to_value(locations).unwrap_or(serde_json::Value::Null),
+                )),
+                Err(reason) => Err(jsonrpc::Error::invalid_params(reason)),
+            };
+        }
         if params.command != crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND {
             return Err(jsonrpc::Error::method_not_found());
         }

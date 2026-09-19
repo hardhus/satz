@@ -66,7 +66,7 @@ Standard Markdown footnote syntax. References and definitions are matched by lab
 This is the paragraph you want to reference. ^my-block-id
 ```
 
-A block anchor is `^` immediately followed by alphanumerics/hyphens, at the end of its line (optionally followed by one punctuation mark, e.g. `^id.`), preceded by whitespace or start-of-line — so `2 ^3 power` is not an anchor. A trailing ` ^id` on a heading line labels the heading and is not part of its text (`## Old ^blk` is matched as `Old`). Reference it from anywhere with `[[note#^my-block-id]]`.
+A block anchor is `^` immediately followed by alphanumerics/hyphens, at the end of its line (optionally followed by one punctuation mark, e.g. `^id.`), preceded by whitespace or start-of-line — so `2 ^3 power` is not an anchor. A trailing ` ^id` on a heading line labels the heading and is not part of its text (`## Old ^blk` is matched as `Old`). Reference it from anywhere with `[[note#^my-block-id]]`. Block ids are matched ignoring case (`[[note#^ABC]]` finds `^abc`).
 
 ## Frontmatter
 

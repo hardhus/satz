@@ -189,6 +189,17 @@ pub fn config_error_message(error: &str, fallback: &str) -> String {
 }
 
 impl SatzState {
+    /// Resolves a link of `doc` the way every handler must: folder-relative Markdown paths, relative
+    /// daily aliases from the config, and the heading/block anchor check.
+    pub fn resolve<'a>(
+        &'a self,
+        link: &satz_core::Link,
+        doc: &'a satz_core::Document,
+    ) -> satz_core::LinkResolution<'a> {
+        self.index
+            .resolve_link_full_with_config(link, Some(doc), Some(&self.config))
+    }
+
     /// Whether formatting requests may be served: the formatter is enabled in the config AND the
     /// config file is usable (see `config_error`).
     pub fn formatting_allowed(&self) -> bool {

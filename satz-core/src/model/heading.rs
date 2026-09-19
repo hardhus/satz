@@ -42,16 +42,28 @@ impl Heading {
         (name, Some(id))
     }
 
-    /// Checks if a precomputed link slug matches this heading.
-    pub fn matches_slug(&self, link_slug: &str) -> bool {
-        self.slug == link_slug
-    }
-
     /// Checks if a link heading target (raw text or slug) matches this heading.
     pub fn matches(&self, link_heading: &str) -> bool {
-        self.slug == link_heading
-            || self.text.eq_ignore_ascii_case(link_heading)
-            || self.slug == crate::slug::slugify(link_heading)
+        self.matches_with_slug(link_heading, &crate::slug::slugify(link_heading))
+    }
+
+    /// Like [`Heading::matches`] with the reference's slug already computed, so a lookup over many
+    /// headings slugifies the reference once. A heading or reference without letters or digits has an
+    /// empty slug, which never counts as a match; those are compared by their folded text instead.
+    pub fn matches_with_slug(&self, link_heading: &str, link_slug: &str) -> bool {
+        if link_heading.trim().is_empty() {
+            return false;
+        }
+        if !self.slug.is_empty() {
+            // `ı` and `i` are one letter here (an all-caps `NOTLARI` cannot tell them apart).
+            let same = |a: &str, b: &str| {
+                let fold = |c: char| if c == 'ı' { 'i' } else { c };
+                a.chars().map(fold).eq(b.chars().map(fold))
+            };
+            return same(&self.slug, link_heading) || same(&self.slug, link_slug);
+        }
+        // No letters or digits: only identical text (ignoring case and spacing) matches.
+        crate::slug::fold_key(&self.text) == crate::slug::fold_key(link_heading)
     }
 }
 
