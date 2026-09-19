@@ -45,9 +45,10 @@ pub fn goto_definition(
         return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
     }
 
-    let resolution = state
-        .index
-        .resolve_link_full_with_config(link, Some(doc), Some(&state.config));
+    let resolution =
+        state
+            .index
+            .resolve_link_full_with_config(link, Some(doc), Some(&state.config));
     // Deliberately not logging `resolution` itself: it borrows the full target
     // `Document` and its derived `Debug` would dump the whole parsed document
     // (content, headings, links, ...) on every `gd` call at debug level.
@@ -273,5 +274,89 @@ mod tests {
         } else {
             panic!("Expected scalar location");
         }
+    }
+
+    fn definition_file(files: &[(&str, &str)], open: &str, at: (u32, u32)) -> Option<String> {
+        let root = if cfg!(windows) {
+            Path::new("C:\\vault").to_path_buf()
+        } else {
+            Path::new("/vault").to_path_buf()
+        };
+        let mut state = SatzState::default();
+        state.index = Index::build(
+            files
+                .iter()
+                .map(|(p, t)| parse_document(t, Path::new(p)))
+                .collect(),
+        );
+        state.vault_root = Some(root.clone());
+        let uri_of = |rel: &str| {
+            crate::convert::path_to_uri(&root.join(rel))
+                .unwrap()
+                .as_str()
+                .to_string()
+        };
+        let text = files.iter().find(|(p, _)| *p == open).unwrap().1;
+        let uri = uri_of(open);
+        state.open_docs.insert(
+            uri.clone(),
+            crate::state::OpenDocument::new(&uri, root.join(open), text, 1),
+        );
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                position: tower_lsp_server::ls_types::Position::new(at.0, at.1),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let response = goto_definition(params, &state)?;
+        let location = match response {
+            GotoDefinitionResponse::Scalar(l) => l,
+            GotoDefinitionResponse::Array(mut v) => v.remove(0),
+            GotoDefinitionResponse::Link(_) => return None,
+        };
+        let target = crate::convert::uri_to_path(location.uri.as_str())?;
+        Some(
+            target
+                .strip_prefix(&root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/"),
+        )
+    }
+
+    #[test]
+    fn a_relative_markdown_link_goes_to_the_note_in_its_own_folder() {
+        let files = [
+            ("sub/a.md", "See [t](b.md) and [u](../c.md)\n"),
+            ("sub/b.md", "# sub b\n"),
+            ("b.md", "# root b\n"),
+            ("c.md", "# c\n"),
+            ("sub/c.md", "# sub c\n"),
+        ];
+        assert_eq!(
+            definition_file(&files, "sub/a.md", (0, 8)),
+            Some("sub/b.md".into())
+        );
+        assert_eq!(
+            definition_file(&files, "sub/a.md", (0, 24)),
+            Some("c.md".into())
+        );
+    }
+
+    #[test]
+    fn a_wikilink_still_uses_the_vault_wide_rule() {
+        let files = [
+            ("sub/a.md", "See [[b]]\n"),
+            ("sub/b.md", "# sub b\n"),
+            ("b.md", "# root b\n"),
+        ];
+        assert_eq!(
+            definition_file(&files, "sub/a.md", (0, 7)),
+            Some("b.md".into())
+        );
     }
 }

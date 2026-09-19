@@ -18,6 +18,15 @@ pub enum LinkResolution<'a> {
     DocMissing,
 }
 
+/// Outcome of resolving a Markdown link path relative to its own note.
+enum RelativeResolution<'a> {
+    Found(&'a DocId),
+    /// The path climbs above the vault root.
+    EscapesVault,
+    /// Not a relative path, or nothing there: use the vault-wide lookup.
+    NotApplicable,
+}
+
 /// In-memory vault index.
 #[derive(Debug, Default)]
 pub struct Index {
@@ -110,6 +119,46 @@ impl Index {
         self.by_title_alias.get(&fold_key(trimmed))
     }
 
+    /// Resolves a Markdown link path against the folder of the note `from` that contains it:
+    /// `.` and `..` components are applied, and the result is looked up as a vault path (with or
+    /// without `.md`, ignoring case).
+    fn resolve_relative_to(&self, from: &Path, target: &str) -> RelativeResolution<'_> {
+        let target = target.trim().replace('\\', "/");
+        if target.starts_with('/') {
+            return RelativeResolution::NotApplicable;
+        }
+        let mut parts: Vec<String> = from
+            .parent()
+            .map(|dir| {
+                dir.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for component in target.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return RelativeResolution::EscapesVault;
+                    }
+                }
+                other => parts.push(other.to_string()),
+            }
+        }
+        let joined = parts.join("/");
+        if let Some(id) = self.by_path.get(Path::new(&joined)) {
+            return RelativeResolution::Found(id);
+        }
+        if let Some(id) = self.by_path.get(Path::new(&format!("{joined}.md"))) {
+            return RelativeResolution::Found(id);
+        }
+        match self.by_path_folded.get(&fold_path_key(&joined)) {
+            Some(id) => RelativeResolution::Found(id),
+            None => RelativeResolution::NotApplicable,
+        }
+    }
+
     /// Resolves relative daily note aliases like `[[bugün]]`, `[[dün]]`, `[[yarın]]`
     /// to the target `DocId` based on `DailyNoteConfig`.
     pub fn resolve_relative_daily(
@@ -180,7 +229,20 @@ impl Index {
             };
         }
 
+        // A Markdown link's path is relative to the note that contains it; a path that climbs out of
+        // the vault is broken (it is not matched by file name as a wikilink would be).
+        let relative = match (link.kind, current_doc) {
+            (LinkKind::Markdown, Some(from)) if !link.target_doc.is_empty() => {
+                self.resolve_relative_to(&from.path, &link.target_doc)
+            }
+            _ => RelativeResolution::NotApplicable,
+        };
+
         let resolved_id = if link.target_doc.is_empty() {
+            None
+        } else if let RelativeResolution::Found(id) = relative {
+            Some(id)
+        } else if matches!(relative, RelativeResolution::EscapesVault) {
             None
         } else if let Some(id) = self.resolve_link(&link.target_doc) {
             Some(id)

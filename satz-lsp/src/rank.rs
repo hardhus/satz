@@ -9,6 +9,22 @@ pub struct Ranker {
     buf: Vec<char>,
 }
 
+/// Puts the Turkish I family on the same footing as ASCII `I`/`i`, for the query AND the target:
+/// `İ` -> `I`, `ı` -> `i`, and the combining dot above (`U+0307`, how a decomposed `İ` is written)
+/// is dropped. nucleo alone treats `İ`/`ı` as unrelated to `i`/`I`, so `işlem` would never find
+/// `İşlem`. Keeping capital and small letters apart preserves nucleo's smart case: a query with a
+/// capital (`İşlem`) stays case sensitive, one without (`işlem`) finds both.
+fn fold_turkish_i(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c != '\u{307}')
+        .map(|c| match c {
+            'İ' => 'I',
+            'ı' => 'i',
+            other => other,
+        })
+        .collect()
+}
+
 impl Ranker {
     pub fn new(query: &str) -> Self {
         // `Pattern::parse` would read `^`, `$`, `!` and a leading `'` as nucleo's own query syntax;
@@ -17,7 +33,7 @@ impl Ranker {
             .split_whitespace()
             .map(|word| {
                 Pattern::new(
-                    word,
+                    &fold_turkish_i(word),
                     CaseMatching::Smart,
                     Normalization::Smart,
                     AtomKind::Fuzzy,
@@ -37,7 +53,8 @@ impl Ranker {
             return Some(0);
         }
         self.buf.clear();
-        let haystack = Utf32Str::new(target, &mut self.buf);
+        let folded = fold_turkish_i(target);
+        let haystack = Utf32Str::new(&folded, &mut self.buf);
         let mut total = 0u32;
         for pattern in &self.patterns {
             total = total.saturating_add(pattern.score(haystack, &mut self.matcher)?);
@@ -111,5 +128,41 @@ mod tests {
         let exact = ranker.score("sat").unwrap();
         let scattered = ranker.score("s-a-t stuff").unwrap();
         assert!(exact > scattered);
+    }
+
+    // ---- the Turkish I family: İ ı I i ----
+
+    #[test]
+    fn a_lowercase_query_finds_dotted_and_dotless_capitals() {
+        assert!(matches("işlem", "İşlem notları"));
+        assert!(matches("i", "İstanbul"));
+        assert!(matches("istanbul", "İstanbul"));
+        assert!(matches("ışık", "Işık"));
+        assert!(matches("işlem", "Işlem"));
+        assert!(matches("ısı", "ISI"));
+    }
+
+    #[test]
+    fn an_uppercase_query_keeps_smart_case_for_the_family() {
+        assert!(matches("İşlem", "İşlem notları"));
+        assert!(matches("Işlem", "İşlem"));
+        assert!(matches("İ", "İstanbul"));
+        // Like `Foo` vs `foo`: a capital in the query makes it case sensitive.
+        assert!(!matches("İşlem", "işlem notları"));
+        assert!(!matches("İ", "istanbul"));
+    }
+
+    #[test]
+    fn a_decomposed_capital_i_with_dot_matches_like_the_composed_one() {
+        assert!(matches("işlem", "I\u{307}şlem"));
+        assert!(matches("İşlem", "I\u{307}şlem"));
+        assert!(matches("i\u{307}şlem", "İşlem"));
+    }
+
+    #[test]
+    fn other_letters_and_words_are_unaffected() {
+        assert!(matches("ğüş", "Ağüşt"));
+        assert!(!matches("xyz", "İşlem"));
+        assert!(matches("iş not", "Not defteri İş"));
     }
 }

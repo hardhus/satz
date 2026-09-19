@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "satz-cli"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "satz-core"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "satz-lsp"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "notify",
