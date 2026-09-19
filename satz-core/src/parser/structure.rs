@@ -69,6 +69,12 @@ pub struct StructureOutput {
     /// Only top-level paragraphs — not inside a list item, blockquote, or table — since wrapping
     /// those would need indentation-aware continuation lines the wrap pass doesn't attempt yet.
     pub paragraph_spans: Vec<ByteRange>,
+    /// Every code BLOCK, fenced or indented (never inline code spans). Whitespace and blank
+    /// lines inside are content, so line-oriented passes must leave their lines alone.
+    pub code_block_spans: Vec<ByteRange>,
+    /// Every HTML block (`<div>`, `<pre>`, `<!-- -->`, ...), whose raw text is passed through to
+    /// the output verbatim.
+    pub html_block_spans: Vec<ByteRange>,
 }
 
 /// Parses the structural markdown components using `pulldown-cmark`.
@@ -122,6 +128,7 @@ pub fn parse_structure(source: &str) -> StructureOutput {
     let mut blockquote_start = 0usize;
 
     let mut paragraph_start = 0usize;
+    let mut html_block_start = 0usize;
 
     for (event, range) in parser.into_offset_iter() {
         match event {
@@ -273,10 +280,21 @@ pub fn parse_structure(source: &str) -> StructureOutput {
                     in_code_block = false;
                     let full_range = ByteRange::new(code_block_start, range.end);
                     output.code_spans.push(full_range);
+                    output.code_block_spans.push(full_range);
                     if code_block_is_fenced {
                         output.code_fence_spans.push(full_range);
                     }
                 }
+            }
+
+            // --- HTML blocks (raw text passed through verbatim) ---
+            Event::Start(Tag::HtmlBlock) => {
+                html_block_start = range.start;
+            }
+            Event::End(TagEnd::HtmlBlock) => {
+                output
+                    .html_block_spans
+                    .push(ByteRange::new(html_block_start, range.end));
             }
 
             // --- Inline Code ---
@@ -517,6 +535,58 @@ mod tests {
         let structure = parse_structure(md);
         assert_eq!(structure.rule_spans.len(), 1);
         assert!(structure.frontmatter_range.is_some());
+    }
+
+    fn texts<'a>(md: &'a str, spans: &[ByteRange]) -> Vec<&'a str> {
+        spans.iter().map(|r| md[r.start..r.end].trim()).collect()
+    }
+
+    #[test]
+    fn code_block_spans_cover_fenced_and_indented_blocks_but_not_inline_code() {
+        let md = "text `inline`\n\n```\nfenced\n```\n\n    indented one\n    indented two\n\nend\n";
+        let out = parse_structure(md);
+        assert_eq!(
+            texts(md, &out.code_block_spans),
+            vec!["```\nfenced\n```", "indented one\n    indented two"],
+        );
+        // Inline code stays out of the block list (but is still a code span).
+        assert!(out.code_spans.len() >= 3);
+    }
+
+    #[test]
+    fn code_block_spans_include_blocks_nested_in_quotes_and_lists() {
+        let md = "> ```\n> in quote\n> ```\n\n- item\n\n  ```\n  in list\n  ```\n";
+        let out = parse_structure(md);
+        assert_eq!(
+            out.code_block_spans.len(),
+            2,
+            "{:?}",
+            texts(md, &out.code_block_spans)
+        );
+    }
+
+    #[test]
+    fn a_document_without_code_blocks_has_no_code_block_spans() {
+        let out = parse_structure("just `inline` code\n");
+        assert!(out.code_block_spans.is_empty());
+    }
+
+    #[test]
+    fn html_block_spans_cover_block_html_only() {
+        let md = "<div>\nx\n\ny\n</div>\n\npara <b>inline</b> html\n\n<!-- comment -->\n\n<pre>\na\n\n\nb\n</pre>\n";
+        let out = parse_structure(md);
+        let t = texts(md, &out.html_block_spans);
+        assert!(t.iter().any(|s| s.starts_with("<div>")), "{t:?}");
+        assert!(t.iter().any(|s| s.starts_with("<!-- comment -->")), "{t:?}");
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("<pre>") && s.ends_with("</pre>")),
+            "{t:?}"
+        );
+        assert!(
+            t.iter().all(|s| !s.contains("para")),
+            "inline html is not a block: {t:?}"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod diff;
 pub mod emphasis;
 pub mod line_pass;
+pub mod links;
 pub mod list;
 pub mod misc;
 pub mod table;
@@ -12,7 +13,9 @@ use crate::model::ByteRange;
 
 /// Formats a markdown document deterministically according to the provided `FormatterConfig`.
 ///
-/// Three stages, in order:
+/// Four stages, in order:
+/// 0. `links::normalize` trims the whitespace inside wikilinks (outside code and frontmatter), first,
+///    so tables and wrapping measure the final link text and one pass is always enough.
 /// 1. A single `parse_structure` call gathers every construct's byte ranges (tables,
 ///    emphasis/strong, list markers, rule lines, blockquote markers, code fences), each
 ///    sub-module turns its ranges into replacement text, and all replacements are spliced into
@@ -24,7 +27,8 @@ use crate::model::ByteRange;
 ///    for text inside it, and `splice_ranges` silently drops overlapping ranges rather than
 ///    merging them. Running after stage 1 also means wrapping sees the already-normalized
 ///    `**bold**`/list-marker/etc. text, not the pre-formatting source.
-/// 3. `line_pass` (trim/blank-line/heading-spacing/final-newline) runs on the result.
+/// 3. `line_pass::layout` (trim/blank-line/heading-spacing/final-newline) runs on the result;
+///    frontmatter, code blocks (fenced or indented) and HTML blocks are copied through untouched.
 ///
 /// Stage 1's ranges never overlap each other by construction: every construct there replaces
 /// only marker/fence bytes or (for tables) a region whose inner content is deliberately
@@ -32,7 +36,37 @@ use crate::model::ByteRange;
 /// of that verbatim-cell policy: emphasis/list/etc. markers *inside* a table cell are not
 /// separately normalized by this pass (they're copied as-is by the table renderer); this is an
 /// accepted, narrow scope limitation, not a correctness bug.
+///
+/// Line endings are preserved: a document whose lines mostly end in `\r\n` is formatted as if it
+/// used `\n` and converted back afterwards, so a CRLF file stays CRLF (and formats exactly like its
+/// LF twin). A document mixing both styles is normalised to whichever is more common (LF on a tie).
+/// A lone `\r` that isn't part of `\r\n` is ordinary content and is left alone.
 pub fn format_document(source: &str, config: &FormatterConfig) -> String {
+    if !source.contains('\r') {
+        return format_lf(source, config);
+    }
+    let crlf = uses_crlf(source);
+    let normalized = source.replace("\r\n", "\n");
+    let formatted = format_lf(&normalized, config);
+    if crlf {
+        formatted.replace('\n', "\r\n")
+    } else {
+        formatted
+    }
+}
+
+/// True if more of the document's line endings are `\r\n` than bare `\n`.
+fn uses_crlf(source: &str) -> bool {
+    let crlf = source.matches("\r\n").count();
+    let lf = source.matches('\n').count() - crlf;
+    crlf > lf
+}
+
+/// The formatting pipeline proper; expects `\n` line endings only.
+fn format_lf(source: &str, config: &FormatterConfig) -> String {
+    // Stage 0: wikilink whitespace. Done first so tables and wrapping measure the final link text.
+    let source = links::normalize(source, config);
+    let source = source.as_str();
     let structure = crate::parser::structure::parse_structure(source);
     let mut replacements: Vec<(ByteRange, String)> = Vec::new();
 
@@ -40,7 +74,11 @@ pub fn format_document(source: &str, config: &FormatterConfig) -> String {
         let mut spans = structure.table_spans.clone();
         spans.sort_by_key(|s| s.start);
         for span in spans {
+            // A table whose rows have more cells than its header (typically an unescaped `|`
+            // inside a wikilink or code span) can only be re-rendered by deleting the extra
+            // cells from the file, so it is left exactly as written.
             let rendered = table::parse_table_block(source, span)
+                .filter(|block| block.dropped_cells == 0)
                 .map(|block| table::render(&block, &config.tables))
                 .unwrap_or_else(|| source[span.start..span.end].to_string());
             replacements.push((span, rendered));
@@ -77,7 +115,7 @@ pub fn format_document(source: &str, config: &FormatterConfig) -> String {
     let spliced = zones::splice_ranges(source, &replacements);
     let wrapped = wrap::wrap(&spliced, config);
 
-    line_pass::run(&wrapped, config)
+    line_pass::layout(&wrapped, config)
 }
 
 #[cfg(test)]
@@ -111,6 +149,118 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    fn crlf(s: &str) -> String {
+        s.replace('\n', "\r\n")
+    }
+
+    const DIRTY_LF: &str =
+        "# T\n\nText with   trailing   \n\n\n\n- a\n- b\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+
+    #[test]
+    fn crlf_document_formats_like_its_lf_twin_and_stays_crlf() {
+        let config = FormatterConfig::default();
+        let expected = crlf(&format_document(DIRTY_LF, &config));
+        let got = format_document(&crlf(DIRTY_LF), &config);
+        assert_eq!(got, expected);
+        assert!(got.contains("\r\n"));
+        assert!(
+            !got.replace("\r\n", "").contains('\n'),
+            "bare LF in CRLF output: {got:?}"
+        );
+    }
+
+    #[test]
+    fn lf_document_stays_lf() {
+        let out = format_document(DIRTY_LF, &FormatterConfig::default());
+        assert!(!out.contains('\r'), "{out:?}");
+    }
+
+    #[test]
+    fn mixed_line_endings_follow_the_dominant_style() {
+        let config = FormatterConfig::default();
+        // 2 CRLF vs 1 LF -> CRLF
+        assert_eq!(format_document("a\r\nb\r\nc\n", &config), "a\r\nb\r\nc\r\n");
+        // 1 CRLF vs 2 LF -> LF
+        assert_eq!(format_document("a\nb\nc\r\n", &config), "a\nb\nc\n");
+        // tie -> LF
+        assert_eq!(format_document("a\r\nb\n", &config), "a\nb\n");
+    }
+
+    #[test]
+    fn crlf_edge_cases() {
+        let config = FormatterConfig::default();
+        // Empty and line-ending-only documents.
+        assert_eq!(
+            format_document("\r\n", &config),
+            format_document("\n", &config)
+        );
+        assert_eq!(
+            format_document("\r\n\r\n\r\n", &config),
+            format_document("\n\n\n", &config)
+        );
+        // No line ending at all: nothing to be "dominant"; the final newline is added as LF.
+        assert_eq!(format_document("abc", &config), "abc\n");
+        // A single CRLF line keeps CRLF.
+        assert_eq!(format_document("abc\r\n", &config), "abc\r\n");
+        // final_newline = false: no trailing ending is added or kept, others stay CRLF.
+        let no_final = FormatterConfig {
+            final_newline: false,
+            ..FormatterConfig::default()
+        };
+        assert_eq!(format_document("a\r\nb   \r\n", &no_final), "a\r\nb");
+    }
+
+    #[test]
+    fn crlf_code_block_frontmatter_and_table_are_preserved() {
+        let config = FormatterConfig::default();
+        let code = "```\r\ncode with trailing spaces   \r\n\r\n\r\n\r\nmore\r\n```\r\n";
+        assert_eq!(format_document(code, &config), code);
+
+        let fm = "---\r\ntitle: x\r\n---\r\n\r\n# H\r\n";
+        assert_eq!(format_document(fm, &config), fm);
+
+        let table = "| a | b |\r\n|---|---|\r\n| 1 | 2 |\r\n";
+        assert_eq!(
+            format_document(table, &config),
+            "| a   | b   |\r\n|-----|-----|\r\n| 1   | 2   |\r\n"
+        );
+    }
+
+    #[test]
+    fn a_lone_carriage_return_is_content_not_a_line_ending() {
+        let out = format_document("a\rb\n", &FormatterConfig::default());
+        assert_eq!(out, "a\rb\n");
+    }
+
+    #[test]
+    fn links_are_normalised_before_tables_and_wrapping_so_one_pass_is_enough() {
+        let config = FormatterConfig::default();
+        // The link's normalised width decides the column width, in a single pass.
+        let table = "| x | y |\n|---|---|\n| [[ a ]] | b |\n";
+        let once = format_document(table, &config);
+        assert_eq!(once, "| x     | y   |\n|-------|-----|\n| [[a]] | b   |\n");
+        assert_eq!(format_document(&once, &config), once);
+
+        // Wrapping measures links after normalisation, so a second pass changes nothing.
+        let mut wrap = FormatterConfig::default();
+        wrap.wrap.enable = true;
+        wrap.line_width = 20;
+        let text = "Inline code `[[ a ]]` and [[ b ]] then more words follow here.\n";
+        let once = format_document(text, &wrap);
+        assert_eq!(format_document(&once, &wrap), once);
+        assert!(
+            once.contains("`[[ a ]]`") && once.contains("[[b]]"),
+            "{once:?}"
+        );
+    }
+
+    #[test]
+    fn crlf_formatting_is_idempotent() {
+        let config = FormatterConfig::default();
+        let once = format_document(&crlf(DIRTY_LF), &config);
+        assert_eq!(format_document(&once, &config), once);
     }
 
     /// Same idempotency guarantee with paragraph wrapping ON, over every fixture plus paragraphs

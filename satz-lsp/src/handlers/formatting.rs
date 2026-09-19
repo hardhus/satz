@@ -173,6 +173,74 @@ mod tests {
         assert!(!edits.is_empty(), "fixing the config re-enables formatting");
     }
 
+    fn state_and_params_for(text: &str) -> (SatzState, DocumentFormattingParams) {
+        let rel_path = Path::new("test.md");
+        let mut state = SatzState {
+            index: Index::build(vec![parse_document(text, rel_path)]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            "file:///test.md".to_string(),
+            crate::state::OpenDocument::new("file:///test.md", rel_path.to_path_buf(), text, 1),
+        );
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.md".parse().unwrap(),
+            },
+            options: tower_lsp_server::ls_types::FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+        };
+        (state, params)
+    }
+
+    #[test]
+    fn a_clean_crlf_document_gets_no_edits() {
+        let text = "# Title\r\n\r\nClean paragraph.\r\n\r\n- a\r\n- b\r\n";
+        let (state, params) = state_and_params_for(text);
+        let edits = formatting(params, &state).expect("Some");
+        assert!(
+            edits.is_empty(),
+            "CRLF must not count as a change: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn a_dirty_crlf_document_is_formatted_and_stays_entirely_crlf() {
+        let text = "# Title\r\n\r\nLine with   trailing   \r\n\r\n\r\n\r\nNext.\r\n";
+        let (state, params) = state_and_params_for(text);
+
+        let edits = formatting(params, &state).expect("Some");
+        assert!(!edits.is_empty(), "the dirty document must produce edits");
+
+        let result = crate::convert::apply_text_edits(text, &edits);
+        assert_eq!(
+            result,
+            "# Title\r\n\r\nLine with   trailing\r\n\r\nNext.\r\n"
+        );
+    }
+
+    #[test]
+    fn crlf_edits_leave_untouched_lines_alone() {
+        // Only the middle line is dirty; the edits must not rewrite the clean CRLF lines.
+        let text = "clean one\r\ndirty   \r\nclean two\r\n";
+        let (state, params) = state_and_params_for(text);
+
+        let edits = formatting(params, &state).expect("Some");
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].range.start.line, 1);
+        assert_eq!(edits[0].range.end.line, 2);
+        assert_eq!(
+            crate::convert::apply_text_edits(text, &edits),
+            "clean one\r\ndirty\r\nclean two\r\n"
+        );
+    }
+
     #[test]
     fn test_formatting_disabled_returns_no_edits() {
         let text = "Line 1   \n\n\n\nLine 2   ";

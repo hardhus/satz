@@ -25,6 +25,8 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 insta = { workspace = true, features = ["yaml"] }
+# `html` is only needed by the formatter safety tests (they compare rendered HTML).
+pulldown-cmark = { workspace = true, features = ["html"] }
 
 [[bench]]
 name = "benchmark"

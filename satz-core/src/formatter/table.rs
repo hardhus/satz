@@ -22,6 +22,10 @@ pub struct TableBlock {
     pub alignments: Vec<ColumnAlignment>,
     pub header: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// How many cells beyond the delimiter row's column count the source rows contained (and that
+    /// `header`/`rows` therefore no longer hold). Re-rendering a table with `dropped_cells > 0`
+    /// would delete that text from the file.
+    pub dropped_cells: usize,
 }
 
 /// Parses the raw source text of a single table block (a byte range already validated as a GFM
@@ -56,14 +60,20 @@ pub fn parse_table_block(source: &str, range: ByteRange) -> Option<TableBlock> {
     let alignments: Vec<ColumnAlignment> = delim_cells.iter().map(|c| parse_alignment(c)).collect();
     let col_count = alignments.len();
 
-    let header = normalize_row(split_row(header_line), col_count);
+    let mut dropped_cells = 0usize;
+    let mut normalize = |cells: Vec<String>| {
+        dropped_cells += cells.len().saturating_sub(col_count);
+        normalize_row(cells, col_count)
+    };
+
+    let header = normalize(split_row(header_line));
 
     let mut rows = Vec::with_capacity(lines.len().saturating_sub(2));
     for &row_line in &lines[2..] {
         if row_line.trim().is_empty() {
             continue;
         }
-        rows.push(normalize_row(split_row(row_line), col_count));
+        rows.push(normalize(split_row(row_line)));
     }
 
     Some(TableBlock {
@@ -71,6 +81,7 @@ pub fn parse_table_block(source: &str, range: ByteRange) -> Option<TableBlock> {
         alignments,
         header,
         rows,
+        dropped_cells,
     })
 }
 
@@ -102,8 +113,10 @@ fn split_row(line: &str) -> Vec<String> {
     let mut boundaries = Vec::new();
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'|' {
-            let escaped = i > 0 && bytes[i - 1] == b'\\';
-            if !escaped {
+            // A `|` is escaped only by an ODD number of backslashes right before it: `\|` is an
+            // escaped pipe, but in `\\|` the backslash is itself escaped and the pipe separates.
+            let backslashes = bytes[..i].iter().rev().take_while(|&&c| c == b'\\').count();
+            if backslashes % 2 == 0 {
                 boundaries.push(i);
             }
         }
@@ -304,6 +317,110 @@ mod tests {
         let span = structure.table_spans[0];
         let block = parse_table_block(source, span).unwrap();
         assert_eq!(block.rows[0], vec!["`a", "b`"]);
+    }
+
+    fn parse(source: &str) -> TableBlock {
+        let structure = crate::parser::structure::parse_structure(source);
+        let span = *structure
+            .table_spans
+            .first()
+            .unwrap_or_else(|| panic!("not parsed as a table: {source:?}"));
+        parse_table_block(source, span).unwrap()
+    }
+
+    #[test]
+    fn a_table_that_would_lose_cells_is_flagged() {
+        for (label, source) in [
+            (
+                "extra cell in a body row",
+                "| a | b |\n|---|---|\n| 1 | 2 | 3 |\n| x | y |\n",
+            ),
+            (
+                "unescaped pipe in a wikilink",
+                "| Link | Note |\n|------|------|\n| [[a|b]] | text |\n",
+            ),
+            (
+                "unescaped pipe in a code span",
+                "| Expr | Result |\n|---|---|\n| `a|b` | ok |\n",
+            ),
+            (
+                "several rows, only the last has an extra cell",
+                "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 | 7 | 8 |\n",
+            ),
+        ] {
+            let block = parse(source);
+            assert!(
+                block.dropped_cells > 0,
+                "{label}: rendering would silently delete source text but is not flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_that_loses_nothing_is_not_flagged() {
+        for (label, source) in [
+            ("plain", "| a | b |\n|---|---|\n| 1 | 2 |\n"),
+            (
+                "missing cell is padded, not lost",
+                "| a | b |\n|---|---|\n| only |\n",
+            ),
+            ("empty trailing cells", "| a | b |\n|---|---|\n| 1 | |\n"),
+            (
+                "escaped pipe stays in its cell",
+                "| a | b |\n|---|---|\n| [[a\\|b]] | text |\n",
+            ),
+            (
+                "escaped pipe in code",
+                "| a | b |\n|---|---|\n| `a\\|b` | ok |\n",
+            ),
+            ("single column", "| a |\n|---|\n| 1 |\n"),
+            ("no outer pipes", "a | b\n--|--\n1 | 2\n"),
+        ] {
+            assert_eq!(parse(source).dropped_cells, 0, "{label}");
+        }
+    }
+
+    #[test]
+    fn formatting_leaves_a_table_that_would_lose_cells_byte_for_byte_alone() {
+        use crate::config::FormatterConfig;
+        for source in [
+            "# T\n\n| a | b |\n|---|---|\n| 1 | 2 | 3 |\n| x | y |\n\nAfter.\n",
+            "| Link | Note |\n|------|------|\n| [[a|b]] | text |\n",
+            "| Expr | Result |\n|---|---|\n| `a|b` | ok |\n",
+        ] {
+            assert_eq!(
+                crate::formatter::format_document(source, &FormatterConfig::default()),
+                source,
+                "a table with unparseable extra cells must be left exactly as written"
+            );
+        }
+    }
+
+    #[test]
+    fn formatting_still_aligns_a_table_with_missing_or_escaped_cells() {
+        let out = render_source("| a | b |\n|---|---|\n| only |\n", &TablesConfig::default());
+        assert_eq!(out, "| a    | b   |\n|------|-----|\n| only |     |\n");
+        let out = render_source(
+            "| a | b |\n|---|---|\n| [[x\\|y]] | text |\n",
+            &TablesConfig::default(),
+        );
+        assert_eq!(
+            out,
+            "| a        | b    |\n|----------|------|\n| [[x\\|y]] | text |\n"
+        );
+    }
+
+    #[test]
+    fn split_row_treats_only_an_odd_number_of_backslashes_as_an_escape() {
+        // `\|` is an escaped pipe, `\\|` is an escaped backslash followed by a real separator,
+        // `\\\|` is escaped backslash + escaped pipe again.
+        assert_eq!(split_row("a\\|b | c"), vec!["a\\|b", "c"]);
+        assert_eq!(split_row("a\\\\| b"), vec!["a\\\\", "b"]);
+        assert_eq!(split_row("a\\\\\\|b | c"), vec!["a\\\\\\|b", "c"]);
+        assert_eq!(split_row("| a | b |"), vec!["a", "b"]);
+        assert_eq!(split_row("a | b"), vec!["a", "b"]);
+        assert_eq!(split_row("\\| a | b"), vec!["\\| a", "b"]);
+        assert_eq!(split_row("||"), vec![String::new()]);
     }
 
     #[test]

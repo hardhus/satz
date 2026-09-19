@@ -91,9 +91,55 @@ pub fn line_edits_to_text_edits(
         .collect()
 }
 
+/// Test helper: applies LSP `TextEdit`s (all expressed against `text`, as the protocol requires)
+/// and returns the resulting text, so tests can assert on what the user would actually end up
+/// with instead of only on the edits' `new_text`.
+#[cfg(test)]
+pub fn apply_text_edits(text: &str, edits: &[lsp::TextEdit]) -> String {
+    let line_index = LineIndex::new(text);
+    let mut spans: Vec<(usize, usize, &str)> = edits
+        .iter()
+        .map(|e| {
+            (
+                line_index.position_to_byte(lsp_pos_to_satz(e.range.start)),
+                line_index.position_to_byte(lsp_pos_to_satz(e.range.end)),
+                e.new_text.as_str(),
+            )
+        })
+        .collect();
+    spans.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (start, end, new_text) in spans {
+        assert!(start >= cursor, "overlapping edits: {edits:?}");
+        out.push_str(&text[cursor..start]);
+        out.push_str(new_text);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_text_edits_applies_several_edits_against_the_original_text() {
+        let text = "a\nb\nc\n";
+        let edits = vec![
+            lsp::TextEdit::new(
+                lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(1, 0)),
+                "A\n".to_string(),
+            ),
+            lsp::TextEdit::new(
+                lsp::Range::new(lsp::Position::new(2, 0), lsp::Position::new(2, 1)),
+                "CC".to_string(),
+            ),
+        ];
+        assert_eq!(apply_text_edits(text, &edits), "A\nb\nCC\n");
+        assert_eq!(apply_text_edits(text, &[]), text);
+    }
 
     #[test]
     fn test_pos_conversions() {

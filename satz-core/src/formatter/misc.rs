@@ -57,7 +57,13 @@ fn fence_replacements(source: &str, span: ByteRange, fence_char: char) -> Vec<(B
     let text = &source[span.start..span.end];
     let bytes = text.as_bytes();
 
-    let open_char = bytes[0] as char;
+    // The span starts at the opening fence characters themselves (any indentation or `>` quote
+    // marker before them is outside it); anything else means it isn't a shape we understand.
+    let open_char = match bytes.first() {
+        Some(b'`') => '`',
+        Some(b'~') => '~',
+        _ => return Vec::new(),
+    };
     let mut open_len = 0usize;
     while bytes.get(open_len).is_some_and(|b| *b as char == open_char) {
         open_len += 1;
@@ -68,17 +74,31 @@ fn fence_replacements(source: &str, span: ByteRange, fence_char: char) -> Vec<(B
         return Vec::new();
     }
 
+    let first_line_end = text.find('\n').unwrap_or(text.len());
+    // A backtick fence's info string may not contain a backtick, so a tilde fence like
+    // `~~~ js `x`` can't be converted: it would stop being a code block.
+    if fence_char == '`' && text[open_len..first_line_end].contains('`') {
+        return Vec::new();
+    }
+
     let content_start = text.find('\n').map(|i| i + 1).unwrap_or(text.len());
 
-    // Determine whether the last line is a genuine closing fence: entirely (after any leading
-    // indentation) the same character as the opening fence, with length >= the opening fence.
-    let last_line_start = text[..text.len()].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    // On continuation lines inside a blockquote or list item, the fence characters are preceded
+    // by indentation and/or `>` markers.
+    let split_prefix =
+        |line: &str| -> usize { line.len() - line.trim_start_matches([' ', '\t', '>']).len() };
+
+    // Determine whether the last line is a genuine closing fence: (after that prefix, and ignoring
+    // trailing whitespace) entirely the same character as the opening fence, with length >= the
+    // opening fence.
+    let last_line_start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let last_line = &text[last_line_start..];
-    let last_line_trimmed = last_line.trim_start_matches([' ', '\t']);
+    let close_prefix_len = split_prefix(last_line);
+    let close_run = last_line[close_prefix_len..].trim_end();
     let has_closing_fence = last_line_start > content_start.saturating_sub(1)
-        && !last_line_trimmed.is_empty()
-        && last_line_trimmed.chars().all(|c| c == open_char)
-        && last_line_trimmed.len() >= open_len;
+        && !close_run.is_empty()
+        && close_run.chars().all(|c| c == open_char)
+        && close_run.len() >= open_len;
 
     let content_end = if has_closing_fence {
         last_line_start
@@ -93,9 +113,9 @@ fn fence_replacements(source: &str, span: ByteRange, fence_char: char) -> Vec<(B
     let longest_run_in_content = content
         .lines()
         .map(|line| {
-            let trimmed = line.trim_start_matches([' ', '\t']);
-            if !trimmed.is_empty() && trimmed.chars().all(|c| c == fence_char) {
-                trimmed.len()
+            let run = line[split_prefix(line)..].trim_end();
+            if !run.is_empty() && run.chars().all(|c| c == fence_char) {
+                run.len()
             } else {
                 0
             }
@@ -111,23 +131,23 @@ fn fence_replacements(source: &str, span: ByteRange, fence_char: char) -> Vec<(B
         fence_text.clone(),
     ));
     if has_closing_fence {
-        let close_start =
-            span.start + last_line_start + (last_line.len() - last_line_trimmed.len());
+        // Replace the WHOLE closing run: it may be longer than the opening fence, and leaving the
+        // extra characters behind would make the closer invalid.
+        let close_start = span.start + last_line_start + close_prefix_len;
         out.push((
-            ByteRange::new(
-                close_start,
-                close_start + open_len.min(last_line_trimmed.len()),
-            ),
+            ByteRange::new(close_start, close_start + close_run.len()),
             fence_text,
         ));
     }
     out
 }
 
-/// Normalizes every line within a top-level blockquote span so each `>` marker (at every nesting
-/// level present on that line) is followed by exactly one space. Lazy-continuation lines that
-/// don't start with `>` at all are left untouched, as is any leading indentation before the first
-/// `>` on a line.
+/// Normalizes the `>` markers of every line within a top-level blockquote span: consecutive
+/// markers are separated by exactly one space (`>>` becomes `> >`), and the last marker is followed
+/// by a space when the line has content. Whitespace AFTER the last marker is never collapsed:
+/// beyond the marker's own optional space it is indentation and can be significant (indented code,
+/// nested lists), so `>     code` must stay as it is. Lazy-continuation lines that don't start with
+/// `>` at all are left untouched, as is any leading indentation before the first `>` on a line.
 fn blockquote_replacements(source: &str, span: ByteRange) -> Vec<(ByteRange, String)> {
     let text = &source[span.start..span.end];
     let mut out = Vec::new();
@@ -164,16 +184,33 @@ fn normalize_blockquote_line(line: &str) -> Option<(usize, String)> {
 
     let indent = &line[..i];
     let mut depth = 0usize;
-    while bytes.get(i) == Some(&b'>') {
+    // Byte offset just after the last marker (the whitespace run that follows it is preserved).
+    let mut after_last_marker;
+    loop {
+        // `bytes[i]` is a `>` here.
         i += 1;
         depth += 1;
+        after_last_marker = i;
         while bytes.get(i).is_some_and(|b| *b == b' ' || *b == b'\t') {
             i += 1;
         }
+        if bytes.get(i) != Some(&b'>') {
+            break;
+        }
     }
 
-    let replacement = format!("{indent}{}", "> ".repeat(depth));
-    Some((i, replacement))
+    let kept_whitespace = i > after_last_marker;
+    let has_content = i < bytes.len();
+    let mut replacement = format!("{indent}{}>", "> ".repeat(depth - 1));
+    if !kept_whitespace && has_content {
+        replacement.push(' ');
+    }
+    // Only the prefix up to the last marker is rewritten; the whitespace run after it (if any)
+    // stays exactly as written.
+    if replacement == line[..after_last_marker] {
+        return None;
+    }
+    Some((after_last_marker, replacement))
 }
 
 #[cfg(test)]
@@ -264,6 +301,212 @@ mod tests {
             &MiscConfig::default(),
         );
         assert_eq!(out, "- item\n\n  ```rust\n  code\n  ```\n");
+    }
+
+    fn html(src: &str) -> String {
+        let mut options = pulldown_cmark::Options::empty();
+        options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+        let mut out = String::new();
+        pulldown_cmark::html::push_html(&mut out, pulldown_cmark::Parser::new_ext(src, options));
+        out
+    }
+
+    /// The formatted text must render exactly like the original.
+    fn assert_same_rendering(input: &str, output: &str) {
+        assert_eq!(
+            html(input),
+            html(output),
+            "rendering changed:\n--- input ---\n{input}\n--- output ---\n{output}"
+        );
+    }
+
+    fn to_tilde() -> MiscConfig {
+        MiscConfig {
+            code_fence_style: "~~~".to_string(),
+            ..MiscConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_closing_fence_longer_than_the_opening_is_replaced_entirely() {
+        // Only the first 3 bytes of the closer used to be replaced, leaving stray fence
+        // characters ("```~") that no longer close the block and swallow the rest of the file.
+        let cases = [
+            ("~~~\ncode\n~~~~\n\nafter\n", "```\ncode\n```\n\nafter\n"),
+            (
+                "~~~\ncode\n~~~~~~~~\n\nafter\n",
+                "```\ncode\n```\n\nafter\n",
+            ),
+            (
+                "~~~~\ncode\n~~~~~\n\nafter\n",
+                "````\ncode\n````\n\nafter\n",
+            ),
+        ];
+        for (input, expected) in cases {
+            let out = apply(input, &MiscConfig::default());
+            assert_eq!(out, expected, "input {input:?}");
+            assert_same_rendering(input, &out);
+        }
+        let out = apply("```\ncode\n`````\n\nafter\n", &to_tilde());
+        assert_eq!(out, "~~~\ncode\n~~~\n\nafter\n");
+    }
+
+    #[test]
+    fn a_closing_fence_with_trailing_spaces_or_indent_is_still_a_closing_fence() {
+        let out = apply("~~~\ncode\n~~~   \n\nafter\n", &MiscConfig::default());
+        assert_eq!(out, "```\ncode\n```   \n\nafter\n");
+        let out = apply("~~~\ncode\n  ~~~\n\nafter\n", &MiscConfig::default());
+        assert_eq!(out, "```\ncode\n  ```\n\nafter\n");
+        let out = apply("~~~\ncode\n   ~~~~  \n\nafter\n", &MiscConfig::default());
+        assert_eq!(out, "```\ncode\n   ```  \n\nafter\n");
+    }
+
+    #[test]
+    fn a_tilde_fence_whose_info_string_has_a_backtick_is_not_converted_to_backticks() {
+        // A backtick fence may not have a backtick in its info string, so converting would turn
+        // the block into something else entirely.
+        let input = "~~~ js `x`\ncode\n~~~\n\nafter\n";
+        let out = apply(input, &MiscConfig::default());
+        assert_eq!(out, input);
+        assert_same_rendering(input, &out);
+        // Without a backtick in the info string the conversion is fine.
+        assert_eq!(
+            apply("~~~ js\ncode\n~~~\n", &MiscConfig::default()),
+            "``` js\ncode\n```\n"
+        );
+        assert_eq!(
+            apply("~~~\ncode\n~~~\n", &MiscConfig::default()),
+            "```\ncode\n```\n"
+        );
+    }
+
+    #[test]
+    fn the_new_fence_is_lengthened_when_the_content_contains_the_target_character() {
+        let out = apply("~~~\n```\ninner\n```\n~~~\n", &MiscConfig::default());
+        assert_eq!(out, "````\n```\ninner\n```\n````\n");
+        assert_same_rendering("~~~\n```\ninner\n```\n~~~\n", &out);
+    }
+
+    #[test]
+    fn a_shorter_run_is_content_not_a_closing_fence() {
+        // "````" is closed only by 4+ fence characters; the "```" line is content and the block
+        // is unterminated, so only the opening fence is rewritten.
+        let input = "````\ncode\n```\n";
+        let out = apply(input, &to_tilde());
+        assert_eq!(out, "~~~~\ncode\n```\n");
+        assert_same_rendering(input, &out);
+    }
+
+    #[test]
+    fn fences_inside_quotes_and_lists_never_change_how_the_document_renders() {
+        let cases = [
+            "> ~~~\n> code in quote\n> ~~~\n\nafter\n",
+            "> ```\n> code in quote\n> ```\n\nafter\n",
+            "- item\n\n  ~~~\n  code in list\n  ~~~\n\nafter\n",
+            "- item\n\n  ```\n  code in list\n  ```\n\nafter\n",
+            "1. item\n\n   ~~~ rust\n   code\n   ~~~~\n\nafter\n",
+            "> - item\n>\n>   ~~~\n>   code\n>   ~~~\n",
+        ];
+        for input in cases {
+            for config in [MiscConfig::default(), to_tilde()] {
+                let out = apply(input, &config);
+                assert_same_rendering(input, &out);
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_fences_and_odd_shapes_survive() {
+        let input = "```rust\na\n```\n\ntext\n\n~~~\nb\n~~~~\n\n~~~\n~~~\n";
+        for config in [MiscConfig::default(), to_tilde()] {
+            let out = apply(input, &config);
+            assert_same_rendering(input, &out);
+        }
+        // A document that is only a fence, terminated and not.
+        assert_eq!(apply("~~~\n~~~\n", &MiscConfig::default()), "```\n```\n");
+        assert_eq!(apply("~~~\n", &MiscConfig::default()), "```\n");
+        assert_eq!(apply("~~~", &MiscConfig::default()), "```");
+    }
+
+    #[test]
+    fn blockquote_marker_spacing_rules() {
+        // Between consecutive markers: exactly one space. After the LAST marker: at least one
+        // space when there is content, but extra spaces are kept -- they are indentation (code,
+        // nested lists), not decoration.
+        for (input, expected) in [
+            ("> line one\n>line two\n", "> line one\n> line two\n"),
+            (">text\n", "> text\n"),
+            (">>text\n", "> > text\n"),
+            ("> >text\n", "> > text\n"),
+            (">>>x\n", "> > > x\n"),
+            (">  >  text\n", "> >  text\n"),
+            ("> a\n>> b\n", "> a\n> > b\n"),
+            // Extra spaces after the last marker are content and stay.
+            (">  two spaces\n", ">  two spaces\n"),
+            (">     code\n", ">     code\n"),
+            ("> > >   deep\n", "> > >   deep\n"),
+            // Empty quote lines get no trailing space added.
+            (">\n", ">\n"),
+            ("> >\n", "> >\n"),
+            (">>\n", "> >\n"),
+            // A marker followed only by whitespace is left alone.
+            ("> \n", "> \n"),
+            // A tab after the marker is kept.
+            (">\ttab\n", ">\ttab\n"),
+            // Up to 3 spaces of indentation before the first marker are kept.
+            ("   > indented marker\n", "   > indented marker\n"),
+            ("  >text\n", "  > text\n"),
+            // Non-ASCII content.
+            (">Türkçe içerik\n", "> Türkçe içerik\n"),
+            // Not a quote line: untouched.
+            ("plain > not a marker\n", "plain > not a marker\n"),
+        ] {
+            assert_eq!(
+                apply(input, &MiscConfig::default()),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blockquote_normalisation_never_changes_how_content_renders() {
+        let cases = [
+            // indented code inside a quote
+            "> intro\n>\n>     code line\n>     second\n",
+            // nested list depends on the indentation after the marker
+            "> - outer\n>     - nested\n> - second\n",
+            "> - outer\n>   - nested\n",
+            // fenced code with indentation inside a quote
+            "> ```\n>   indented\n> ```\n",
+            // a list item containing a fence inside a quote
+            "> - item\n>\n>   ~~~\n>   code\n>   ~~~\n",
+            // nested quotes with code
+            ">> outer\n>>     code\n",
+            "> > text\n> >   more\n",
+            // lazy continuation
+            "> first\nlazy\n> second\n",
+            // headings, rules and lists in quotes
+            ">#  Heading\n>\n>1.  one\n>2.  two\n",
+        ];
+        for input in cases {
+            let out = apply(input, &MiscConfig::default());
+            assert_same_rendering(input, &out);
+        }
+    }
+
+    #[test]
+    fn blockquote_normalisation_is_idempotent() {
+        for input in [
+            ">a\n>>b\n",
+            ">  a\n>     code\n",
+            "> > >x\n",
+            "> a\n>\n> b\n",
+        ] {
+            let once = apply(input, &MiscConfig::default());
+            let twice = apply(&once, &MiscConfig::default());
+            assert_eq!(once, twice, "input {input:?}");
+        }
     }
 
     #[test]

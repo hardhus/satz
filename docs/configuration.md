@@ -154,19 +154,25 @@ Used by `satz fmt`, the LSP's "Format Document" request and `satz.formatWorkspac
 
 Deterministic, structure-aware Markdown formatting: the same input always produces the same byte-for-byte output. Every sub-table below can be disabled independently; `formatter.enabled = false` turns the whole thing off (both `satz fmt` and the LSP's format-on-request become a no-op).
 
+The formatter changes how a document is *written*, never how it *renders*. Guarantees, all covered by tests that run the formatter over an adversarial set of documents:
+
+- **Code is never touched.** Fenced blocks (any fence length, `` ` `` or `~`, nested, unterminated, inside a quote or list item), indented code blocks and HTML blocks keep their whitespace, blank lines and trailing spaces byte for byte. Fence styles can still be converted (see `code_fence_style`), but never in a way that changes where a block ends.
+- **Line endings are preserved.** A file whose lines end in `\r\n` is formatted exactly like its `\n` twin and stays CRLF. A file mixing both is normalized to whichever is more common (LF on a tie).
+- **Idempotent.** Formatting already-formatted text changes nothing.
+
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `enabled` | bool | `true` | Master switch for the entire formatter. When `false`, `satz fmt` reports nothing to do and `textDocument/formatting` returns no edits. |
 | `line_width` | integer | `80` | Target column width for paragraph reflow. Only takes effect when `[formatter.wrap] enable = true` — see below; otherwise unused. |
 | `blank_lines_around_headings` | integer (0–255) | `1` | Number of blank lines forced before each heading (headings immediately after frontmatter always get exactly one). |
 | `final_newline` | bool | `true` | Whether the formatted document must end with exactly one trailing newline. |
-| `normalize_links` | bool | `true` | Whether `[[  target  \|  display  ]]`-style wikilinks get their whitespace trimmed down to `[[target\|display]]` on format. |
+| `normalize_links` | bool | `true` | Whether `[[  target  \|  display  ]]`-style wikilinks get their whitespace trimmed down to `[[target\|display]]` on format. Wikilinks inside code (inline code, fenced or indented blocks) and inside frontmatter are literal text and are never touched. |
 
 #### `[formatter.tables]`
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `enable` | bool | `true` | Detect and realign GFM pipe tables (column widths, alignment markers). Cell content itself is reproduced verbatim — never re-parsed — so inline markdown/wikilinks inside cells survive untouched. |
+| `enable` | bool | `true` | Detect and realign GFM pipe tables (column widths, alignment markers). Cell content itself is reproduced verbatim — never re-parsed — so inline markdown/wikilinks inside cells survive untouched. A table with a row that has more cells than its header (usually an unescaped `\|` inside a wikilink or code span) is left exactly as you wrote it, because realigning it would delete the extra cells; escape the pipe (`\\|`) to have the table formatted. |
 | `cell_padding` | integer | `1` | Minimum whitespace padding on each side of a cell's content. |
 | `min_column_width` | integer | `3` | Minimum width (display columns) reserved for a column, even if its content is shorter. |
 
@@ -193,7 +199,7 @@ Deterministic, structure-aware Markdown formatting: the same input always produc
 | `enable` | bool | `true` | Enables thematic-break and code-fence style normalization (both governed by this one flag). |
 | `hr_style` | `"---"` \| `"***"` \| `"___"` | `"---"` | Style used for every thematic break (horizontal rule). The YAML frontmatter's own `---` fences are never affected — they're a distinct construct, not a thematic break. |
 | `code_fence_style` | `` "```" `` \| `"~~~"` | `` "```" `` | Style used for fenced code block delimiters. Fence length is preserved unless the code content itself contains a same-or-longer run of the target character, in which case the fence is lengthened just enough to stay unambiguous. An unterminated fence (cut off by EOF) has only its opening delimiter rewritten. |
-| `blockquote_single_space` | bool | `true` | Guarantee exactly one space after every `>` marker, at every nesting level (`>>text` → `> > text`). Lazy-continuation lines (part of a blockquote but not themselves prefixed with `>`) are left untouched. |
+| `blockquote_single_space` | bool | `true` | Normalize blockquote markers: consecutive markers are separated by exactly one space (`>>text` → `> > text`) and a marker followed directly by text gets one space (`>text` → `> text`). Extra spaces after the last marker are kept, because they are indentation that can be significant (indented code, nested lists: `>     code` stays code). Lazy-continuation lines (part of a blockquote but not themselves prefixed with `>`) are left untouched. |
 
 #### `[formatter.wrap]`
 
