@@ -86,16 +86,25 @@ fn format_lf(source: &str, config: &FormatterConfig) -> String {
     }
 
     if config.lists.enable {
+        let keep_zones: Vec<ByteRange> = structure
+            .table_spans
+            .iter()
+            .chain(structure.blockquote_spans.iter())
+            .copied()
+            .collect();
         replacements.extend(list::replacements(
             source,
+            &structure.list_spans,
             &structure.list_items,
             &structure.task_markers,
+            &keep_zones,
             &config.lists,
         ));
     }
 
     if config.emphasis.enable {
         replacements.extend(emphasis::replacements(
+            source,
             &structure.emphasis_spans,
             &config.emphasis,
         ));

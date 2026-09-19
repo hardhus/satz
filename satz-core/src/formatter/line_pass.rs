@@ -28,6 +28,7 @@ pub(crate) fn layout(source: &str, config: &FormatterConfig) -> String {
     let structure = parse_structure(source);
     let raw_lines: Vec<&str> = source.lines().collect();
     let protected = protected_lines(source, &raw_lines, &structure);
+    let hard_break = hard_break_lines(source, &raw_lines, &structure);
 
     // 1. First pass: frontmatter, protected regions verbatim, trailing whitespace elsewhere.
     // Each entry is (text, is_protected).
@@ -54,6 +55,8 @@ pub(crate) fn layout(source: &str, config: &FormatterConfig) -> String {
 
         if protected[i] {
             lines.push((raw_line.to_string(), true));
+        } else if hard_break[i] {
+            lines.push((raw_line.to_string(), false));
         } else {
             lines.push((trimmed_end.to_string(), false));
         }
@@ -161,20 +164,7 @@ fn protected_lines(
         .collect();
     spans.sort_unstable_by_key(|s| s.start);
 
-    // Byte offset at which each line starts.
-    let mut line_start = 0usize;
-    let mut starts = Vec::with_capacity(lines.len());
-    for line in lines {
-        starts.push(line_start);
-        line_start += line.len();
-        // Skip this line's terminator ("\n" or "\r\n"); the last line may have none.
-        let rest = &source[line_start.min(source.len())..];
-        if rest.starts_with("\r\n") {
-            line_start += 2;
-        } else if rest.starts_with('\n') {
-            line_start += 1;
-        }
-    }
+    let starts = line_starts(source, lines);
 
     let mut result = vec![false; lines.len()];
     let mut si = 0usize;
@@ -194,6 +184,45 @@ fn protected_lines(
                 break;
             }
             sj += 1;
+        }
+    }
+    result
+}
+
+/// Byte offset at which each line starts.
+fn line_starts(source: &str, lines: &[&str]) -> Vec<usize> {
+    let mut line_start = 0usize;
+    let mut starts = Vec::with_capacity(lines.len());
+    for line in lines {
+        starts.push(line_start);
+        line_start += line.len();
+        // Skip this line's terminator ("\n" or "\r\n"); the last line may have none.
+        let rest = &source[line_start.min(source.len())..];
+        if rest.starts_with("\r\n") {
+            line_start += 2;
+        } else if rest.starts_with('\n') {
+            line_start += 1;
+        }
+    }
+    starts
+}
+
+/// Lines that end in a hard break (`text` + two or more spaces): those trailing spaces are
+/// content and must survive trimming.
+fn hard_break_lines(
+    source: &str,
+    lines: &[&str],
+    structure: &crate::parser::structure::StructureOutput,
+) -> Vec<bool> {
+    let starts = line_starts(source, lines);
+    let mut result = vec![false; lines.len()];
+    for span in &structure.hard_break_spans {
+        // The line the break starts on: the last line starting at or before it.
+        let i = starts
+            .partition_point(|s| *s <= span.start)
+            .saturating_sub(1);
+        if i < lines.len() && lines[i].ends_with("  ") {
+            result[i] = true;
         }
     }
     result
@@ -220,7 +249,9 @@ mod tests {
 
     #[test]
     fn test_trailing_whitespace_removal() {
-        let input = "Line 1   \nLine 2\t\t\nLine 3";
+        // (Two or more trailing spaces before a line break are a hard break, not whitespace to
+        // trim: `trailing_spaces_that_make_a_hard_break_are_kept`.)
+        let input = "Line 1 \t \nLine 2\t\t\nLine 3";
         let config = FormatterConfig::default();
         let formatted = run(input, &config);
         assert_eq!(formatted, "Line 1\nLine 2\nLine 3\n");
@@ -416,5 +447,74 @@ mod tests {
             let once = fmt(input);
             assert_eq!(fmt(&once), once, "input {input:?}");
         }
+    }
+
+    // ---- two-space hard breaks are content ----
+
+    fn fmt_default(src: &str) -> String {
+        crate::formatter::format_document(src, &FormatterConfig::default())
+    }
+
+    fn fmt_wrap(src: &str, width: usize) -> String {
+        let mut cfg = FormatterConfig::default();
+        cfg.wrap.enable = true;
+        cfg.line_width = width;
+        crate::formatter::format_document(src, &cfg)
+    }
+
+    #[test]
+    fn trailing_spaces_that_make_a_hard_break_are_kept() {
+        for src in [
+            "a  \nb\n",
+            "a   \nb\n",
+            "a      \nb\n",
+            "> a  \n> b\n",
+            "- a  \n  b\n",
+            "1. a  \n   b\n",
+            "a  \r\nb\r\n",
+            "first  \nsecond  \nthird\n",
+            "# H\n\nline one  \nline two\n\nnext para\n",
+            "> - quoted item  \n>   continued\n",
+        ] {
+            assert_eq!(fmt_default(src), src, "{src:?}");
+            assert_eq!(
+                fmt_default(&fmt_default(src)),
+                fmt_default(src),
+                "idempotent {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_whitespace_that_is_not_a_hard_break_is_still_trimmed() {
+        for (src, expected) in [
+            ("a \nb\n", "a\nb\n"),
+            ("a  \n\nb\n", "a\n\nb\n"),
+            ("a  \n", "a\n"),
+            ("a  ", "a\n"),
+            ("a \t \nb\n", "a\nb\n"),
+            ("# H  \n\ntext\n", "# H\n\ntext\n"),
+            ("- a  \n- b\n", "- a\n- b\n"),
+            ("a  \n# heading\n", "a\n\n# heading\n"),
+        ] {
+            assert_eq!(fmt_default(src), expected, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn a_hard_break_survives_wrapping() {
+        let src = "aaa bbb ccc ddd eee fff  \nggg hhh iii jjj kkk lll mmm nnn\n";
+        for width in [10, 20, 40, 80] {
+            let out = fmt_wrap(src, width);
+            assert!(
+                out.contains("fff  \nggg"),
+                "width {width}: hard break lost in {out:?}"
+            );
+            assert_eq!(fmt_wrap(&out, width), out, "idempotent at {width}");
+        }
+        // The break itself still forces a new line even when everything would fit.
+        assert_eq!(fmt_wrap("a  \nb\n", 80), "a  \nb\n");
+        // A single trailing space is only whitespace and reflows.
+        assert_eq!(fmt_wrap("a \nb\n", 80), "a b\n");
     }
 }

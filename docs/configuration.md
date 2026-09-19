@@ -180,7 +180,9 @@ The formatter changes how a document is *written*, never how it *renders*. Guara
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `enable` | bool | `true` | Normalize unordered marker characters, renumber ordered lists, and canonicalize task-list checkboxes (`[ ]`/`[x]`). Indentation and nesting are never touched. |
+| `enable` | bool | `true` | Normalize unordered marker characters, renumber ordered lists, and canonicalize task-list checkboxes (`[ ]`/`[x]`). A marker (or `.`/`)` delimiter) change is what makes Markdown start a new list, so two lists that touch keep different markers (`- a
+
+* b` stays two lists; the second keeps its own marker). When a marker changes width (`-   x` -> `- x`, `9.` -> `10.`) the item's continuation lines and nested content are re-indented by the same amount so nothing leaves the item; an item that cannot be re-indented safely (lazy or tab-indented continuation, inside a blockquote, containing a table) keeps its spacing. |
 | `marker` | `"-"` \| `"*"` \| `"+"` | `"-"` | Character used for every unordered list marker in the vault. |
 | `renumber_ordered` | bool | `true` | Renumber ordered lists sequentially (`1. 2. 3. ...`) from the list's own starting number, regardless of what each item was originally typed as. The `.`/`)` delimiter is always normalized to `.` regardless of this setting — when `false`, only the *numbers themselves* are left as originally written. |
 
@@ -189,7 +191,7 @@ The formatter changes how a document is *written*, never how it *renders*. Guara
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `enable` | bool | `true` | Normalize emphasis/strong delimiters. Only the delimiter characters are touched — content (including nested emphasis or `[[wikilinks]]`) is never altered. |
-| `italic_marker` | `"*"` \| `"_"` | `"*"` | Delimiter used for single-emphasis (`*text*`/`_text_`). |
+| `italic_marker` | `"*"` \| `"_"` | `"*"` | Delimiter used for single-emphasis (`*text*`/`_text_`). `_` is only written where it can work: an emphasis span inside a word (`a*b*c`) or containing a `_` keeps its `*`. |
 | `bold_marker` | `"**"` \| `"__"` | `"**"` | Delimiter used for strong emphasis (`**text**`/`__text__`). |
 
 #### `[formatter.misc]`
@@ -222,12 +224,10 @@ Wrapping never changes what a paragraph *is*:
   line even when that overruns `line_width`.
 - A backslash hard break (`text\` followed by a newline) is kept, and a literal backslash is never
   followed by a newline (which would turn it into a hard break).
+- A trailing-two-spaces hard break (`text␠␠` + newline) is kept exactly as written, both by wrapping and by the trailing-whitespace trim.
 - Footnote definitions are not reflowed.
 - As a final check, a paragraph is only rewritten if re-parsing the wrapped text still gives
   exactly one paragraph with the same words; otherwise it is left as you wrote it.
-
-Known limitation: a trailing-two-spaces hard break is *not* preserved — `line_pass`'s
-trailing-whitespace trim discards it regardless of this setting.
 
 ## See also
 

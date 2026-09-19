@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn crlf_edits_leave_untouched_lines_alone() {
         // Only the middle line is dirty; the edits must not rewrite the clean CRLF lines.
-        let text = "clean one\r\ndirty   \r\nclean two\r\n";
+        let text = "clean one\r\ndirty \t \r\nclean two\r\n";
         let (state, params) = state_and_params_for(text);
 
         let edits = formatting(params, &state).expect("Some");

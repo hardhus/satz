@@ -19,9 +19,8 @@ use crate::parser::structure::{self, StructureOutput};
 /// drop. Running after splicing avoids the conflict and also means wrapping is computed against
 /// the already-normalized emphasis/list/table text, not the pre-formatting source.
 ///
-/// Backslash hard breaks (`text\` + newline) are preserved. Trailing-space hard breaks are NOT:
-/// `line_pass::run`'s per-line `trim_end()` destroys them unconditionally regardless of this pass
-/// (tracked separately), and by the time this pass runs the spaces are already gone.
+/// Hard breaks are preserved: backslash ones (`text\` + newline) and trailing-space ones (two or
+/// more spaces + newline, written back exactly as they were).
 ///
 /// A wrapped paragraph is only written back if re-parsing it still yields exactly one paragraph
 /// with the same words (`is_single_paragraph` / `same_words`), so a construct the wrapping rules
@@ -209,10 +208,21 @@ fn render_wrapped(source: &str, tokens: &[(ByteRange, usize)], line_width: usize
         let hard_break = prev_ends_in_backslash
             && (source[prev_range.end..].starts_with('\n')
                 || source[prev_range.end..].starts_with("\r\n"));
+        // Two or more spaces right before a newline are a hard break too; they are written back
+        // exactly as they were.
+        let gap = &source[prev_range.end..range.start];
+        let break_spaces = gap
+            .split_once('\n')
+            .map(|(before, _)| before.trim_end_matches('\r'))
+            .filter(|before| before.len() >= 2 && before.bytes().all(|b| b == b' '));
 
         let overflows = current_width + 1 + width > line_width;
         let may_break = !prev_ends_in_backslash && !would_start_block(text);
-        if hard_break || (overflows && may_break) {
+        if let Some(spaces) = break_spaces {
+            out.push_str(spaces);
+            out.push('\n');
+            current_width = *width;
+        } else if hard_break || (overflows && may_break) {
             out.push('\n');
             current_width = *width;
         } else {

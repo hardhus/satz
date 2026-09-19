@@ -28,8 +28,18 @@ pub struct EmphasisSpan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListItemSpan {
     pub range: ByteRange,
+    /// Index into `StructureOutput::list_spans` of the list this item belongs to.
+    pub list_id: usize,
     pub ordered: bool,
     pub ordinal: u64,
+}
+
+/// A whole list: its byte range, whether it is ordered, and how deeply it is nested (0 = top level).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListSpan {
+    pub range: ByteRange,
+    pub ordered: bool,
+    pub depth: usize,
 }
 
 /// A GFM task-list checkbox (`[ ]`/`[x]`), with `range` covering exactly the bracketed marker.
@@ -41,6 +51,7 @@ pub struct TaskMarkerSpan {
 
 #[derive(Default)]
 struct ListCtx {
+    id: usize,
     ordered: bool,
     next_ordinal: u64,
 }
@@ -58,6 +69,8 @@ pub struct StructureOutput {
     pub emphasis_spans: Vec<EmphasisSpan>,
     pub rule_spans: Vec<ByteRange>,
     pub list_items: Vec<ListItemSpan>,
+    /// Every list (also nested ones), in source order; `ListItemSpan::list_id` indexes this.
+    pub list_spans: Vec<ListSpan>,
     pub task_markers: Vec<TaskMarkerSpan>,
     /// Only outermost blockquotes — a nested `> >` blockquote is *not* also recorded separately,
     /// since the formatter re-scans the outer span's raw lines itself to normalize every nesting
@@ -78,6 +91,9 @@ pub struct StructureOutput {
     /// Regions that look like text to a raw scan but are markup: an inline link's or image's
     /// `(destination)` and raw HTML. A `#anchor` in there is not a tag.
     pub non_text_spans: Vec<ByteRange>,
+    /// Every hard line break: `text` + two or more spaces + newline, or `text` + newline. The
+    /// trailing spaces of the first form are content, not whitespace to trim.
+    pub hard_break_spans: Vec<ByteRange>,
 }
 
 /// The `(destination ...)` part of an inline link/image whose whole source range is `range`,
@@ -201,7 +217,13 @@ pub fn parse_structure(source: &str) -> StructureOutput {
 
             // --- Lists ---
             Event::Start(Tag::List(start_number)) => {
+                output.list_spans.push(ListSpan {
+                    range: ByteRange::new(range.start, range.end),
+                    ordered: start_number.is_some(),
+                    depth: list_stack.len(),
+                });
                 list_stack.push(ListCtx {
+                    id: output.list_spans.len() - 1,
                     ordered: start_number.is_some(),
                     next_ordinal: start_number.unwrap_or(1),
                 });
@@ -213,6 +235,7 @@ pub fn parse_structure(source: &str) -> StructureOutput {
                 if let Some(ctx) = list_stack.last_mut() {
                     output.list_items.push(ListItemSpan {
                         range: ByteRange::new(range.start, range.end),
+                        list_id: ctx.id,
                         ordered: ctx.ordered,
                         ordinal: ctx.next_ordinal,
                     });
@@ -359,6 +382,12 @@ pub fn parse_structure(source: &str) -> StructureOutput {
                 if let Some(span) = destination_span(source, range) {
                     output.non_text_spans.push(span);
                 }
+            }
+
+            Event::HardBreak => {
+                output
+                    .hard_break_spans
+                    .push(ByteRange::new(range.start, range.end));
             }
 
             // --- Raw HTML (attribute values are not text) ---

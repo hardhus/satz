@@ -10,7 +10,11 @@ use crate::parser::structure::{EmphasisKind, EmphasisSpan};
 /// or `[[wikilink]]` syntax, is never re-examined or altered. Nested spans (e.g. `***text***`
 /// parsing as `Emphasis` wrapping `Strong`) naturally decompose into non-overlapping marker
 /// ranges since a construct's delimiters never share a byte position with another construct's.
-pub fn replacements(spans: &[EmphasisSpan], config: &EmphasisConfig) -> Vec<(ByteRange, String)> {
+pub fn replacements(
+    source: &str,
+    spans: &[EmphasisSpan],
+    config: &EmphasisConfig,
+) -> Vec<(ByteRange, String)> {
     let mut out = Vec::with_capacity(spans.len() * 2);
 
     for span in spans {
@@ -19,6 +23,20 @@ pub fn replacements(spans: &[EmphasisSpan], config: &EmphasisConfig) -> Vec<(Byt
             EmphasisKind::Bold => normalize_marker(&config.bold_marker, 2, "**"),
         };
         let marker_len = marker.len();
+
+        // `_` cannot open or close emphasis inside a word (`a*b*c` is emphasis, `a_b_c` is not),
+        // and an inner `_` would be ambiguous; such a span keeps the delimiters it was written with.
+        if marker.starts_with('_') && !source[span.range.start..].starts_with('_') {
+            let inner = &source[span.range.start + marker_len..span.range.end - marker_len];
+            let before = source[..span.range.start].chars().next_back();
+            let after = source[span.range.end..].chars().next();
+            if before.is_some_and(char::is_alphanumeric)
+                || after.is_some_and(char::is_alphanumeric)
+                || inner.contains('_')
+            {
+                continue;
+            }
+        }
 
         let open_range = ByteRange::new(span.range.start, span.range.start + marker_len);
         let close_range = ByteRange::new(span.range.end - marker_len, span.range.end);
@@ -54,7 +72,7 @@ mod tests {
 
     fn apply(source: &str, config: &EmphasisConfig) -> String {
         let structure = parse_structure(source);
-        let mut reps = replacements(&structure.emphasis_spans, config);
+        let mut reps = replacements(source, &structure.emphasis_spans, config);
         reps.sort_by_key(|(r, _)| r.start);
         crate::formatter::zones::splice_ranges(source, &reps)
     }
@@ -137,5 +155,73 @@ mod tests {
             pass1,
             "Mixed _style_ and _also this_ and __loud__ and __also loud__.\n"
         );
+    }
+
+    fn underscore() -> EmphasisConfig {
+        EmphasisConfig {
+            enable: true,
+            italic_marker: "_".to_string(),
+            bold_marker: "__".to_string(),
+        }
+    }
+
+    #[test]
+    fn intraword_emphasis_keeps_its_stars_when_underscores_are_configured() {
+        // `_` cannot open or close emphasis inside a word, so converting would turn emphasis into
+        // literal underscores.
+        for src in [
+            "a*b*c\n",
+            "a**b**c\n",
+            "*a*b\n",
+            "a*b*\n",
+            "ç*x*ç\n",
+            "2*x*3\n",
+            "foo*bar*\n",
+            "*foo*bar baz\n",
+        ] {
+            assert_eq!(apply(src, &underscore()), src, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn emphasis_containing_the_target_marker_keeps_its_stars() {
+        for src in ["*a_b*\n", "**a__b**\n", "*snake_case_name*\n"] {
+            assert_eq!(apply(src, &underscore()), src, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn emphasis_at_word_boundaries_still_converts() {
+        for (src, expected) in [
+            ("x *y* z\n", "x _y_ z\n"),
+            ("*a*\n", "_a_\n"),
+            ("(*x*)\n", "(_x_)\n"),
+            ("*x*, *y*.\n", "_x_, _y_.\n"),
+            ("**a** b\n", "__a__ b\n"),
+            ("— *dash* —\n", "— _dash_ —\n"),
+            ("*a*\r\n", "_a_\r\n"),
+        ] {
+            assert_eq!(apply(src, &underscore()), expected, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn converting_to_stars_is_always_allowed() {
+        let star = EmphasisConfig::default();
+        assert_eq!(apply("a_b_c\n", &star), "a_b_c\n"); // not emphasis at all
+        assert_eq!(apply("x _y_ z\n", &star), "x *y* z\n");
+        assert_eq!(apply("a__b__ c\n", &star), "a__b__ c\n"); // intraword `__` is not strong
+    }
+
+    #[test]
+    fn underscore_conversion_is_idempotent_and_keeps_the_rendered_result() {
+        let cfg = FormatterConfig {
+            emphasis: underscore(),
+            ..FormatterConfig::default()
+        };
+        let src = "a*b*c and *ok* and **b**d and **fine**\n";
+        let once = format_document(src, &cfg);
+        assert_eq!(once, "a*b*c and _ok_ and **b**d and __fine__\n");
+        assert_eq!(format_document(&once, &cfg), once);
     }
 }

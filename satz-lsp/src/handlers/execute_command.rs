@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_scattered_changes_produce_multiple_minimal_edits_not_one_blob() {
         let dirty = parse_document(
-            "1   \n2\n3\n4\n5   \n6\n7\n8   \n",
+            "1 \t \n2\n3\n4\n5 \t \n6\n7\n8   \n",
             Path::new("scattered.md"),
         );
         let state = state_with(vec![dirty]);

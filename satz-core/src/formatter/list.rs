@@ -1,6 +1,6 @@
 use crate::config::ListsConfig;
 use crate::model::ByteRange;
-use crate::parser::structure::{ListItemSpan, TaskMarkerSpan};
+use crate::parser::structure::{ListItemSpan, ListSpan, TaskMarkerSpan};
 
 /// Computes splice replacements for list item markers and task-list checkboxes.
 ///
@@ -11,19 +11,25 @@ use crate::parser::structure::{ListItemSpan, TaskMarkerSpan};
 /// and nesting are never touched: only the marker-and-following-whitespace prefix is rewritten.
 pub fn replacements(
     source: &str,
+    lists: &[ListSpan],
     items: &[ListItemSpan],
     task_markers: &[TaskMarkerSpan],
+    keep_zones: &[ByteRange],
     config: &ListsConfig,
 ) -> Vec<(ByteRange, String)> {
-    let marker_char = normalize_marker_char(&config.marker);
+    let markers = effective_markers(source, lists, items, config);
     let mut out = Vec::with_capacity(items.len() + task_markers.len());
 
     for item in items {
-        if let Some(replacement) =
-            normalize_item_marker(source, item, marker_char, config.renumber_ordered)
-        {
-            out.push(replacement);
-        }
+        let (marker_char, delimiter) = markers[item.list_id];
+        out.extend(item_replacements(
+            source,
+            item,
+            marker_char,
+            delimiter,
+            config.renumber_ordered,
+            keep_zones,
+        ));
     }
 
     for marker in task_markers {
@@ -32,6 +38,73 @@ pub fn replacements(
     }
 
     out
+}
+
+/// The marker (`-`/`*`/`+`) and ordered delimiter (`.`/`)`) each list is rewritten with.
+///
+/// Normally every list gets the configured marker. But a different marker (or delimiter) is what
+/// makes CommonMark start a NEW list, so a list directly after another list of the same kind must
+/// not end up with the same marker as its predecessor: it keeps its own marker when that differs,
+/// otherwise the first one that does.
+fn effective_markers(
+    source: &str,
+    lists: &[ListSpan],
+    items: &[ListItemSpan],
+    config: &ListsConfig,
+) -> Vec<(char, char)> {
+    let configured = normalize_marker_char(&config.marker);
+    let mut first_item_start: Vec<Option<usize>> = vec![None; lists.len()];
+    for item in items {
+        first_item_start[item.list_id].get_or_insert(item.range.start);
+    }
+    let separator_only = |text: &str| text.chars().all(|c| c.is_whitespace() || c == '>');
+
+    let mut result = vec![(configured, '.'); lists.len()];
+    // Per nesting depth: the previous list there (end offset, ordered, its effective marker).
+    let mut previous: Vec<Option<(usize, bool, char)>> = Vec::new();
+    for (id, list) in lists.iter().enumerate() {
+        previous.truncate(list.depth + 1);
+        previous.resize(list.depth + 1, None);
+        let original = first_item_start[id]
+            .and_then(|start| parse_marker(source, start))
+            .map(|m| match m {
+                ParsedMarker::Unordered { marker_end } => source.as_bytes()[marker_end - 1] as char,
+                ParsedMarker::Ordered { delimiter_end, .. } => {
+                    source.as_bytes()[delimiter_end - 1] as char
+                }
+            });
+        let neighbour = previous[list.depth]
+            .filter(|(end, ordered, _)| {
+                *ordered == list.ordered
+                    && source
+                        .get(*end..list.range.start)
+                        .is_some_and(separator_only)
+            })
+            .map(|(_, _, effective)| effective);
+
+        let effective = if list.ordered {
+            let default = '.';
+            match neighbour {
+                Some(n) if n == default => original.filter(|o| *o != n).unwrap_or(')'),
+                _ => default,
+            }
+        } else {
+            match neighbour {
+                Some(n) if n == configured => original
+                    .filter(|o| *o != n)
+                    .or_else(|| ['-', '*', '+'].into_iter().find(|c| *c != n))
+                    .unwrap_or(configured),
+                _ => configured,
+            }
+        };
+        result[id] = if list.ordered {
+            (configured, effective)
+        } else {
+            (effective, '.')
+        };
+        previous[list.depth] = Some((list.range.end, list.ordered, effective));
+    }
+    result
 }
 
 fn normalize_marker_char(configured: &str) -> char {
@@ -84,13 +157,24 @@ fn parse_marker(source: &str, start: usize) -> Option<ParsedMarker> {
     None
 }
 
-fn normalize_item_marker(
+/// The rewrites for one item: its marker prefix and, when the prefix changes width, the
+/// indentation of the item's continuation lines so its content keeps the same column relative to
+/// its children (`-   a\n    cont` -> `- a\n  cont`).
+///
+/// Whatever cannot be re-indented safely (a lazy or tab-indented continuation, an item inside a
+/// blockquote or containing a table) keeps its spacing: only the marker character is rewritten,
+/// and only when that does not change the width. Not formatting beats breaking the structure.
+fn item_replacements(
     source: &str,
     item: &ListItemSpan,
     marker_char: char,
+    delimiter: char,
     renumber_ordered: bool,
-) -> Option<(ByteRange, String)> {
-    let parsed = parse_marker(source, item.range.start)?;
+    keep_zones: &[ByteRange],
+) -> Vec<(ByteRange, String)> {
+    let Some(parsed) = parse_marker(source, item.range.start) else {
+        return Vec::new();
+    };
 
     let (marker_end, new_marker_text) = match parsed {
         ParsedMarker::Unordered { marker_end } => (marker_end, marker_char.to_string()),
@@ -106,7 +190,7 @@ fn normalize_item_marker(
             } else {
                 original_digits
             };
-            (delimiter_end, format!("{number}."))
+            (delimiter_end, format!("{number}{delimiter}"))
         }
     };
 
@@ -118,21 +202,83 @@ fn normalize_item_marker(
     {
         whitespace_end += 1;
     }
+    let has_tab = source[marker_end..whitespace_end].contains('\t');
 
     let has_content_after = bytes
         .get(whitespace_end)
         .is_some_and(|b| *b != b'\n' && *b != b'\r');
-
-    let replacement = if has_content_after {
+    let new_prefix = if has_content_after {
         format!("{new_marker_text} ")
     } else {
-        new_marker_text
+        new_marker_text.clone()
     };
-
-    Some((
+    let prefix_replacement = (
         ByteRange::new(item.range.start, whitespace_end),
-        replacement,
-    ))
+        new_prefix.clone(),
+    );
+
+    let delta = new_prefix.len() as isize - (whitespace_end - item.range.start) as isize;
+    // Continuation lines: every non-blank line of the item after its first.
+    let item_end = item.range.end.min(source.len());
+    let first_line_end = source[item.range.start..item_end]
+        .find('\n')
+        .map(|i| item.range.start + i + 1);
+    let mut continuation: Vec<(usize, usize)> = Vec::new(); // (line start, leading spaces)
+    if let Some(mut line_start) = first_line_end {
+        while line_start < item_end {
+            let line_end = source[line_start..item_end]
+                .find('\n')
+                .map_or(item_end, |i| line_start + i);
+            let line = source[line_start..line_end].trim_end_matches('\r');
+            if !line.trim().is_empty() {
+                let leading = line.len() - line.trim_start_matches(' ').len();
+                continuation.push((line_start, leading));
+            }
+            line_start = line_end + 1;
+        }
+    }
+
+    if continuation.is_empty() || (delta == 0 && !has_tab) {
+        return vec![prefix_replacement];
+    }
+
+    let in_keep_zone = keep_zones
+        .iter()
+        .any(|zone| zone.start < item_end && item.range.start < zone.end);
+    let cannot_shrink = delta < 0
+        && continuation
+            .iter()
+            .any(|(_, lead)| *lead < (-delta) as usize);
+    if has_tab || in_keep_zone || cannot_shrink {
+        // Only the marker character, and only if the width stays the same.
+        let old_marker_len = marker_end - item.range.start;
+        return if new_marker_text.len() == old_marker_len
+            && new_marker_text != source[item.range.start..marker_end]
+        {
+            vec![(
+                ByteRange::new(item.range.start, marker_end),
+                new_marker_text,
+            )]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let mut out = vec![prefix_replacement];
+    for (line_start, _) in continuation {
+        if delta > 0 {
+            out.push((
+                ByteRange::new(line_start, line_start),
+                " ".repeat(delta as usize),
+            ));
+        } else {
+            out.push((
+                ByteRange::new(line_start, line_start + (-delta) as usize),
+                String::new(),
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -146,8 +292,10 @@ mod tests {
         let structure = parse_structure(source);
         let mut reps = replacements(
             source,
+            &structure.list_spans,
             &structure.list_items,
             &structure.task_markers,
+            &[],
             config,
         );
         reps.sort_by_key(|(r, _)| r.start);
@@ -156,8 +304,10 @@ mod tests {
 
     #[test]
     fn test_normalizes_mixed_unordered_markers_to_configured_char() {
+        // Three different markers are three separate lists in CommonMark. Normalizing must not
+        // merge them, so the middle one keeps a marker that differs from its neighbours.
         let out = apply("- a\n* b\n+ c\n", &ListsConfig::default());
-        assert_eq!(out, "- a\n- b\n- c\n");
+        assert_eq!(out, "- a\n* b\n- c\n");
     }
 
     #[test]
@@ -242,5 +392,123 @@ mod tests {
         let pass1 = format_document(input, &cfg);
         let pass2 = format_document(&pass1, &cfg);
         assert_eq!(pass1, pass2);
+    }
+
+    fn fmt(src: &str) -> String {
+        format_document(src, &FormatterConfig::default())
+    }
+
+    fn fmt_marker(src: &str, marker: &str) -> String {
+        let mut cfg = FormatterConfig::default();
+        cfg.lists.marker = marker.to_string();
+        format_document(src, &cfg)
+    }
+
+    // ---- adjacent lists stay separate lists (a different marker starts a new list) ----
+
+    #[test]
+    fn a_marker_change_still_starts_a_new_list_after_normalizing() {
+        for (src, expected) in [
+            ("- a\n\n* c\n", "- a\n\n* c\n"),
+            ("- a\n* b\n", "- a\n* b\n"),
+            ("* a\n\n+ b\n", "- a\n\n+ b\n"),
+            ("+ a\n\n- b\n\n* c\n", "- a\n\n* b\n\n- c\n"),
+            ("- a\n- a2\n\n* b\n* b2\n", "- a\n- a2\n\n* b\n* b2\n"),
+            ("1. a\n\n1) b\n", "1. a\n\n1) b\n"),
+            ("> - a\n>\n> * b\n", "> - a\n>\n> * b\n"),
+            ("- p\n  - x\n\n  * y\n", "- p\n  - x\n\n  * y\n"),
+        ] {
+            assert_eq!(fmt(src), expected, "{src:?}");
+            assert_eq!(fmt(expected), expected, "idempotency for {src:?}");
+        }
+    }
+
+    #[test]
+    fn lists_that_are_not_adjacent_are_normalized_independently() {
+        assert_eq!(fmt("* a\n\n# H\n\n* b\n"), "- a\n\n# H\n\n- b\n");
+        assert_eq!(fmt("* a\n\ntext\n\n+ b\n"), "- a\n\ntext\n\n- b\n");
+        assert_eq!(fmt("* a\n* b\n"), "- a\n- b\n");
+        assert_eq!(fmt("1. a\n\ntext\n\n1) b\n"), "1. a\n\ntext\n\n1. b\n");
+    }
+
+    #[test]
+    fn the_configured_marker_is_used_and_the_neighbour_still_differs() {
+        assert_eq!(fmt_marker("- a\n\n* b\n", "*"), "* a\n\n- b\n");
+        assert_eq!(fmt_marker("+ a\n\n+ b\n", "+"), "+ a\n\n+ b\n"); // one list, stays one
+        assert_eq!(fmt_marker("- a\n\n* b\n", "+"), "+ a\n\n* b\n");
+    }
+
+    #[test]
+    fn a_single_list_keeps_all_its_items_on_one_marker() {
+        assert_eq!(fmt("* a\n* b\n* c\n"), "- a\n- b\n- c\n");
+        assert_eq!(fmt("- a\n  * b\n  * c\n- d\n"), "- a\n  - b\n  - c\n- d\n");
+    }
+
+    // ---- the content column of an item never moves relative to its children ----
+
+    #[test]
+    fn continuation_lines_follow_a_narrower_marker() {
+        for (src, expected) in [
+            ("-   a\n    cont\n", "- a\n  cont\n"),
+            ("1.  a\n    cont\n2.  b\n", "1. a\n   cont\n2. b\n"),
+            ("-   a\n    - b\n    - c\n", "- a\n  - b\n  - c\n"),
+            (
+                "-   a\n\n    ```\n    code\n    ```\n",
+                "- a\n\n  ```\n  code\n  ```\n",
+            ),
+            (
+                "-   a\n\n    para two\n\n-   b\n",
+                "- a\n\n  para two\n\n- b\n",
+            ),
+            ("-  a\n   cont\n", "- a\n  cont\n"),
+        ] {
+            assert_eq!(fmt(src), expected, "{src:?}");
+            assert_eq!(fmt(expected), expected, "idempotency for {src:?}");
+        }
+    }
+
+    #[test]
+    fn continuation_lines_follow_a_wider_marker() {
+        // Renumbering a list that starts at 9 turns `9.` into `10.`.
+        assert_eq!(
+            fmt("9. a\n   x\n9. b\n   y\n"),
+            "9. a\n   x\n10. b\n    y\n"
+        );
+        // Nested content moves with it.
+        assert_eq!(
+            fmt("9. a\n9. b\n   - n1\n   - n2\n"),
+            "9. a\n10. b\n    - n1\n    - n2\n"
+        );
+        let once = fmt("9. a\n   x\n9. b\n   y\n");
+        assert_eq!(fmt(&once), once);
+    }
+
+    #[test]
+    fn an_item_whose_children_cannot_be_reindented_keeps_its_spacing() {
+        for src in [
+            // A lazy continuation line has no indentation to give back.
+            "-   a\nlazy\n",
+            // A tab after the marker has no fixed width.
+            "-\ta\n  cont\n",
+            // Inside a blockquote the indentation follows the `>` prefix.
+            "> -   a\n>     cont\n",
+        ] {
+            assert_eq!(fmt(src), src, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn an_item_with_a_table_inside_is_left_alone() {
+        let src = "-   a\n\n    | x | y |\n    |---|---|\n    | 1 | 2 |\n";
+        let out = fmt(src);
+        assert!(out.starts_with("-   a\n"), "{out:?}");
+        assert!(out.contains("| x"), "{out:?}");
+    }
+
+    #[test]
+    fn single_line_items_still_collapse_their_spacing() {
+        assert_eq!(fmt("-   a\n-   b\n"), "- a\n- b\n");
+        assert_eq!(fmt("1.   a\n2.   b\n"), "1. a\n2. b\n");
+        assert_eq!(fmt("-   a\n\n-   b\n"), "- a\n\n- b\n");
     }
 }

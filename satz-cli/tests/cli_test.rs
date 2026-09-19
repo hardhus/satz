@@ -182,7 +182,7 @@ fn test_satz_fmt_check_exits_1_on_dirty_file() {
     let _ = std::fs::create_dir_all(&temp_dir);
     std::fs::write(
         temp_dir.join("note.md"),
-        "# Title\n\nContent with   trailing spaces   \nand _underscore italic_.\n",
+        "# Title\n\nContent with   trailing spaces \t \nand _underscore italic_.\n",
     )
     .unwrap();
 
@@ -209,7 +209,7 @@ fn test_satz_fmt_write_actually_rewrites_dirty_file() {
     let file_path = temp_dir.join("note.md");
     std::fs::write(
         &file_path,
-        "# Title\n\nContent with   trailing spaces   \nand _underscore italic_.\n",
+        "# Title\n\nContent with   trailing spaces \t \nand _underscore italic_.\n",
     )
     .unwrap();
 
@@ -371,7 +371,7 @@ mod support {
     }
 
     pub const DIRTY: &str =
-        "# Title\n\nContent with   trailing spaces   \nand _underscore italic_.\n";
+        "# Title\n\nContent with   trailing spaces \t \nand _underscore italic_.\n";
     pub const DIRTY_FORMATTED: &str =
         "# Title\n\nContent with   trailing spaces\nand *underscore italic*.\n";
 }
