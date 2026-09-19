@@ -338,7 +338,8 @@ pub fn parse_structure(source: &str) -> StructureOutput {
             Event::Code(s) => {
                 if in_heading {
                     heading_text.push_str(&s);
-                } else if in_link {
+                }
+                if in_link {
                     link_text.push_str(&s);
                 }
                 output
@@ -388,6 +389,12 @@ pub fn parse_structure(source: &str) -> StructureOutput {
                 output
                     .hard_break_spans
                     .push(ByteRange::new(range.start, range.end));
+                if in_heading {
+                    heading_text.push(' ');
+                }
+                if in_link {
+                    link_text.push(' ');
+                }
             }
 
             // --- Raw HTML (attribute values are not text) ---
@@ -427,10 +434,24 @@ pub fn parse_structure(source: &str) -> StructureOutput {
             Event::Text(s) => {
                 if in_metadata {
                     metadata_text.push_str(&s);
-                } else if in_heading {
-                    heading_text.push_str(&s);
-                } else if in_link {
-                    link_text.push_str(&s);
+                } else {
+                    // A link inside a heading is part of both texts.
+                    if in_heading {
+                        heading_text.push_str(&s);
+                    }
+                    if in_link {
+                        link_text.push_str(&s);
+                    }
+                }
+            }
+
+            // A line break inside a heading (setext) or a link reads as a space.
+            Event::SoftBreak => {
+                if in_heading {
+                    heading_text.push(' ');
+                }
+                if in_link {
+                    link_text.push(' ');
                 }
             }
 
@@ -446,11 +467,39 @@ fn parse_link_dest(dest: &str) -> (String, Option<String>) {
     if crate::model::link::is_external_target(dest) {
         return (dest.to_string(), None);
     }
+    // A note target is a path: `my%20note.md` names the file `my note.md`.
     if let Some((doc, heading)) = dest.split_once('#') {
-        (doc.to_string(), Some(heading.to_string()))
+        (percent_decode(doc), Some(percent_decode(heading)))
     } else {
-        (dest.to_string(), None)
+        (percent_decode(dest), None)
     }
+}
+
+/// Decodes `%XX` escapes (UTF-8). Text with a malformed escape, or one that would not be valid
+/// UTF-8 once decoded, is returned as written.
+fn percent_decode(text: &str) -> String {
+    if !text.contains('%') {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 #[cfg(test)]
@@ -709,5 +758,135 @@ mod tests {
         assert_eq!(structure.footnote_refs.len(), 1);
         assert_eq!(structure.footnote_defs.len(), 1);
         assert_eq!(structure.footnote_defs[0].label, "1");
+    }
+
+    // ---- links inside headings and line breaks in headings/links ----
+
+    fn heading_texts(md: &str) -> Vec<(String, String)> {
+        parse_structure(md)
+            .headings
+            .into_iter()
+            .map(|h| (h.text, h.slug))
+            .collect()
+    }
+
+    fn link_displays(md: &str) -> Vec<Option<String>> {
+        parse_structure(md)
+            .std_links
+            .into_iter()
+            .map(|l| l.display)
+            .collect()
+    }
+
+    #[test]
+    fn a_link_inside_a_heading_keeps_its_display_text() {
+        assert_eq!(link_displays("# [Foo](x.md)\n"), vec![Some("Foo".into())]);
+        assert_eq!(
+            link_displays("# See [Foo](x.md) now\n"),
+            vec![Some("Foo".into())]
+        );
+        assert_eq!(
+            link_displays("## [a](x.md) and [b](y.md)\n"),
+            vec![Some("a".into()), Some("b".into())]
+        );
+        assert_eq!(
+            link_displays("# [`code`](x.md)\n"),
+            vec![Some("code".into())]
+        );
+        assert_eq!(
+            link_displays("# [**bold** t](x.md)\n"),
+            vec![Some("bold t".into())]
+        );
+        // Outside headings nothing changes.
+        assert_eq!(
+            link_displays("text [Foo](x.md)\n"),
+            vec![Some("Foo".into())]
+        );
+        assert_eq!(link_displays("[](x.md)\n"), vec![None]);
+    }
+
+    #[test]
+    fn the_heading_text_still_reads_through_its_links() {
+        assert_eq!(
+            heading_texts("# See [Foo](x.md) now\n"),
+            vec![("See Foo now".to_string(), "see-foo-now".to_string())]
+        );
+        assert_eq!(
+            heading_texts("# [Foo](x.md)\n"),
+            vec![("Foo".to_string(), "foo".to_string())]
+        );
+    }
+
+    fn link_targets(md: &str) -> Vec<(String, Option<String>)> {
+        parse_structure(md)
+            .std_links
+            .into_iter()
+            .map(|l| (l.target_doc, l.target_heading))
+            .collect()
+    }
+
+    #[test]
+    fn percent_encoded_note_targets_are_decoded() {
+        assert_eq!(
+            link_targets("[t](my%20note.md)\n"),
+            vec![("my note.md".to_string(), None)]
+        );
+        assert_eq!(
+            link_targets("[t](a%C3%BCn.md#Big%20Head)\n"),
+            vec![("aün.md".to_string(), Some("Big Head".to_string()))]
+        );
+        assert_eq!(
+            link_targets("[t](sub%20dir/n%C3%B6t.md)\n"),
+            vec![("sub dir/nöt.md".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn malformed_escapes_and_plus_signs_are_left_alone() {
+        for (md, target) in [
+            ("[t](a%zz.md)\n", "a%zz.md"),
+            ("[t](a%2)\n", "a%2"),
+            ("[t](a%)\n", "a%"),
+            ("[t](a+b.md)\n", "a+b.md"),
+            // Not valid UTF-8 once decoded: keep the original text.
+            ("[t](a%FF.md)\n", "a%FF.md"),
+        ] {
+            assert_eq!(link_targets(md), vec![(target.to_string(), None)], "{md:?}");
+        }
+    }
+
+    #[test]
+    fn external_urls_stay_exactly_as_written() {
+        assert_eq!(
+            link_targets("[t](https://a.b/c%20d#x%20y)\n"),
+            vec![("https://a.b/c%20d#x%20y".to_string(), None)]
+        );
+        assert_eq!(
+            link_targets("[t](mailto:a%40b.c)\n"),
+            vec![("mailto:a%40b.c".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn a_line_break_inside_a_heading_or_link_is_a_space() {
+        assert_eq!(
+            heading_texts("Foo\nbar\n===\n"),
+            vec![("Foo bar".to_string(), "foo-bar".to_string())]
+        );
+        assert_eq!(
+            heading_texts("Foo\r\nbar\r\n---\r\n"),
+            vec![("Foo bar".to_string(), "foo-bar".to_string())]
+        );
+        assert_eq!(
+            heading_texts("one\ntwo\nthree\n===\n"),
+            vec![("one two three".to_string(), "one-two-three".to_string())]
+        );
+        assert_eq!(link_displays("[a\nb](x.md)\n"), vec![Some("a b".into())]);
+        assert_eq!(link_displays("[a\r\nb](x.md)\n"), vec![Some("a b".into())]);
+        // A single-line ATX heading is unchanged.
+        assert_eq!(
+            heading_texts("# Plain title\n"),
+            vec![("Plain title".to_string(), "plain-title".to_string())]
+        );
     }
 }

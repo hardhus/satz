@@ -37,6 +37,10 @@ pub struct Document {
     pub title: String,
     pub frontmatter: Frontmatter,
     pub frontmatter_range: Option<ByteRange>,
+    /// Why the frontmatter block could not be read (invalid YAML, or not a mapping); `None` when it
+    /// is fine or absent. Title, aliases and tags of a broken block are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontmatter_error: Option<String>,
     pub headings: Vec<Heading>,
     pub links: Vec<Link>,
     pub tags: Vec<Tag>,

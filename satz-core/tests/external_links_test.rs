@@ -67,3 +67,14 @@ fn an_external_url_is_kept_whole_including_its_fragment() {
     assert_eq!(doc.links[0].target_doc, "note.md");
     assert_eq!(doc.links[0].target_heading.as_deref(), Some("Sec"));
 }
+
+#[test]
+fn a_percent_encoded_link_to_a_note_with_a_space_is_not_broken() {
+    let a = parse_document(
+        "[t](my%20note.md) [u](my%20note.md#Sec%20Tion)\n",
+        Path::new("a.md"),
+    );
+    let b = parse_document("# B\n\n## Sec Tion\n", Path::new("my note.md"));
+    let index = Index::build(vec![a, b]);
+    assert_eq!(index.docs_with_broken_links().count(), 0);
+}

@@ -192,6 +192,19 @@ pub fn compute_diagnostics(
         });
     }
 
+    // 1b. A frontmatter block that cannot be read: its title, aliases and tags are ignored, which
+    // would otherwise be invisible.
+    if let (Some(error), Some(range)) = (&doc.frontmatter_error, doc.frontmatter_range) {
+        diagnostics.push(lsp::Diagnostic {
+            range: byte_range_to_lsp(range, &doc.line_index),
+            severity: Some(lsp::DiagnosticSeverity::WARNING),
+            code: Some(lsp::NumberOrString::String("invalid-frontmatter".to_string())),
+            source: Some("satz".to_string()),
+            message: format!("Invalid frontmatter: {error}; title, aliases and tags are ignored"),
+            ..Default::default()
+        });
+    }
+
     // 2. Missing required frontmatter fields
     for required_field in &config.frontmatter.required_fields {
         if is_missing_frontmatter_field(&doc.frontmatter, required_field) {
@@ -369,6 +382,43 @@ mod tests {
                 d.code == Some(lsp::NumberOrString::String("duplicate-heading".to_string()))
             })
             .count()
+    }
+
+    fn frontmatter_diagnostics(body: &str) -> Vec<lsp::Diagnostic> {
+        let doc_a = parse_document(body, Path::new("doc-a.md"));
+        let doc_b = parse_document("# B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
+        compute_diagnostics(&doc_a, &index, &VaultConfig::default())
+            .into_iter()
+            .filter(|d| {
+                d.code == Some(lsp::NumberOrString::String("invalid-frontmatter".to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_frontmatter_that_cannot_be_read_is_reported_on_its_block() {
+        let found = frontmatter_diagnostics("---\ntitle: Foo: bar\ntags: [a]\n---\n# Real\n");
+        assert_eq!(found.len(), 1);
+        let d = &found[0];
+        assert_eq!(d.severity, Some(lsp::DiagnosticSeverity::WARNING));
+        assert!(d.message.starts_with("Invalid frontmatter"), "{}", d.message);
+        assert!(d.message.contains("ignored"), "{}", d.message);
+        // The range is the frontmatter block: from its opening line to its closing line.
+        assert_eq!(d.range.start.line, 0);
+        assert_eq!(d.range.end.line, 3);
+    }
+
+    #[test]
+    fn readable_or_missing_frontmatter_gets_no_such_diagnostic() {
+        for body in [
+            "---\ntitle: T\ntags: [a]\n---\n# H\n",
+            "# Just a heading\n",
+            "---\n---\n# Empty block\n",
+            "---\r\ntitle: T\r\n---\r\n# H\r\n",
+        ] {
+            assert!(frontmatter_diagnostics(body).is_empty(), "{body:?}");
+        }
     }
 
     #[test]

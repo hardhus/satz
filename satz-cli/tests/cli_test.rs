@@ -810,3 +810,25 @@ fn daily_absolute_looking_folder_is_kept_inside_the_vault() {
             .exists()
     );
 }
+
+#[test]
+fn fmt_write_keeps_the_byte_order_mark() {
+    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_bom_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let file_path = temp_dir.join("note.md");
+    let mut before = vec![0xEF, 0xBB, 0xBF];
+    before.extend_from_slice(b"---\ntitle: T\n---\n\n\n# Title  \n\ntext  \n");
+    std::fs::write(&file_path, &before).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(["fmt", temp_dir.to_str().unwrap(), "--write"])
+        .output()
+        .expect("satz binary should execute");
+    assert!(output.status.success());
+
+    let after = std::fs::read(&file_path).unwrap();
+    let mut expected = vec![0xEF, 0xBB, 0xBF];
+    expected.extend_from_slice(b"---\ntitle: T\n---\n\n# Title\n\ntext\n");
+    assert_eq!(after, expected);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

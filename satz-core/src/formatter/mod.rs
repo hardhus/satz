@@ -42,6 +42,11 @@ use crate::model::ByteRange;
 /// LF twin). A document mixing both styles is normalised to whichever is more common (LF on a tie).
 /// A lone `\r` that isn't part of `\r\n` is ordinary content and is left alone.
 pub fn format_document(source: &str, config: &FormatterConfig) -> String {
+    // A leading byte order mark belongs to the file, not to the text: format what follows and put
+    // the mark back, so the frontmatter fence is still recognised and the file keeps its BOM.
+    if let Some(rest) = source.strip_prefix('\u{feff}') {
+        return format!("\u{feff}{}", format_document(rest, config));
+    }
     if !source.contains('\r') {
         return format_lf(source, config);
     }

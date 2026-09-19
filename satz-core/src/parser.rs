@@ -56,6 +56,9 @@ fn locate_fm_tag(source: &str, fm: ByteRange, name: &str, from: usize) -> Option
 ///
 /// Never panics; if frontmatter has YAML syntax errors, it falls back to empty frontmatter.
 pub fn parse_document(source: &str, path: &Path) -> Document {
+    // A leading UTF-8 byte order mark is a property of the file, not content: it must not stop the
+    // frontmatter fence from being recognised or shift the first line.
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let line_index = LineIndex::new(source);
 
     let mut hasher = DefaultHasher::new();
@@ -64,11 +67,15 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
 
     let structure = structure::parse_structure(source);
 
-    let frontmatter = structure
-        .frontmatter_yaml
-        .as_deref()
-        .and_then(|y| frontmatter::parse_frontmatter(y).ok())
-        .unwrap_or_default();
+    // A block that cannot be read is treated as empty (nothing of it is used) but the reason is kept,
+    // so it can be shown to the user instead of silently dropping their title, aliases and tags.
+    let (frontmatter, frontmatter_error) = match structure.frontmatter_yaml.as_deref() {
+        Some(yaml) => match frontmatter::parse_frontmatter(yaml) {
+            Ok(fm) => (fm, None),
+            Err(e) => (Default::default(), Some(e.to_string())),
+        },
+        None => (Default::default(), None),
+    };
 
     let mut code_spans = structure.code_spans.clone();
     if let Some(fm_range) = structure.frontmatter_range {
@@ -135,6 +142,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         title,
         frontmatter,
         frontmatter_range: structure.frontmatter_range,
+        frontmatter_error,
         headings: structure.headings,
         links,
         tags,
@@ -294,6 +302,53 @@ Here is a tag: #syntax and a footnote[^1].
         assert_eq!(&md[tag.range.start..tag.range.end], "rust");
         let tags_key_pos = md.find("tags:").unwrap();
         assert!(tag.range.start > tags_key_pos);
+    }
+
+    // ---- a broken frontmatter block is reported, not silently dropped ----
+
+    fn frontmatter_error(md: &str) -> Option<String> {
+        parse_document(md, Path::new("a.md")).frontmatter_error
+    }
+
+    #[test]
+    fn valid_absent_or_empty_frontmatter_has_no_error() {
+        for md in [
+            "---\ntitle: T\ntags: [a]\n---\n# H\n",
+            "# No frontmatter\n",
+            "---\n---\n# Empty\n",
+            "---\n\n---\n# Blank\n",
+            "---\ntitle: T\n# never closed\n",
+            "text\n\n---\nnot: frontmatter\n---\n",
+            "---\r\ntitle: T\r\n---\r\n# H\r\n",
+            "",
+        ] {
+            assert_eq!(frontmatter_error(md), None, "{md:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_yaml_is_recorded_and_its_fields_are_ignored() {
+        let md = "---\ntitle: Foo: bar\ntags: [a]\n---\n# Real title\n";
+        let doc = parse_document(md, Path::new("a.md"));
+        let error = doc.frontmatter_error.expect("an error message");
+        assert!(error.to_lowercase().contains("yaml"), "{error}");
+        // Behaviour is unchanged: nothing of the broken block is used.
+        assert_eq!(doc.title, "Real title");
+        assert!(doc.tags.is_empty());
+        assert!(doc.frontmatter.aliases.is_empty());
+        assert!(doc.frontmatter_range.is_some());
+    }
+
+    #[test]
+    fn a_frontmatter_that_is_not_a_mapping_is_an_error_too() {
+        let error = frontmatter_error("---\n- a\n- b\n---\n# H\n").expect("an error message");
+        assert!(error.to_lowercase().contains("mapping"), "{error}");
+        assert!(frontmatter_error("---\njust text\n---\n# H\n").is_some());
+    }
+
+    #[test]
+    fn a_broken_block_with_crlf_is_reported_as_well() {
+        assert!(frontmatter_error("---\r\ntitle: Foo: bar\r\n---\r\n# H\r\n").is_some());
     }
 
     fn body_tags(md: &str) -> Vec<String> {

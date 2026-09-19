@@ -59,7 +59,20 @@ pub fn run(args: FmtArgs) -> Result<()> {
             let mut write_error = None;
             if changed && !check_only {
                 let abs_path = vault_root.join(&doc.path);
-                if let Err(e) = fs::write(&abs_path, &formatted) {
+                // The parsed text has no byte order mark; a file that had one keeps it.
+                let had_bom = fs::File::open(&abs_path)
+                    .and_then(|mut f| {
+                        use std::io::Read;
+                        let mut head = [0u8; 3];
+                        f.read_exact(&mut head).map(|_| head == [0xEF, 0xBB, 0xBF])
+                    })
+                    .unwrap_or(false);
+                let mut bytes = Vec::with_capacity(formatted.len() + 3);
+                if had_bom {
+                    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+                }
+                bytes.extend_from_slice(formatted.as_bytes());
+                if let Err(e) = fs::write(&abs_path, &bytes) {
                     write_error = Some(e.to_string());
                 }
             }
