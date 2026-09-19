@@ -26,6 +26,10 @@ pub struct Index {
     pub(crate) by_stem: HashMap<String, DocId>,
     pub(crate) by_title_alias: HashMap<String, DocId>,
     pub(crate) backlinks: HashMap<DocId, HashSet<DocId>>,
+    /// Source document -> the documents its links resolved to when they were last (re)computed.
+    /// Lets backlinks be removed exactly as they were added, instead of re-resolving the links
+    /// against an index that may have changed since.
+    pub(crate) outgoing: HashMap<DocId, HashSet<DocId>>,
     pub(crate) tags: HashMap<String, HashSet<DocId>>,
 }
 
@@ -336,140 +340,19 @@ impl Index {
         })
     }
 
-    /// Replaces or inserts a document in the index, updating paths, title/aliases, tags, and backlinks.
-    pub fn replace_doc(&mut self, new_doc: Document) {
-        let id = new_doc.id.clone();
-        tracing::trace!(?id, path = ?new_doc.path, "Index::replace_doc");
-
-        // If old doc exists, clean up old references
-        if let Some(old_doc) = self.docs.get(&id) {
-            // Remove outgoing backlinks from old_doc FIRST
-            for link in &old_doc.links {
-                if matches!(
-                    link.kind,
-                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-                ) && !link.target_doc.starts_with("http://")
-                    && !link.target_doc.starts_with("https://")
-                {
-                    let is_degenerate = link.target_doc.is_empty()
-                        && link
-                            .target_heading
-                            .as_deref()
-                            .is_none_or(|h| h.trim().is_empty())
-                        && link
-                            .target_block
-                            .as_deref()
-                            .is_none_or(|b| b.trim().is_empty());
-
-                    let target_id = if is_degenerate {
-                        None
-                    } else if link.target_doc.is_empty() {
-                        Some(id.clone())
-                    } else {
-                        self.resolve_link(&link.target_doc).cloned()
-                    };
-                    if let Some(target_id) = target_id
-                        && let Some(set) = self.backlinks.get_mut(&target_id)
-                    {
-                        set.remove(&id);
-                        if set.is_empty() {
-                            self.backlinks.remove(&target_id);
-                        }
-                    }
-                }
-            }
-
-            // Remove old tags
-            for tag in &old_doc.tags {
-                let tag_key = fold_key(tag.name.trim_start_matches('#'));
-                if let Some(set) = self.tags.get_mut(&tag_key) {
-                    set.remove(&id);
-                    if set.is_empty() {
-                        self.tags.remove(&tag_key);
-                    }
-                }
-            }
-
-            // Remove old title and aliases from by_title_alias if pointing to this doc
-            let old_title_key = fold_key(&old_doc.title);
-            if self.by_title_alias.get(&old_title_key) == Some(&id) {
-                self.by_title_alias.remove(&old_title_key);
-            }
-            for alias in &old_doc.frontmatter.aliases {
-                let alias_key = fold_key(alias);
-                if self.by_title_alias.get(&alias_key) == Some(&id) {
-                    self.by_title_alias.remove(&alias_key);
-                }
-            }
-
-            // Remove old stem
-            let old_stem_key = old_doc
-                .path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(fold_key)
-                .unwrap_or_default();
-            if !old_stem_key.is_empty() && self.by_stem.get(&old_stem_key) == Some(&id) {
-                self.by_stem.remove(&old_stem_key);
-            }
-
-            // Remove old path
-            let old_normalized = PathBuf::from(old_doc.path.to_string_lossy().replace('\\', "/"));
-            if self.by_path.get(&old_normalized) == Some(&id) {
-                self.by_path.remove(&old_normalized);
-            }
+    /// Which document (if any) a link counts as a backlink *to*, for backlink/orphan purposes.
+    ///
+    /// The single rule shared by `build`, `replace_doc` and `remove_doc`: external `http(s)`
+    /// links, degenerate links (`[[]]`, `[[#]]`, `[[|x]]`), footnotes, and Markdown links with an
+    /// empty target (`[x](#h)`) never count; a wikilink/embed with an empty target but a
+    /// heading/block (`[[#Heading]]`) is a self-link; everything else goes through
+    /// `resolve_link`.
+    pub(crate) fn link_target(&self, src: &DocId, link: &Link) -> Option<DocId> {
+        if link.target_doc.starts_with("http://") || link.target_doc.starts_with("https://") {
+            return None;
         }
-
-        // Insert new path
-        let normalized_path = PathBuf::from(new_doc.path.to_string_lossy().replace('\\', "/"));
-        self.by_path.insert(normalized_path, id.clone());
-
-        // Insert new stem
-        let new_stem_key = new_doc
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(fold_key)
-            .unwrap_or_default();
-        if !new_stem_key.is_empty() {
-            match self.by_stem.entry(new_stem_key) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    tracing::warn!(
-                        "stem conflict: '{}' (keeping first entry {:?}, new doc {:?} at path {:?} was rejected)",
-                        e.key(),
-                        e.get(),
-                        id,
-                        new_doc.path
-                    );
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(id.clone());
-                }
-            }
-        }
-
-        // Insert new title and aliases
-        let title_key = fold_key(&new_doc.title);
-        self.by_title_alias.insert(title_key, id.clone());
-        for alias in &new_doc.frontmatter.aliases {
-            let alias_key = fold_key(alias);
-            self.by_title_alias.insert(alias_key, id.clone());
-        }
-
-        // Insert new tags
-        for tag in &new_doc.tags {
-            let tag_key = fold_key(tag.name.trim_start_matches('#'));
-            self.tags.entry(tag_key).or_default().insert(id.clone());
-        }
-
-        // Insert new outgoing backlinks
-        for link in &new_doc.links {
-            if matches!(
-                link.kind,
-                LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-            ) && !link.target_doc.starts_with("http://")
-                && !link.target_doc.starts_with("https://")
-            {
+        match link.kind {
+            LinkKind::WikiLink | LinkKind::Embed => {
                 let is_degenerate = link.target_doc.is_empty()
                     && link
                         .target_heading
@@ -479,103 +362,182 @@ impl Index {
                         .target_block
                         .as_deref()
                         .is_none_or(|b| b.trim().is_empty());
-
-                let target_id = if is_degenerate {
+                if is_degenerate {
                     None
                 } else if link.target_doc.is_empty() {
-                    Some(id.clone())
+                    Some(src.clone())
                 } else {
                     self.resolve_link(&link.target_doc).cloned()
-                };
-                if let Some(target_id) = target_id {
-                    self.backlinks
-                        .entry(target_id)
-                        .or_default()
-                        .insert(id.clone());
+                }
+            }
+            LinkKind::Markdown => {
+                if link.target_doc.is_empty() {
+                    None
+                } else {
+                    self.resolve_link(&link.target_doc).cloned()
+                }
+            }
+            LinkKind::Footnote => None,
+        }
+    }
+
+    fn tag_keys(doc: &Document) -> Vec<String> {
+        doc.tags
+            .iter()
+            .map(|t| fold_key(t.name.trim_start_matches('#')))
+            .collect()
+    }
+
+    /// Resolves `id`'s outgoing links against the current lookup tables and records them in
+    /// `outgoing` + `backlinks`.
+    fn add_doc_edges(&mut self, id: &DocId) {
+        let Some(doc) = self.docs.get(id) else {
+            return;
+        };
+        let targets: HashSet<DocId> = doc
+            .links
+            .iter()
+            .filter_map(|link| self.link_target(id, link))
+            .collect();
+        for target in &targets {
+            self.backlinks
+                .entry(target.clone())
+                .or_default()
+                .insert(id.clone());
+        }
+        if !targets.is_empty() {
+            self.outgoing.insert(id.clone(), targets);
+        }
+    }
+
+    /// Removes `id`'s outgoing edges using what was recorded when they were added -- never by
+    /// re-resolving the links against the (possibly different) current index.
+    fn remove_doc_edges(&mut self, id: &DocId) {
+        let Some(targets) = self.outgoing.remove(id) else {
+            return;
+        };
+        for target in targets {
+            if let Some(set) = self.backlinks.get_mut(&target) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.backlinks.remove(&target);
                 }
             }
         }
-
-        self.docs.insert(id, new_doc);
     }
 
-    /// Removes a document from the index.
-    pub fn remove_doc(&mut self, id: &DocId) {
-        tracing::debug!(?id, "Index::remove_doc");
-        if let Some(old_doc) = self.docs.remove(id) {
-            // Remove outgoing backlinks
-            for link in &old_doc.links {
-                if matches!(
-                    link.kind,
-                    LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-                ) && !link.target_doc.starts_with("http://")
-                    && !link.target_doc.starts_with("https://")
-                {
-                    let is_degenerate = link.target_doc.is_empty()
-                        && link
-                            .target_heading
-                            .as_deref()
-                            .is_none_or(|h| h.trim().is_empty())
-                        && link
-                            .target_block
-                            .as_deref()
-                            .is_none_or(|b| b.trim().is_empty());
+    /// Rebuilds every table derived from `docs` (path/stem/title-alias lookups, tags, forward
+    /// and backward link edges) from scratch, visiting documents in `DocId` order so the result
+    /// never depends on insertion order.
+    ///
+    /// Conflict rules (unchanged from the original `build`): the first document (by `DocId`) wins
+    /// a stem; the last one wins a title/alias.
+    pub(crate) fn rebuild_derived(&mut self, log_conflicts: bool) {
+        self.by_path.clear();
+        self.by_stem.clear();
+        self.by_title_alias.clear();
+        self.backlinks.clear();
+        self.tags.clear();
+        self.outgoing.clear();
 
-                    let target_id = if is_degenerate {
-                        None
-                    } else if link.target_doc.is_empty() {
-                        Some(id.clone())
-                    } else {
-                        self.resolve_link(&link.target_doc).cloned()
-                    };
-                    if let Some(target_id) = target_id
-                        && let Some(set) = self.backlinks.get_mut(&target_id)
-                    {
-                        set.remove(id);
-                        if set.is_empty() {
-                            self.backlinks.remove(&target_id);
-                        }
-                    }
-                }
-            }
+        let mut ids: Vec<DocId> = self.docs.keys().cloned().collect();
+        ids.sort();
 
-            for tag in &old_doc.tags {
-                let tag_key = fold_key(tag.name.trim_start_matches('#'));
-                if let Some(set) = self.tags.get_mut(&tag_key) {
-                    set.remove(id);
-                    if set.is_empty() {
-                        self.tags.remove(&tag_key);
-                    }
-                }
-            }
+        // Pass 1: lookup tables + tags, so pass 2 sees a complete index.
+        for id in &ids {
+            let doc = &self.docs[id];
+            let normalized_path = PathBuf::from(doc.path.to_string_lossy().replace('\\', "/"));
+            self.by_path.insert(normalized_path, id.clone());
 
-            let old_title_key = fold_key(&old_doc.title);
-            if self.by_title_alias.get(&old_title_key) == Some(id) {
-                self.by_title_alias.remove(&old_title_key);
-            }
-            for alias in &old_doc.frontmatter.aliases {
-                let alias_key = fold_key(alias);
-                if self.by_title_alias.get(&alias_key) == Some(id) {
-                    self.by_title_alias.remove(&alias_key);
-                }
-            }
-
-            let old_stem_key = old_doc
+            let stem_key = doc
                 .path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(fold_key)
                 .unwrap_or_default();
-            if !old_stem_key.is_empty() && self.by_stem.get(&old_stem_key) == Some(id) {
-                self.by_stem.remove(&old_stem_key);
+            if !stem_key.is_empty() {
+                match self.by_stem.entry(stem_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        if log_conflicts {
+                            tracing::warn!(
+                                "stem conflict: '{}' (keeping {:?}, ignoring {:?})",
+                                e.key(),
+                                e.get(),
+                                id
+                            );
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(id.clone());
+                    }
+                }
             }
 
-            let old_normalized = PathBuf::from(old_doc.path.to_string_lossy().replace('\\', "/"));
-            if self.by_path.get(&old_normalized) == Some(id) {
-                self.by_path.remove(&old_normalized);
+            let title_and_aliases = std::iter::once(fold_key(&doc.title))
+                .chain(doc.frontmatter.aliases.iter().map(|a| fold_key(a)));
+            for key in title_and_aliases {
+                if log_conflicts && self.by_title_alias.get(&key).is_some_and(|o| o != id) {
+                    tracing::warn!(
+                        "title/alias conflict: '{}' (overwriting previous entry)",
+                        key
+                    );
+                }
+                self.by_title_alias.insert(key, id.clone());
             }
 
-            self.backlinks.remove(id);
+            for tag_key in Self::tag_keys(doc) {
+                self.tags.entry(tag_key).or_default().insert(id.clone());
+            }
+        }
+
+        // Pass 2: resolve links.
+        for id in &ids {
+            self.add_doc_edges(id);
+        }
+    }
+
+    /// Replaces or inserts a document in the index, keeping every derived table consistent.
+    ///
+    /// If the document already exists and its identity keys (title, aliases, stem) are
+    /// unchanged -- the common keystroke-edit case -- only its own outgoing edges and tags are
+    /// refreshed. Otherwise (new document, or a title/alias/stem change) links elsewhere in the
+    /// vault may now resolve differently, so all derived tables are rebuilt.
+    pub fn replace_doc(&mut self, new_doc: Document) {
+        let id = new_doc.id.clone();
+        tracing::trace!(?id, path = ?new_doc.path, "Index::replace_doc");
+
+        let same_identity = self
+            .docs
+            .get(&id)
+            .is_some_and(|old| old.identity_keys() == new_doc.identity_keys());
+
+        if !same_identity {
+            self.docs.insert(id, new_doc);
+            self.rebuild_derived(false);
+            return;
+        }
+
+        self.remove_doc_edges(&id);
+        for tag_key in Self::tag_keys(&self.docs[&id]) {
+            if let Some(set) = self.tags.get_mut(&tag_key) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.tags.remove(&tag_key);
+                }
+            }
+        }
+        for tag_key in Self::tag_keys(&new_doc) {
+            self.tags.entry(tag_key).or_default().insert(id.clone());
+        }
+        self.docs.insert(id.clone(), new_doc);
+        self.add_doc_edges(&id);
+    }
+
+    /// Removes a document from the index.
+    pub fn remove_doc(&mut self, id: &DocId) {
+        tracing::debug!(?id, "Index::remove_doc");
+        if self.docs.remove(id).is_some() {
+            self.rebuild_derived(false);
         }
     }
 
@@ -613,9 +575,191 @@ pub struct IndexStats {
 }
 
 #[cfg(test)]
+impl Index {
+    /// Deterministic dump of every derived map, so incremental updates can be compared against
+    /// a from-scratch `Index::build` of the same documents.
+    pub(crate) fn snapshot(&self) -> String {
+        fn sorted_set(s: &HashSet<DocId>) -> Vec<String> {
+            let mut v: Vec<String> = s.iter().map(|d| d.as_str().to_string()).collect();
+            v.sort();
+            v
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for id in self.docs.keys() {
+            lines.push(format!("doc {}", id.as_str()));
+        }
+        for (k, v) in &self.by_path {
+            lines.push(format!("path {:?} -> {}", k, v.as_str()));
+        }
+        for (k, v) in &self.by_stem {
+            lines.push(format!("stem {:?} -> {}", k, v.as_str()));
+        }
+        for (k, v) in &self.by_title_alias {
+            lines.push(format!("title_alias {:?} -> {}", k, v.as_str()));
+        }
+        for (k, v) in &self.backlinks {
+            lines.push(format!("backlinks {} <- {:?}", k.as_str(), sorted_set(v)));
+        }
+        for (k, v) in &self.outgoing {
+            lines.push(format!("outgoing {} -> {:?}", k.as_str(), sorted_set(v)));
+        }
+        for (k, v) in &self.tags {
+            lines.push(format!("tag {:?} -> {:?}", k, sorted_set(v)));
+        }
+        lines.sort();
+        lines.join("\n")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::parse_document;
+
+    fn doc(path: &str, content: &str) -> Document {
+        parse_document(content, Path::new(path))
+    }
+
+    #[test]
+    fn replace_doc_resolves_previously_broken_incoming_links() {
+        // The reported bug: `a.md` links to `[[new]]` while `new.md` doesn't exist yet. Creating
+        // `new.md` afterwards must make that link resolve AND count as a backlink -- otherwise
+        // the freshly created note is wrongly flagged as an orphan.
+        let mut index = Index::build(vec![doc("a.md", "# A\n\nSee [[new]].")]);
+        assert_eq!(index.broken_link_count(), 1);
+
+        index.replace_doc(doc("new.md", "# New"));
+
+        let new_id = DocId::new("new.md");
+        let backlinks: Vec<&str> = index.backlinks_of(&new_id).map(|d| d.as_str()).collect();
+        assert_eq!(backlinks, vec!["a.md"]);
+        assert_eq!(index.broken_link_count(), 0);
+        let orphans: Vec<&str> = index.orphan_docs().map(|d| d.id.as_str()).collect();
+        assert!(
+            !orphans.contains(&"new.md"),
+            "new.md wrongly orphan: {orphans:?}"
+        );
+    }
+
+    #[test]
+    fn removed_and_recreated_note_regains_incoming_backlinks() {
+        let mut index = Index::build(vec![doc("a.md", "# A\n\nSee [[b]]."), doc("b.md", "# B")]);
+        let b_id = DocId::new("b.md");
+        assert_eq!(index.backlinks_of(&b_id).count(), 1);
+
+        index.remove_doc(&b_id);
+        assert_eq!(index.backlinks_of(&b_id).count(), 0);
+        assert_eq!(index.broken_link_count(), 1);
+
+        index.replace_doc(doc("b.md", "# B"));
+        assert_eq!(index.backlinks_of(&b_id).count(), 1);
+        assert_eq!(index.broken_link_count(), 0);
+    }
+
+    #[test]
+    fn removing_alias_owner_restores_the_shadowed_alias() {
+        let a = doc("a.md", "---\naliases: [shared]\n---\n# A");
+        let b = doc("b.md", "---\naliases: [shared]\n---\n# B");
+        let mut index = Index::build(vec![a, b]);
+        // `by_title_alias` is last-wins, and now deterministic (sorted by DocId): b.md wins.
+        assert_eq!(index.resolve_link("shared"), Some(&DocId::new("b.md")));
+
+        index.remove_doc(&DocId::new("b.md"));
+        assert_eq!(index.resolve_link("shared"), Some(&DocId::new("a.md")));
+    }
+
+    #[test]
+    fn stem_conflict_is_deterministic_and_loser_is_promoted_on_removal() {
+        let make = |order: &[&str]| {
+            Index::build(
+                order
+                    .iter()
+                    .map(|p| doc(p, "# Foo"))
+                    .collect::<Vec<Document>>(),
+            )
+        };
+        // Same winner regardless of insertion order (first by sorted DocId).
+        let forward = make(&["a/foo.md", "b/foo.md"]);
+        let reverse = make(&["b/foo.md", "a/foo.md"]);
+        assert_eq!(forward.resolve_link("foo"), Some(&DocId::new("a/foo.md")));
+        assert_eq!(reverse.resolve_link("foo"), Some(&DocId::new("a/foo.md")));
+
+        let mut index = reverse;
+        index.remove_doc(&DocId::new("a/foo.md"));
+        assert_eq!(index.resolve_link("foo"), Some(&DocId::new("b/foo.md")));
+    }
+
+    #[test]
+    fn build_and_replace_agree_on_empty_target_markdown_link() {
+        // `[Self](#section)` has an empty `target_doc`. `build` never counted it as a backlink;
+        // `replace_doc` used to count it as a self-link. Both paths must agree.
+        let content = "# Self\n\n[Self](#section)";
+        let built = Index::build(vec![doc("self.md", content)]);
+        let mut replaced = Index::default();
+        replaced.replace_doc(doc("self.md", content));
+
+        let id = DocId::new("self.md");
+        assert_eq!(built.backlinks_of(&id).count(), 0);
+        assert_eq!(replaced.backlinks_of(&id).count(), 0);
+        assert_eq!(built.snapshot(), replaced.snapshot());
+    }
+
+    /// Tiny deterministic PRNG so the parity test needs no extra dependency.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % bound
+        }
+    }
+
+    #[test]
+    fn incremental_updates_always_match_a_fresh_build() {
+        const PATHS: [&str; 6] = [
+            "n1.md",
+            "n2.md",
+            "sub/n3.md",
+            "sub/n1.md", // stem conflict with n1.md
+            "n4.md",
+            "d/n2.md", // stem conflict with n2.md
+        ];
+        const VARIANTS: [&str; 5] = [
+            "# T\n\n[[n1]] [[n2]]",
+            "---\ntitle: Alias One\naliases: [shared, x1]\n---\n# Alias One\n\n[[shared]] [[n3#h]]",
+            "# Heading\n\n[[#Heading]] [Self](#heading) #tag1",
+            "---\naliases: [shared]\ntags: [tag2]\n---\n# Other\n\n[[Alias One]] [[n4]]",
+            "# Plain",
+        ];
+
+        for seed in 1..=8u64 {
+            let mut rng = Lcg(seed);
+            let mut index = Index::default();
+            let mut current: HashMap<&str, Document> = HashMap::new();
+
+            for step in 0..120 {
+                let path = PATHS[rng.next(PATHS.len())];
+                if rng.next(10) < 7 {
+                    let d = doc(path, VARIANTS[rng.next(VARIANTS.len())]);
+                    current.insert(path, d.clone());
+                    index.replace_doc(d);
+                } else if current.remove(path).is_some() {
+                    index.remove_doc(&DocId::new(path));
+                }
+
+                let mut docs: Vec<Document> = current.values().cloned().collect();
+                docs.sort_by(|a, b| a.id.cmp(&b.id));
+                let fresh = Index::build(docs);
+                assert_eq!(
+                    index.snapshot(),
+                    fresh.snapshot(),
+                    "seed {seed}, step {step}: incremental index diverged from a fresh build"
+                );
+            }
+        }
+    }
 
     #[test]
     fn empty_and_degenerate_links_are_silent() {

@@ -54,6 +54,25 @@ pub struct Document {
 }
 
 impl Document {
+    /// The folded keys other documents can use to link to this one: title, frontmatter aliases,
+    /// and file stem. When these change, links elsewhere in the vault may resolve differently.
+    pub fn identity_keys(&self) -> std::collections::HashSet<String> {
+        std::iter::once(crate::slug::fold_key(&self.title))
+            .chain(
+                self.frontmatter
+                    .aliases
+                    .iter()
+                    .map(|a| crate::slug::fold_key(a)),
+            )
+            .chain(
+                self.path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(crate::slug::fold_key),
+            )
+            .collect()
+    }
+
     /// Resolves the document title according to priority:
     /// 1. `frontmatter.title` (if non-empty)
     /// 2. First level 1 heading (`# Heading 1`)

@@ -1,135 +1,19 @@
-use std::path::PathBuf;
-
 use crate::index::lookup::Index;
-use crate::model::{Document, LinkKind};
-use crate::slug::fold_key;
+use crate::model::Document;
 
 impl Index {
     /// Builds an in-memory index from a collection of parsed `Document`s.
     ///
-    /// Performs a two-pass construction:
-    /// - Pass 1: Populates documents, path lookups, title/alias lookups, and tags.
-    /// - Pass 2: Resolves link targets and populates the backlink graph and broken link count.
+    /// Registers every document, then derives the path/stem/title-alias lookups, tags and link
+    /// edges from them in one deterministic pass (`Index::rebuild_derived`), so the result does
+    /// not depend on the order `docs` arrives in. Incremental updates (`replace_doc` /
+    /// `remove_doc`) are checked against exactly this result.
     pub fn build(docs: Vec<Document>) -> Self {
         let mut index = Index::default();
-
-        // Pass 1: Register all documents, paths, aliases, and tags
         for doc in docs {
-            let normalized_path = PathBuf::from(doc.path.to_string_lossy().replace('\\', "/"));
-            index.by_path.insert(normalized_path, doc.id.clone());
-
-            let stem_key = doc
-                .path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(fold_key)
-                .unwrap_or_default();
-            if !stem_key.is_empty() {
-                match index.by_stem.entry(stem_key) {
-                    std::collections::hash_map::Entry::Occupied(e) => {
-                        tracing::warn!("stem conflict: '{}' (keeping first entry)", e.key());
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(doc.id.clone());
-                    }
-                }
-            }
-
-            let title_key = fold_key(&doc.title);
-            if index
-                .by_title_alias
-                .get(&title_key)
-                .is_some_and(|id| id != &doc.id)
-            {
-                tracing::warn!(
-                    "title conflict: '{}' (overwriting previous entry)",
-                    title_key
-                );
-            }
-            index.by_title_alias.insert(title_key, doc.id.clone());
-
-            for alias in &doc.frontmatter.aliases {
-                let alias_key = fold_key(alias);
-                if index
-                    .by_title_alias
-                    .get(&alias_key)
-                    .is_some_and(|id| id != &doc.id)
-                {
-                    tracing::warn!(
-                        "alias conflict: '{}' (overwriting previous entry)",
-                        alias_key
-                    );
-                }
-                index.by_title_alias.insert(alias_key, doc.id.clone());
-            }
-
-            for tag in &doc.tags {
-                let tag_key = fold_key(tag.name.trim_start_matches('#'));
-                index
-                    .tags
-                    .entry(tag_key)
-                    .or_default()
-                    .insert(doc.id.clone());
-            }
-
             index.docs.insert(doc.id.clone(), doc);
         }
-
-        // Pass 2: Resolve links and compute incoming backlinks and broken links
-        let all_ids: Vec<_> = index.docs.keys().cloned().collect();
-
-        for src_id in &all_ids {
-            let doc = &index.docs[src_id];
-            for link in &doc.links {
-                match link.kind {
-                    LinkKind::WikiLink | LinkKind::Embed => {
-                        let is_degenerate = link.target_doc.is_empty()
-                            && link
-                                .target_heading
-                                .as_deref()
-                                .is_none_or(|h| h.trim().is_empty())
-                            && link
-                                .target_block
-                                .as_deref()
-                                .is_none_or(|b| b.trim().is_empty());
-
-                        let target_id = if is_degenerate {
-                            None
-                        } else if link.target_doc.is_empty() {
-                            Some(src_id.clone())
-                        } else {
-                            index.resolve_link(&link.target_doc).cloned()
-                        };
-
-                        if let Some(target_id) = target_id {
-                            index
-                                .backlinks
-                                .entry(target_id)
-                                .or_default()
-                                .insert(src_id.clone());
-                        }
-                    }
-                    LinkKind::Markdown => {
-                        if link.target_doc.starts_with("http://")
-                            || link.target_doc.starts_with("https://")
-                            || link.target_doc.is_empty()
-                        {
-                            continue;
-                        }
-                        let target_id = index.resolve_link(&link.target_doc).cloned();
-
-                        if let Some(target_id) = target_id {
-                            index
-                                .backlinks
-                                .entry(target_id)
-                                .or_default()
-                                .insert(src_id.clone());
-                        }
-                    }
-                    LinkKind::Footnote => {}
-                }
-            }
-        }
+        index.rebuild_derived(true);
 
         tracing::debug!(
             doc_count = index.docs.len(),

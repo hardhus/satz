@@ -128,15 +128,7 @@ pub struct SatzState {
 }
 
 pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<String> {
-    std::iter::once(satz_core::fold_key(&d.title))
-        .chain(d.frontmatter.aliases.iter().map(|a| satz_core::fold_key(a)))
-        .chain(
-            d.path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(satz_core::fold_key),
-        )
-        .collect()
+    d.identity_keys()
 }
 
 impl SatzState {
@@ -206,7 +198,10 @@ impl SatzState {
         let new_doc = satz_core::parse_document(content, &rel_path);
         let new_keys = identity_keys(&new_doc);
 
-        if !old_keys.is_empty() && old_keys != new_keys {
+        // A document not yet in the index has empty `old_keys`, which correctly counts as a
+        // change: a note that was just created (e.g. via "Create note") can now resolve links
+        // that other open documents currently show as broken.
+        if old_keys != new_keys {
             self.peers_dirty = true;
         }
 
@@ -317,6 +312,71 @@ mod tests {
         assert_ne!(keys1, keys2);
         assert!(keys1.contains("eski baslik") || keys1.contains("eski başlık"));
         assert!(keys2.contains("yeni baslik") || keys2.contains("yeni başlık"));
+    }
+
+    fn state_with_broken_link_to_new() -> SatzState {
+        let a = satz_core::parse_document("# A\n\nSee [[new]].", Path::new("a.md"));
+        SatzState {
+            index: Index::build(vec![a]),
+            indexing_complete: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn open_new_note_marks_peers_dirty() {
+        // A note that isn't in the index yet (e.g. just created via "Create note") can resolve
+        // links other open documents show as broken, so their diagnostics must be refreshed.
+        let mut state = state_with_broken_link_to_new();
+        assert!(!state.peers_dirty);
+        state.open_document("file:///new.md", "# New", Path::new("new.md"), 1);
+        assert!(state.peers_dirty);
+    }
+
+    #[test]
+    fn reopening_an_unchanged_indexed_note_does_not_mark_peers_dirty() {
+        let mut state = state_with_broken_link_to_new();
+        state.open_document("file:///a.md", "# A\n\nSee [[new]].", Path::new("a.md"), 1);
+        assert!(!state.peers_dirty);
+    }
+
+    #[test]
+    fn create_note_flow_clears_broken_link_and_orphan_diagnostics() {
+        use crate::handlers::diagnostics::compute_diagnostics;
+        let mut state = state_with_broken_link_to_new();
+
+        let a_before = state.index.get_doc(&satz_core::DocId::new("a.md")).unwrap();
+        let codes = |diags: &[tower_lsp_server::ls_types::Diagnostic]| -> Vec<String> {
+            diags
+                .iter()
+                .filter_map(|d| match &d.code {
+                    Some(tower_lsp_server::ls_types::NumberOrString::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            codes(&compute_diagnostics(a_before, &state.index, &state.config))
+                .contains(&"broken-link".to_string())
+        );
+
+        state.open_document("file:///new.md", "# New\n\nBody.", Path::new("new.md"), 1);
+
+        let new_doc = state
+            .index
+            .get_doc(&satz_core::DocId::new("new.md"))
+            .unwrap();
+        let new_codes = codes(&compute_diagnostics(new_doc, &state.index, &state.config));
+        assert!(
+            !new_codes.contains(&"orphan-note".to_string()),
+            "freshly created note wrongly flagged orphan: {new_codes:?}"
+        );
+        let a_after = state.index.get_doc(&satz_core::DocId::new("a.md")).unwrap();
+        let a_codes = codes(&compute_diagnostics(a_after, &state.index, &state.config));
+        assert!(
+            !a_codes.contains(&"broken-link".to_string()),
+            "link to the new note still reported broken: {a_codes:?}"
+        );
     }
 
     #[test]
