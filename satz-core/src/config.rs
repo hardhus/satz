@@ -1,6 +1,8 @@
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VaultConfig {
+    /// RESERVED: accepted so existing files keep loading, but currently has no effect (every
+    /// document is identified by its vault-relative path).
     pub id_scheme: IdSchemeConfig,
     pub daily_note: DailyNoteConfig,
     pub frontmatter: FrontmatterConfig,
@@ -8,6 +10,8 @@ pub struct VaultConfig {
     pub hover: HoverConfig,
     pub diagnostics: DiagnosticsConfig,
     pub formatter: FormatterConfig,
+    /// RESERVED: accepted so existing files keep loading, but currently has no effect (key
+    /// folding always treats Turkish `İ`/`I` specially).
     pub turkish_i_folding: bool,
 }
 
@@ -15,6 +19,7 @@ pub struct VaultConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     pub moc_tags: Vec<String>,
+    /// RESERVED: accepted so existing files keep loading, but currently has no effect.
     pub workspace: bool,
 }
 
@@ -339,6 +344,34 @@ impl VaultConfig {
                 self.daily_note.format
             ));
         }
+
+        let f = &self.formatter;
+        one_of(
+            "formatter.misc.hr_style",
+            &f.misc.hr_style,
+            &["---", "***", "___"],
+        )?;
+        one_of(
+            "formatter.misc.code_fence_style",
+            &f.misc.code_fence_style,
+            &["```", "~~~"],
+        )?;
+        one_of(
+            "formatter.emphasis.italic_marker",
+            &f.emphasis.italic_marker,
+            &["*", "_"],
+        )?;
+        one_of(
+            "formatter.emphasis.bold_marker",
+            &f.emphasis.bold_marker,
+            &["**", "__"],
+        )?;
+        one_of("formatter.lists.marker", &f.lists.marker, &["-", "*", "+"])?;
+        one_of(
+            "formatter.wrap.link_width_mode",
+            &f.wrap.link_width_mode,
+            &["raw", "display"],
+        )?;
         Ok(())
     }
 
@@ -361,6 +394,19 @@ impl VaultConfig {
         };
         Self::from_toml(&content).map_err(|e| anyhow::anyhow!("invalid {}: {}", path.display(), e))
     }
+}
+
+/// A string setting whose value must be one of a fixed set. (The formatter would otherwise
+/// silently fall back to its default for a typo, so the user never learns the setting was ignored.)
+fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    let choices: Vec<String> = allowed.iter().map(|a| format!("{a:?}")).collect();
+    Err(format!(
+        "invalid {key} {value:?}: expected one of {}",
+        choices.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -780,5 +826,69 @@ link_width_mode = "display"
         )
         .unwrap();
         assert_eq!(VaultConfig::load(&v.0).unwrap(), VaultConfig::default());
+    }
+
+    // ---- string-valued formatter settings must be one of the values the formatter knows ----
+
+    /// The error `from_toml` gives for `[section]\nkey = value`, or `None` if it is accepted.
+    fn rejection(section: &str, key: &str, value: &str) -> Option<String> {
+        let toml = format!("[{section}]\n{key} = \"{value}\"\n");
+        VaultConfig::from_toml(&toml).err().map(|e| e.to_string())
+    }
+
+    #[test]
+    fn every_known_value_of_a_string_setting_is_accepted() {
+        for (section, key, values) in [
+            ("formatter.misc", "hr_style", &["---", "***", "___"][..]),
+            ("formatter.misc", "code_fence_style", &["```", "~~~"][..]),
+            ("formatter.emphasis", "italic_marker", &["*", "_"][..]),
+            ("formatter.emphasis", "bold_marker", &["**", "__"][..]),
+            ("formatter.lists", "marker", &["-", "*", "+"][..]),
+            ("formatter.wrap", "link_width_mode", &["raw", "display"][..]),
+        ] {
+            for value in values {
+                assert_eq!(
+                    rejection(section, key, value),
+                    None,
+                    "{section}.{key} = {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_value_is_an_error_naming_the_key_the_value_and_the_choices() {
+        for (section, key, bad, a_choice) in [
+            ("formatter.misc", "hr_style", "====", "\"---\""),
+            ("formatter.misc", "hr_style", "* * *", "\"***\""),
+            ("formatter.misc", "code_fence_style", "```` ", "\"~~~\""),
+            ("formatter.emphasis", "italic_marker", "**", "\"_\""),
+            ("formatter.emphasis", "bold_marker", "*", "\"__\""),
+            ("formatter.lists", "marker", "=", "\"+\""),
+            ("formatter.wrap", "link_width_mode", "RAW", "\"display\""),
+            ("formatter.wrap", "link_width_mode", "", "\"raw\""),
+        ] {
+            let message = rejection(section, key, bad)
+                .unwrap_or_else(|| panic!("{section}.{key} = {bad:?} should be rejected"));
+            let short_key = key;
+            assert!(message.contains(short_key), "{message}");
+            assert!(message.contains(&format!("{bad:?}")), "{message}");
+            assert!(message.contains(a_choice), "{message}");
+            assert!(message.contains("expected one of"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_bad_value_is_reported_by_load_with_the_file_name() {
+        let v = TempVault::new("bad-value");
+        v.write(b"[formatter.misc]\nhr_style = \"====\"\n");
+        let error = VaultConfig::load(&v.0).unwrap_err().to_string();
+        assert!(error.contains(".satz.toml"), "{error}");
+        assert!(error.contains("hr_style"), "{error}");
+    }
+
+    #[test]
+    fn defaults_and_the_documented_example_still_validate() {
+        assert!(VaultConfig::default().validate().is_ok());
     }
 }

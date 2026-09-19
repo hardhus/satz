@@ -8,6 +8,8 @@ satz reads an optional `.satz.toml` file from the **vault root** (the directory 
 
 All keys are optional. Unknown keys are rejected (TOML parsing is strict — there's no passthrough "extra" bucket at the config level, unlike frontmatter), so a typo such as `[formatter.wrap] enabled = true` (the key is `enable`) is reported instead of silently ignored.
 
+String-valued formatter settings are checked too: `misc.hr_style`, `misc.code_fence_style`, `emphasis.italic_marker`, `emphasis.bold_marker`, `lists.marker` and `wrap.link_width_mode` must be one of the values listed in their tables, otherwise the file is invalid (`invalid formatter.misc.hr_style "====": expected one of "---", "***", "___"`) instead of the setting being silently ignored.
+
 ### When the file is invalid
 
 A file that exists but can't be used — broken TOML, an unknown key, a value of the wrong type or out of range, an invalid `daily_note.format`, or a file that can't be read — is always reported, with the file name and (for TOML errors) the line and column. It never silently falls back to the defaults:

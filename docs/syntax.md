@@ -104,12 +104,14 @@ Recognized via `pulldown-cmark`'s GFM extensions, primarily for the **formatter*
 
 Given a raw target string (from a wikilink, markdown link, or `satz resolve`), `Index::resolve_link` tries, in order:
 
+0. The target is **trimmed** and `` is read as `/`.
 1. **Exact vault-relative path** match (e.g. `books/tractatus.md`).
 2. The same path with **`.md` appended** (e.g. `books/tractatus` → `books/tractatus.md`).
-3. **Filename stem** match, case/Unicode-fold-insensitive (e.g. `tractatus`).
-4. **Title or alias** match, case/Unicode-fold-insensitive, against the document's frontmatter `title`/`aliases` (or its resolved title if no frontmatter title is set).
+3. The path **ignoring letter case** (`Books/Tractatus` finds `books/tractatus.md`).
+4. **Filename stem** match of the last path component, case/Unicode-fold-insensitive (e.g. `tractatus`).
+5. **Title or alias** match, case/Unicode-fold-insensitive, against the document's frontmatter `title`/`aliases` (or its resolved title if no frontmatter title is set).
 
-If the target contains no `/`, `\`, or `.`, steps 3 and 4 are tried before falling back to a literal path lookup — this is what makes bare targets like `[[TLP]]` or `[[my note]]` resolve straight to an alias or title without needing the full path.
+Every target follows this same order, whether or not it looks like a path — so a file at the vault root wins `[[x]]` over a same-named file in a folder, and bare targets like `[[TLP]]` or `[[my note]]` still reach an alias or title when no path or file name matches.
 
 ## Heading slugs & matching
 

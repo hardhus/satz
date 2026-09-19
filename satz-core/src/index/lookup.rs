@@ -23,6 +23,8 @@ pub enum LinkResolution<'a> {
 pub struct Index {
     pub(crate) docs: HashMap<DocId, Document>,
     pub(crate) by_path: HashMap<PathBuf, DocId>,
+    /// Case-folded, `.md`-less path -> document; the first document (by `DocId`) wins a clash.
+    pub(crate) by_path_folded: HashMap<String, DocId>,
     pub(crate) by_stem: HashMap<String, DocId>,
     pub(crate) by_title_alias: HashMap<String, DocId>,
     pub(crate) backlinks: HashMap<DocId, HashSet<DocId>>,
@@ -58,11 +60,15 @@ impl Index {
 
     /// Resolves a raw link target (e.g. `"file"`, `"folder/file"`, or alias/title) to a `DocId`.
     ///
-    /// Priority:
-    /// 1. Exact path match (`by_path`)
-    /// 2. Path with `.md` extension appended (`by_path`)
-    /// 3. Stem match (`by_stem`)
-    /// 4. Lowercase title or alias match (`by_title_alias`)
+    /// The target is trimmed and `\` is read as `/`. Priority:
+    /// 1. Exact path (`by_path`)
+    /// 2. Path with `.md` appended (`by_path`)
+    /// 3. Path ignoring case and a `.md` suffix (`by_path_folded`)
+    /// 4. File name (last path component) as a stem (`by_stem`)
+    /// 5. Title or alias, case- and Unicode-folded (`by_title_alias`)
+    ///
+    /// Every target follows this one order, so a file at the vault root beats a same-named file in
+    /// a folder for `[[x]]` as it does for `[[x.md]]`.
     pub fn resolve_link(&self, raw_target: &str) -> Option<&DocId> {
         let result = self.resolve_link_impl(raw_target);
         if result.is_none() {
@@ -74,48 +80,34 @@ impl Index {
     }
 
     fn resolve_link_impl(&self, raw_target: &str) -> Option<&DocId> {
-        // Fast path: if target has no path separators or extension, check stem & title/alias directly
-        if !raw_target.contains('/') && !raw_target.contains('\\') && !raw_target.contains('.') {
-            let folded = fold_key(raw_target);
-            if let Some(id) = self.by_stem.get(&folded) {
-                return Some(id);
-            }
-            if let Some(id) = self.by_title_alias.get(&folded) {
-                return Some(id);
-            }
-            let as_path = Path::new(raw_target);
-            if let Some(id) = self.by_path.get(as_path) {
-                return Some(id);
-            }
-            return None;
-        }
+        // One order for every kind of target, so `[[x]]` and `[[sub/x]]` follow the same rules:
+        // exact path, path + `.md`, path ignoring case, file name, then title/alias.
+        let trimmed = raw_target.trim();
+        let normalized: std::borrow::Cow<str> = if trimmed.contains('\\') {
+            trimmed.replace('\\', "/").into()
+        } else {
+            trimmed.into()
+        };
 
-        let normalized = raw_target.replace('\\', "/");
-        let as_path = PathBuf::from(&normalized);
-        if let Some(id) = self.by_path.get(&as_path) {
+        if let Some(id) = self.by_path.get(Path::new(&*normalized)) {
+            return Some(id);
+        }
+        if let Some(id) = self.by_path.get(Path::new(&format!("{}.md", normalized))) {
+            return Some(id);
+        }
+        if let Some(id) = self.by_path_folded.get(&fold_path_key(&normalized)) {
             return Some(id);
         }
 
-        let with_ext = PathBuf::from(format!("{}.md", normalized));
-        if let Some(id) = self.by_path.get(&with_ext) {
+        // The last path component, untouched: `.file_stem()` would treat the last `.` of a
+        // dotted-decimal name like "2.0121" as an extension and chop it to "2", silently matching
+        // an unrelated document. Only a real, explicit ".md" suffix is stripped.
+        let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+        if let Some(id) = self.by_stem.get(&fold_key(strip_md_extension(file_name))) {
             return Some(id);
         }
 
-        // `.file_stem()` treats the LAST `.` as an extension separator, which is wrong here:
-        // a dotted-decimal target like "2.0121" has no real extension, but `file_stem()` would
-        // still chop it at the last dot and return "2" — silently matching an unrelated existing
-        // document (e.g. "tlp/2.md") whenever the actual target file doesn't exist yet. Use
-        // `.file_name()` (the whole last path component, untouched) instead, only stripping a
-        // real, explicit ".md" suffix if the link happened to include one.
-        if let Some(file_name) = as_path.file_name().and_then(|s| s.to_str()) {
-            let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
-            let stem_lower = fold_key(stem);
-            if let Some(id) = self.by_stem.get(&stem_lower) {
-                return Some(id);
-            }
-        }
-
-        self.by_title_alias.get(&fold_key(raw_target))
+        self.by_title_alias.get(&fold_key(trimmed))
     }
 
     /// Resolves relative daily note aliases like `[[bugün]]`, `[[dün]]`, `[[yarın]]`
@@ -265,9 +257,17 @@ impl Index {
             .and_then(|id| self.docs.get(id))
     }
 
-    /// Returns an iterator over all document IDs that link to the given `id`.
+    /// Returns an iterator over all document IDs that link to the given `id` -- INCLUDING `id`
+    /// itself when it links to itself. See `incoming_from_others` for the count users see.
     pub fn backlinks_of(&self, id: &DocId) -> impl Iterator<Item = &DocId> {
         self.backlinks.get(id).into_iter().flat_map(|s| s.iter())
+    }
+
+    /// The documents that link to `id`, not counting `id` itself (a note linking to itself is
+    /// not "referenced" by anyone else; this is the rule orphan detection and the backlink count
+    /// shown to users follow).
+    pub fn incoming_from_others<'a>(&'a self, id: &'a DocId) -> impl Iterator<Item = &'a DocId> {
+        self.backlinks_of(id).filter(move |other| *other != id)
     }
 
     /// Returns an iterator over documents with no incoming backlinks (orphan notes).
@@ -433,6 +433,7 @@ impl Index {
     /// a stem; the last one wins a title/alias.
     pub(crate) fn rebuild_derived(&mut self, log_conflicts: bool) {
         self.by_path.clear();
+        self.by_path_folded.clear();
         self.by_stem.clear();
         self.by_title_alias.clear();
         self.backlinks.clear();
@@ -446,6 +447,9 @@ impl Index {
         for id in &ids {
             let doc = &self.docs[id];
             let normalized_path = PathBuf::from(doc.path.to_string_lossy().replace('\\', "/"));
+            self.by_path_folded
+                .entry(fold_path_key(&normalized_path.to_string_lossy()))
+                .or_insert_with(|| id.clone());
             self.by_path.insert(normalized_path, id.clone());
 
             let stem_key = doc
@@ -573,6 +577,21 @@ pub struct IndexStats {
     pub total_words: usize,
 }
 
+/// `name.md` -> `name`, whatever the case of the extension; anything else is returned as is.
+fn strip_md_extension(name: &str) -> &str {
+    match name.len().checked_sub(3) {
+        Some(cut) if name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(".md") => {
+            &name[..cut]
+        }
+        _ => name,
+    }
+}
+
+/// The key of `by_path_folded`: `/`-separated, without `.md`, case- and Unicode-folded.
+pub(crate) fn fold_path_key(path: &str) -> String {
+    fold_key(strip_md_extension(&path.replace('\\', "/")))
+}
+
 #[cfg(test)]
 impl Index {
     /// Deterministic dump of every derived map, so incremental updates can be compared against
@@ -589,6 +608,9 @@ impl Index {
         }
         for (k, v) in &self.by_path {
             lines.push(format!("path {:?} -> {}", k, v.as_str()));
+        }
+        for (k, v) in &self.by_path_folded {
+            lines.push(format!("path_folded {:?} -> {}", k, v.as_str()));
         }
         for (k, v) in &self.by_stem {
             lines.push(format!("stem {:?} -> {}", k, v.as_str()));

@@ -15,7 +15,7 @@ pub fn code_lens(params: CodeLensParams, state: &SatzState) -> Option<Vec<CodeLe
     let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
     let doc_id = satz_core::DocId::new(&rel_path_str);
 
-    let count = state.index.backlinks_of(&doc_id).count();
+    let count = state.index.incoming_from_others(&doc_id).count();
     let title = match count {
         0 => "0 backlinks".to_string(),
         1 => "1 backlink".to_string(),
@@ -97,5 +97,56 @@ mod tests {
         assert_eq!(lens.range.start.line, 0);
         let cmd = lens.command.as_ref().unwrap();
         assert_eq!(cmd.title, "2 backlinks");
+    }
+
+    fn lens_title_for_a(files: &[(&str, &str)]) -> String {
+        let mut config = VaultConfig::default();
+        config.lsp.codelens.enable = true;
+        let uri_str = "file:///doc-a.md";
+        let rel_a = Path::new("doc-a.md");
+        let text_a = files
+            .iter()
+            .find(|(p, _)| *p == "doc-a.md")
+            .map(|(_, t)| *t)
+            .unwrap();
+        let mut state = SatzState {
+            index: Index::build(
+                files
+                    .iter()
+                    .map(|(p, t)| parse_document(t, Path::new(p)))
+                    .collect(),
+            ),
+            vault_root: Some(Path::new("").to_path_buf()),
+            config,
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            uri_str.to_string(),
+            crate::state::OpenDocument::new(uri_str, rel_a.to_path_buf(), text_a, 1),
+        );
+        let params = CodeLensParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri_str.parse().unwrap(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let result = code_lens(params, &state).expect("CodeLens expected");
+        result[0].command.as_ref().unwrap().title.clone()
+    }
+
+    #[test]
+    fn a_self_link_does_not_count_as_a_backlink() {
+        assert_eq!(
+            lens_title_for_a(&[("doc-a.md", "# A\n\n[[doc-a]] and [[#A]]\n")]),
+            "0 backlinks"
+        );
+        assert_eq!(
+            lens_title_for_a(&[
+                ("doc-a.md", "# A\n\n[[doc-a]]\n"),
+                ("doc-b.md", "[[doc-a]]\n"),
+            ]),
+            "1 backlink"
+        );
     }
 }

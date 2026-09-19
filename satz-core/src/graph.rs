@@ -64,7 +64,11 @@ impl VaultGraph {
             };
 
             for link in &doc.links {
-                if crate::model::link::is_external_target(&link.target_doc) {
+                // A footnote reference points inside the document (its `target_doc` is empty), it
+                // is not a link between notes.
+                if link.kind == LinkKind::Footnote
+                    || crate::model::link::is_external_target(&link.target_doc)
+                {
                     continue;
                 }
 
