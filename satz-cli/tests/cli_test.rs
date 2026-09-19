@@ -263,3 +263,550 @@ fn test_satz_fmt_write_skips_io_for_already_clean_file() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Config errors, path validation and write failures (`fmt` / `daily`).
+//
+// These run the real binary and compare file CONTENTS byte for byte: a command that fails must
+// not have changed anything, and a command that succeeds must have really applied the config.
+// ---------------------------------------------------------------------------------------------
+
+mod support {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Output;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A unique temp directory that is removed (read-only files included) when dropped.
+    pub struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub fn new(tag: &str) -> Self {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "satz_cli_{tag}_{}_{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+        pub fn str(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+        pub fn write(&self, rel: &str, content: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+            p
+        }
+        pub fn read(&self, rel: &str) -> Vec<u8> {
+            std::fs::read(self.0.join(rel)).unwrap()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            fn unlock(dir: &Path) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        unlock(&p);
+                    } else if let Ok(meta) = std::fs::metadata(&p) {
+                        let mut perms = meta.permissions();
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        perms.set_readonly(false);
+                        let _ = std::fs::set_permissions(&p, perms);
+                    }
+                }
+            }
+            unlock(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every file (relative path -> bytes) and directory (relative path + "/" -> empty) below
+    /// `dir`, so "nothing was created or changed" can be asserted with one comparison.
+    pub fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if p.is_dir() {
+                    out.insert(format!("{rel}/"), Vec::new());
+                    walk(root, &p, out);
+                } else {
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    pub fn satz(args: &[&str]) -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
+            .args(args)
+            .output()
+            .expect("satz binary should execute")
+    }
+
+    pub fn out(o: &Output) -> String {
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    }
+
+    pub fn err(o: &Output) -> String {
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    }
+
+    pub const DIRTY: &str =
+        "# Title\n\nContent with   trailing spaces   \nand _underscore italic_.\n";
+    pub const DIRTY_FORMATTED: &str =
+        "# Title\n\nContent with   trailing spaces\nand *underscore italic*.\n";
+}
+
+use support::{DIRTY, DIRTY_FORMATTED, TempDir, err, out, satz, snapshot};
+
+fn today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+// ---- fmt: configuration errors must be loud and must not touch any file ----
+
+#[test]
+fn fmt_invalid_toml_fails_and_leaves_files_untouched() {
+    let v = TempDir::new("fmt_badtoml");
+    v.write(".satz.toml", "[formatter\nline_width = 1\n");
+    v.write("note.md", DIRTY);
+    let before = snapshot(v.path());
+
+    let o = satz(&["fmt", v.str()]);
+
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", err(&o));
+    let e = err(&o);
+    assert!(e.contains(".satz.toml"), "should name the config file: {e}");
+    assert!(e.contains("line 1"), "should say where the error is: {e}");
+    assert_eq!(snapshot(v.path()), before, "no file may change");
+}
+
+#[test]
+fn fmt_unknown_config_key_fails_and_leaves_files_untouched() {
+    let v = TempDir::new("fmt_unknownkey");
+    // A typo (`enabled` instead of `enable`) used to be silently ignored.
+    v.write(".satz.toml", "[formatter.wrap]\nenabled = true\n");
+    v.write("note.md", DIRTY);
+    let before = snapshot(v.path());
+
+    let o = satz(&["fmt", v.str()]);
+
+    assert_eq!(o.status.code(), Some(1));
+    let e = err(&o);
+    assert!(e.contains("enabled"), "should name the unknown key: {e}");
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn fmt_wrong_value_type_fails_and_leaves_files_untouched() {
+    let v = TempDir::new("fmt_wrongtype");
+    v.write(".satz.toml", "[formatter]\nline_width = \"wide\"\n");
+    v.write("note.md", DIRTY);
+    let before = snapshot(v.path());
+
+    let o = satz(&["fmt", v.str()]);
+
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn fmt_check_with_invalid_config_never_claims_everything_is_formatted() {
+    let v = TempDir::new("fmt_check_bad");
+    v.write(".satz.toml", "not = [valid\n");
+    v.write("note.md", DIRTY_FORMATTED); // already clean under the default config
+    let before = snapshot(v.path());
+
+    let o = satz(&["fmt", v.str(), "--check"]);
+
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains(".satz.toml"));
+    assert!(
+        !out(&o).contains("already formatted"),
+        "a broken config must not be reported as a clean check: {}",
+        out(&o)
+    );
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn fmt_applies_a_valid_config() {
+    let with_cfg = TempDir::new("fmt_cfg");
+    with_cfg.write(".satz.toml", "[formatter.lists]\nmarker = \"*\"\n");
+    with_cfg.write("note.md", "# T\n\n- a\n- b\n");
+    let without_cfg = TempDir::new("fmt_nocfg");
+    without_cfg.write("note.md", "# T\n\n- a\n- b\n");
+
+    assert!(satz(&["fmt", with_cfg.str()]).status.success());
+    assert!(satz(&["fmt", without_cfg.str()]).status.success());
+
+    // The config really changed the result (a config that is read but ignored would leave "-").
+    assert_eq!(with_cfg.read("note.md"), b"# T\n\n* a\n* b\n");
+    assert_eq!(without_cfg.read("note.md"), b"# T\n\n- a\n- b\n");
+}
+
+#[test]
+fn fmt_ignores_config_files_in_subfolders() {
+    let v = TempDir::new("fmt_subcfg");
+    v.write("sub/.satz.toml", "[formatter.lists]\nmarker = \"*\"\n");
+    v.write("note.md", "# T\n\n- a\n- b\n");
+
+    assert!(satz(&["fmt", v.str()]).status.success());
+
+    assert_eq!(v.read("note.md"), b"# T\n\n- a\n- b\n");
+}
+
+#[test]
+fn fmt_disabled_config_is_a_successful_noop() {
+    let v = TempDir::new("fmt_disabled");
+    v.write(".satz.toml", "[formatter]\nenabled = false\n");
+    v.write("note.md", DIRTY);
+    let before = snapshot(v.path());
+
+    let o = satz(&["fmt", v.str()]);
+
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("disabled"));
+    assert_eq!(snapshot(v.path()), before);
+}
+
+// ---- fmt / daily: the path must be an existing directory ----
+
+#[test]
+fn fmt_path_that_is_a_file_errors_and_leaves_it_untouched() {
+    let v = TempDir::new("fmt_isfile");
+    // A config next to the file must NOT be used to format the file behind the user's back.
+    v.write(".satz.toml", "[formatter.lists]\nmarker = \"*\"\n");
+    let file = v.write("note.md", "# T\n\n- a\n");
+    let before = snapshot(v.path());
+
+    let o = satz(&["fmt", file.to_str().unwrap()]);
+
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("directory"), "{}", err(&o));
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn fmt_missing_path_errors_and_creates_nothing() {
+    let v = TempDir::new("fmt_missing");
+    let missing = v.path().join("does-not-exist");
+
+    let o = satz(&["fmt", missing.to_str().unwrap()]);
+
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("does not exist"), "{}", err(&o));
+    assert!(!missing.exists(), "the command must not create the path");
+}
+
+// ---- fmt: exit codes and write failures ----
+
+#[test]
+fn fmt_check_exit_codes_and_no_writes() {
+    let clean = TempDir::new("fmt_check_clean");
+    clean.write("a.md", DIRTY_FORMATTED);
+    let o = satz(&["fmt", clean.str(), "--check"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(out(&o).contains("already formatted"));
+
+    let dirty = TempDir::new("fmt_check_dirty");
+    dirty.write("a.md", DIRTY);
+    dirty.write("sub/b.md", DIRTY_FORMATTED);
+    let before = snapshot(dirty.path());
+    let o = satz(&["fmt", dirty.str(), "--check"]);
+    assert_eq!(o.status.code(), Some(1));
+    let stdout = out(&o);
+    assert!(
+        stdout.contains("a.md"),
+        "dirty file should be listed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("b.md"),
+        "clean file must not be listed: {stdout}"
+    );
+    assert_eq!(snapshot(dirty.path()), before, "--check must never write");
+}
+
+#[test]
+fn fmt_write_failure_exits_nonzero_reports_the_path_and_keeps_going() {
+    let v = TempDir::new("fmt_readonly");
+    v.write("a.md", DIRTY);
+    let locked = v.write("b.md", DIRTY);
+    let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&locked, perms).unwrap();
+
+    let o = satz(&["fmt", v.str()]);
+
+    assert_eq!(o.status.code(), Some(1), "stdout: {}", out(&o));
+    let e = err(&o);
+    assert!(e.contains("b.md"), "should name the file that failed: {e}");
+    assert!(e.contains("1 file(s) could not be written"), "{e}");
+    // The count only includes files that were really written.
+    assert!(out(&o).contains("1 file(s) formatted"), "{}", out(&o));
+    // The writable file was still formatted; the locked one is byte-for-byte unchanged.
+    assert_eq!(v.read("a.md"), DIRTY_FORMATTED.as_bytes());
+    assert_eq!(v.read("b.md"), DIRTY.as_bytes());
+}
+
+// ---- daily ----
+
+#[test]
+fn daily_creates_todays_note_by_default_and_with_explicit_true() {
+    for extra in [&[][..], &["--create", "true"][..], &["-c", "true"][..]] {
+        let v = TempDir::new("daily_create");
+        let mut args = vec!["daily", v.str()];
+        args.extend_from_slice(extra);
+
+        let o = satz(&args);
+
+        assert!(o.status.success(), "{extra:?}: {}", err(&o));
+        let note = v.path().join("daily").join(format!("{}.md", today()));
+        assert!(
+            note.exists(),
+            "{extra:?}: note should be created at {note:?}"
+        );
+        assert!(out(&o).trim().ends_with(&format!("{}.md", today())));
+    }
+}
+
+#[test]
+fn daily_create_false_prints_the_path_and_creates_nothing() {
+    for flag in [&["--create", "false"][..], &["-c", "false"][..]] {
+        let v = TempDir::new("daily_nocreate");
+        let before = snapshot(v.path());
+        let mut args = vec!["daily", v.str()];
+        args.extend_from_slice(flag);
+
+        let o = satz(&args);
+
+        assert!(o.status.success(), "{flag:?}: {}", err(&o));
+        assert!(
+            out(&o).trim().ends_with(&format!("{}.md", today())),
+            "{flag:?}: {}",
+            out(&o)
+        );
+        assert_eq!(
+            snapshot(v.path()),
+            before,
+            "{flag:?}: nothing may be created"
+        );
+    }
+}
+
+#[test]
+fn daily_create_without_a_value_is_a_usage_error() {
+    let v = TempDir::new("daily_novalue");
+    let before = snapshot(v.path());
+
+    let o = satz(&["daily", v.str(), "--create"]);
+
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "clap usage errors exit 2: {}",
+        err(&o)
+    );
+    assert!(err(&o).contains("--create"));
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn daily_create_with_a_non_boolean_value_is_a_usage_error() {
+    let v = TempDir::new("daily_badvalue");
+    let before = snapshot(v.path());
+
+    let o = satz(&["daily", v.str(), "--create", "maybe"]);
+
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn daily_never_overwrites_an_existing_note() {
+    let v = TempDir::new("daily_existing");
+    let rel = format!("daily/{}.md", today());
+    v.write(&rel, "MY OWN CONTENT, keep it\n");
+
+    let o = satz(&["daily", v.str()]);
+
+    assert!(o.status.success());
+    assert_eq!(v.read(&rel), b"MY OWN CONTENT, keep it\n");
+}
+
+#[test]
+fn daily_invalid_config_errors_and_creates_nothing() {
+    let v = TempDir::new("daily_badcfg");
+    v.write(".satz.toml", "[daily_note]\nfolder = \n");
+    let before = snapshot(v.path());
+
+    let o = satz(&["daily", v.str()]);
+
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains(".satz.toml"), "{}", err(&o));
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn daily_unknown_config_key_errors_and_creates_nothing() {
+    let v = TempDir::new("daily_unknownkey");
+    v.write(".satz.toml", "[daily_note]\nfolders = \"journal\"\n");
+    let before = snapshot(v.path());
+
+    let o = satz(&["daily", v.str()]);
+
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("folders"), "{}", err(&o));
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn daily_invalid_date_format_is_an_error_not_a_panic() {
+    for bad in ["%Q", "%", "%Y%"] {
+        let v = TempDir::new("daily_badfmt");
+        v.write(".satz.toml", &format!("[daily_note]\nformat = \"{bad}\"\n"));
+        let before = snapshot(v.path());
+
+        let o = satz(&["daily", v.str()]);
+
+        // A panic would exit with 101; a reported error exits with 1.
+        assert_eq!(o.status.code(), Some(1), "{bad:?}: {}", err(&o));
+        assert!(!err(&o).contains("panicked"), "{bad:?}: {}", err(&o));
+        assert!(
+            err(&o).contains("daily_note.format"),
+            "{bad:?}: {}",
+            err(&o)
+        );
+        assert_eq!(snapshot(v.path()), before, "{bad:?}");
+    }
+}
+
+#[test]
+fn daily_custom_folder_and_format_are_applied() {
+    let v = TempDir::new("daily_custom");
+    v.write(
+        ".satz.toml",
+        "[daily_note]\nfolder = \"journal\"\nformat = \"%Y/%m/%d\"\n",
+    );
+
+    let o = satz(&["daily", v.str()]);
+
+    assert!(o.status.success(), "{}", err(&o));
+    let printed = std::path::PathBuf::from(out(&o).trim());
+    let parts: Vec<String> = printed
+        .components()
+        .rev()
+        .take(4)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    // .../journal/<yyyy>/<mm>/<dd>.md (components collected in reverse)
+    assert!(
+        parts[0].ends_with(".md") && parts[0].len() == 5,
+        "{parts:?}"
+    );
+    assert_eq!(parts[1].len(), 2, "{parts:?}");
+    assert_eq!(parts[2].len(), 4, "{parts:?}");
+    assert_eq!(parts[3], "journal", "{parts:?}");
+    assert!(printed.exists());
+}
+
+#[test]
+fn daily_path_that_is_a_file_or_missing_errors_and_creates_nothing() {
+    let v = TempDir::new("daily_badpath");
+    let file = v.write("note.md", "# T\n");
+    let missing = v.path().join("nope");
+    let before = snapshot(v.path());
+
+    let o = satz(&["daily", file.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("directory"), "{}", err(&o));
+
+    let o = satz(&["daily", missing.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("does not exist"), "{}", err(&o));
+
+    assert!(!missing.exists(), "must not create the missing vault");
+    assert_eq!(snapshot(v.path()), before);
+}
+
+#[test]
+fn daily_output_path_has_no_windows_verbatim_prefix() {
+    let v = TempDir::new("daily_prefix");
+
+    let o = satz(&["daily", v.str(), "--create", "false"]);
+
+    assert!(o.status.success());
+    let printed = out(&o);
+    assert!(
+        !printed.trim_start().starts_with(r"\\?\"),
+        "printed path should be usable as-is: {printed}"
+    );
+}
+
+#[test]
+fn daily_settings_cannot_escape_the_vault() {
+    for (setting, value) in [
+        ("folder", "../outside"),
+        ("folder", "a/../../outside"),
+        ("format", "../outside/%Y-%m-%d"),
+        // Backslash separators (written as a TOML `\\` escape).
+        ("format", "..\\\\outside\\\\%Y-%m-%d"),
+    ] {
+        let parent = TempDir::new("daily_escape");
+        let vault = parent.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(
+            vault.join(".satz.toml"),
+            format!("[daily_note]\n{setting} = \"{value}\"\n"),
+        )
+        .unwrap();
+        let before = snapshot(parent.path());
+
+        let o = satz(&["daily", vault.to_str().unwrap()]);
+
+        assert_eq!(o.status.code(), Some(1), "{setting}={value}: {}", err(&o));
+        assert!(
+            err(&o).contains("inside the vault"),
+            "{setting}={value}: {}",
+            err(&o)
+        );
+        // Nothing was written next to, above or inside the vault.
+        assert_eq!(snapshot(parent.path()), before, "{setting}={value}");
+        assert!(!parent.path().join("outside").exists());
+    }
+}
+
+#[test]
+fn daily_absolute_looking_folder_is_kept_inside_the_vault() {
+    let v = TempDir::new("daily_abs");
+    v.write(".satz.toml", "[daily_note]\nfolder = \"/journal\"\n");
+
+    let o = satz(&["daily", v.str()]);
+
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        v.path()
+            .join("journal")
+            .join(format!("{}.md", today()))
+            .exists()
+    );
+}

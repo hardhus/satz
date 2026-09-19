@@ -198,7 +198,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
 
     // Source action: some clients surface `workspace/executeCommand`s more discoverably through
     // the code action menu than through a dedicated command palette entry.
-    if state.config.formatter.enabled {
+    if state.formatting_allowed() {
         let action = CodeAction {
             title: "Format entire vault".to_string(),
             kind: Some(CodeActionKind::SOURCE),
@@ -448,6 +448,57 @@ mod tests {
             command.command,
             crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND
         );
+    }
+
+    #[test]
+    fn format_entire_vault_is_offered_only_while_the_config_is_valid() {
+        let rel_a = Path::new("doc-a.md");
+        let text = "---\ntitle: Doc A\n---\n\nPlain content, no links.";
+        let doc_a = parse_document(text, rel_a);
+        let uri_a_str = if cfg!(windows) {
+            "file:///C:/doc-a.md"
+        } else {
+            "file:///doc-a.md"
+        };
+        let abs_a = Path::new(if cfg!(windows) {
+            "C:\\doc-a.md"
+        } else {
+            "/doc-a.md"
+        });
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
+        } else {
+            Path::new("/").to_path_buf()
+        });
+        state.open_docs.insert(
+            uri_a_str.to_string(),
+            crate::state::OpenDocument::new(uri_a_str, abs_a.to_path_buf(), text, 1),
+        );
+        let params = || CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri_a_str.parse().unwrap(),
+            },
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            context: CodeActionContext::default(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        // Control: valid config -> the source action is offered.
+        let response = code_action(params(), &state).expect("source action expected");
+        assert_source_action_present(&response);
+
+        // Invalid config -> nothing is offered (no quickfix applies to this document either).
+        state.config_error = Some("invalid .satz.toml: line 1".to_string());
+        assert!(code_action(params(), &state).is_none());
+
+        // Fixed -> offered again.
+        state.config_error = None;
+        let response = code_action(params(), &state).expect("source action expected");
+        assert_source_action_present(&response);
     }
 
     #[test]

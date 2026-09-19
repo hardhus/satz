@@ -27,7 +27,7 @@ pub struct FormatWorkspaceResult {
 }
 
 /// Computes formatting changes for every indexed document whose formatted output differs from
-/// its current content. Returns everything empty (no-op) if `formatter.enabled` is false.
+/// its current content. Returns everything empty (no-op) if the formatter is disabled or `.satz.toml` is unusable.
 ///
 /// Consults `state.format_cache` first for each document's content hash — on a vault that's
 /// already fully formatted, a repeat call does zero `format_document` work at all, just cache
@@ -37,7 +37,7 @@ pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
         doc_count = state.index.doc_count(),
         "compute_format_changes: starting"
     );
-    if !state.config.formatter.enabled {
+    if !state.formatting_allowed() {
         return FormatWorkspaceResult {
             changes: Vec::new(),
             cache_updates: Vec::new(),
@@ -149,6 +149,26 @@ mod tests {
         let result = compute_format_changes(&state);
         assert!(result.changes.is_empty());
         assert_eq!(result.cache_updates.len(), 2);
+    }
+
+    #[test]
+    fn workspace_format_is_off_while_the_config_is_invalid_and_back_on_once_fixed() {
+        let dirty = parse_document("Line 1   \n\n\n\nLine 2   ", Path::new("dirty.md"));
+        let mut state = state_with(vec![dirty]);
+
+        // Control: with a valid config the dirty document produces a change.
+        assert_eq!(compute_format_changes(&state).changes.len(), 1);
+
+        state.config_error = Some("invalid .satz.toml: line 1".to_string());
+        let result = compute_format_changes(&state);
+        assert!(
+            result.changes.is_empty(),
+            "no edits with an unusable config"
+        );
+        assert!(result.cache_updates.is_empty(), "and nothing cached either");
+
+        state.config_error = None;
+        assert_eq!(compute_format_changes(&state).changes.len(), 1);
     }
 
     #[test]

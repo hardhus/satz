@@ -109,6 +109,11 @@ pub struct SatzState {
     /// Vault configuration (.satz.toml or default)
     pub config: VaultConfig,
 
+    /// Why `.satz.toml` could not be used, if it exists but is unreadable or invalid. While this
+    /// is `Some`, formatting is turned off (`formatting_allowed`): formatting with settings the
+    /// user did not choose would silently rewrite their notes.
+    pub config_error: Option<String>,
+
     /// Whether the client supports pull diagnostics
     pub client_supports_pull_diagnostics: bool,
 
@@ -131,16 +136,38 @@ pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<Strin
     d.identity_keys()
 }
 
+/// The text shown to the user (as a `window/showMessage` warning) when `.satz.toml` can't be
+/// used. `error` already names the file and, for TOML errors, the line and column; `fallback`
+/// says which settings are in effect meanwhile ("default" at startup, "the previous" on reload).
+pub fn config_error_message(error: &str, fallback: &str) -> String {
+    format!(
+        "satz: {error}\nUsing {fallback} settings. Formatting is turned off until .satz.toml is valid."
+    )
+}
+
 impl SatzState {
+    /// Whether formatting requests may be served: the formatter is enabled in the config AND the
+    /// config file is usable (see `config_error`).
+    pub fn formatting_allowed(&self) -> bool {
+        self.config.formatter.enabled && self.config_error.is_none()
+    }
+
     /// Discovers and indexes all `.md` files in the vault.
+    ///
+    /// An unusable `.satz.toml` does not stop indexing: the default configuration is used and
+    /// the reason is recorded in `config_error` for the caller to show to the user.
     pub fn initialize_index(vault_root: PathBuf) -> anyhow::Result<Self> {
-        let config_file = vault_root.join(".satz.toml");
-        let config_present = config_file.exists();
-        let config = std::fs::read_to_string(&config_file)
-            .ok()
-            .and_then(|s| VaultConfig::from_toml(&s).ok())
-            .unwrap_or_default();
-        tracing::debug!(config_present, "initialize_index: loaded .satz.toml (or default)");
+        let (config, config_error) = match VaultConfig::load(&vault_root) {
+            Ok(config) => (config, None),
+            Err(e) => {
+                tracing::warn!("initialize_index: {e}; using default settings");
+                (VaultConfig::default(), Some(e.to_string()))
+            }
+        };
+        tracing::debug!(
+            config_error = config_error.is_some(),
+            "initialize_index: loaded .satz.toml (or default)"
+        );
 
         let docs = walk_vault(&vault_root)?;
         tracing::debug!(doc_count = docs.len(), "initialize_index: walk_vault returned docs");
@@ -152,6 +179,7 @@ impl SatzState {
             index,
             open_docs: HashMap::new(),
             config,
+            config_error,
             client_supports_pull_diagnostics: false,
             peers_dirty: false,
             format_cache,
@@ -448,5 +476,130 @@ mod tests {
         let doc_id = satz_core::DocId::new("test.md");
         let parsed = s.index.get_doc(&doc_id).expect("Doc should exist in index");
         assert_eq!(parsed.title, "Version 4");
+    }
+
+    /// A unique, self-cleaning vault directory containing one note.
+    struct TempVault(PathBuf);
+    impl TempVault {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "satz_lsp_{tag}_{}_{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("a.md"), "# A\n\nText.\n").unwrap();
+            Self(dir)
+        }
+        fn config(&self, content: &str) {
+            std::fs::write(self.0.join(".satz.toml"), content).unwrap();
+        }
+    }
+    impl Drop for TempVault {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn initialize_index_reports_an_invalid_config_but_still_indexes() {
+        let v = TempVault::new("badcfg");
+        v.config("[formatter\nline_width = 1\n");
+
+        let state = SatzState::initialize_index(v.0.clone()).unwrap();
+
+        let error = state
+            .config_error
+            .as_deref()
+            .expect("error must be recorded");
+        assert!(error.contains(".satz.toml"), "{error}");
+        assert!(error.contains("line 1"), "{error}");
+        assert_eq!(state.config, VaultConfig::default());
+        assert_eq!(state.index.doc_count(), 1, "notes are still indexed");
+        assert!(!state.formatting_allowed());
+    }
+
+    #[test]
+    fn initialize_index_reports_unknown_keys_and_wrong_types() {
+        for (label, content, expect) in [
+            (
+                "unknown key",
+                "[formatter.wrap]\nenabled = true\n",
+                "enabled",
+            ),
+            (
+                "wrong type",
+                "[hover]\npreview_lines = \"many\"\n",
+                "preview_lines",
+            ),
+            (
+                "bad daily format",
+                "[daily_note]\nformat = \"%Q\"\n",
+                "daily_note.format",
+            ),
+        ] {
+            let v = TempVault::new("badkey");
+            v.config(content);
+            let state = SatzState::initialize_index(v.0.clone()).unwrap();
+            let error = state.config_error.as_deref().unwrap_or_else(|| {
+                panic!("{label}: config error must be recorded");
+            });
+            assert!(error.contains(expect), "{label}: {error}");
+            assert!(!state.formatting_allowed(), "{label}");
+        }
+    }
+
+    #[test]
+    fn initialize_index_applies_a_valid_config_without_error() {
+        let v = TempVault::new("okcfg");
+        v.config("[hover]\npreview_lines = 3\n");
+
+        let state = SatzState::initialize_index(v.0.clone()).unwrap();
+
+        assert_eq!(state.config_error, None);
+        assert_eq!(state.config.hover.preview_lines, 3);
+        assert!(state.formatting_allowed());
+    }
+
+    #[test]
+    fn initialize_index_without_a_config_file_uses_defaults_without_error() {
+        let v = TempVault::new("nocfg");
+
+        let state = SatzState::initialize_index(v.0.clone()).unwrap();
+
+        assert_eq!(state.config_error, None);
+        assert_eq!(state.config, VaultConfig::default());
+        assert!(state.formatting_allowed());
+    }
+
+    #[test]
+    fn formatting_allowed_truth_table() {
+        for (enabled, error, allowed) in [
+            (true, None, true),
+            (false, None, false),
+            (true, Some("broken"), false),
+            (false, Some("broken"), false),
+        ] {
+            let mut state = SatzState::default();
+            state.config.formatter.enabled = enabled;
+            state.config_error = error.map(str::to_string);
+            assert_eq!(
+                state.formatting_allowed(),
+                allowed,
+                "enabled={enabled} error={error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_error_message_names_the_problem_the_fallback_and_the_consequence() {
+        let msg = config_error_message("invalid /v/.satz.toml: line 3", "default");
+        assert!(msg.contains("invalid /v/.satz.toml: line 3"), "{msg}");
+        assert!(msg.contains("default settings"), "{msg}");
+        assert!(msg.to_lowercase().contains("formatting"), "{msg}");
+        let msg = config_error_message("x", "the previous");
+        assert!(msg.contains("the previous settings"), "{msg}");
     }
 }

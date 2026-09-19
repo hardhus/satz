@@ -84,7 +84,8 @@ The backlink-count CodeLens's command is `satz.showBacklinks`, which the server 
 A background file watcher (`notify`, polling every 500ms with a further 200ms debounce) keeps the in-memory index in sync without needing to restart the server:
 
 - Creating, modifying, or deleting a `.md` file outside the editor (e.g. `git checkout`, another tool writing to the vault) triggers a re-index of just that file — unless it's currently open in the client, in which case the editor's own buffer stays authoritative.
-- Editing and saving `.satz.toml` on disk reloads the whole configuration live; the client is notified to refresh diagnostics afterward.
+- Editing and saving the vault root's `.satz.toml` on disk reloads the whole configuration live; the client is notified to refresh diagnostics afterward. A `.satz.toml` in a subfolder, or a file named `satz.toml`, is ignored.
+- If `.satz.toml` is invalid (at startup or after an edit) the editor shows a warning with the file name and line, and formatting (format-on-save, *Format Document*, the *Format entire vault* action and `satz.formatWorkspace`) is turned off until the file is valid again; see [When the file is invalid](configuration.md#when-the-file-is-invalid).
 - Whether diagnostics are then pushed or the client is asked to re-pull depends on whether the client advertised diagnostic pull support during `initialize`.
 
 Two config fields control edit-triggered (as opposed to file-watcher-triggered) reparsing latency: `lsp.reparse_debounce_ms` and `lsp.reparse_max_wait_ms` — see [`docs/configuration.md`](configuration.md#lsp--server-wide-lsp-tuning).

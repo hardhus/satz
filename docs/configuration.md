@@ -2,10 +2,21 @@
 
 satz reads an optional `.satz.toml` file from the **vault root** (the directory you point the CLI or LSP at). If the file is missing, or a field is omitted, built-in defaults are used — you never need a config file to get started.
 
-- The CLI (`satz daily`) reads `.satz.toml` once, synchronously, before running.
-- The LSP server (`satz-lsp`) reads it once at startup and then **hot-reloads** it: editing and saving `.satz.toml` while the server is running re-parses it and applies the new values immediately, no restart needed.
+- The CLI (`satz fmt`, `satz daily`) reads `.satz.toml` once, synchronously, before running.
+- The LSP server (`satz-lsp`) reads it once at startup and then **hot-reloads** it: editing and saving `.satz.toml` while the server is running re-parses it and applies the new values immediately, no restart needed. Deleting the file returns to the defaults.
+- Only the `.satz.toml` in the **vault root** is read. A `.satz.toml` in a subfolder, or a file named `satz.toml`, is ignored.
 
-All keys are optional. Unknown keys are rejected (TOML parsing is strict — there's no passthrough "extra" bucket at the config level, unlike frontmatter).
+All keys are optional. Unknown keys are rejected (TOML parsing is strict — there's no passthrough "extra" bucket at the config level, unlike frontmatter), so a typo such as `[formatter.wrap] enabled = true` (the key is `enable`) is reported instead of silently ignored.
+
+### When the file is invalid
+
+A file that exists but can't be used — broken TOML, an unknown key, a value of the wrong type or out of range, an invalid `daily_note.format`, or a file that can't be read — is always reported, with the file name and (for TOML errors) the line and column. It never silently falls back to the defaults:
+
+| Where | What happens |
+|---|---|
+| `satz fmt`, `satz daily` | Error on stderr, exit status `1`, **no file is changed or created**. |
+| `satz-lsp` at startup | The vault is still indexed with the default settings, a warning message is shown in the editor, and **formatting is turned off** (format-on-save, *Format Document*, *Format entire vault*) until the file is valid. |
+| `satz-lsp` on hot-reload | The previous settings stay in effect, the same warning is shown, and formatting is turned off until the file is valid. Fixing and saving the file turns it back on automatically. |
 
 ## Full example
 
@@ -23,7 +34,7 @@ yesterday = ["dün", "dun", "yesterday"]
 tomorrow = ["yarın", "yarin", "tomorrow"]
 
 [frontmatter]
-required_fields = ["title", "date"]
+required_fields = []
 
 [lsp]
 reparse_debounce_ms = 200
@@ -35,6 +46,9 @@ enable = false
 
 [lsp.inlay_hints]
 enable = true
+
+[lsp.semantic_tokens]
+split_link_display = true
 
 [hover]
 preview_lines = 8
@@ -70,9 +84,13 @@ enable = true
 hr_style = "---"
 code_fence_style = "```"
 blockquote_single_space = true
+
+[formatter.wrap]
+enable = false
+link_width_mode = "raw"
 ```
 
-This is exactly the built-in default configuration, spelled out. You only need to include the keys you want to override.
+This is exactly the built-in default configuration, spelled out (a test keeps it in sync with the code). You only need to include the keys you want to override.
 
 ## Field reference
 

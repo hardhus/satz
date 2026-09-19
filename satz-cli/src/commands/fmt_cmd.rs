@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Result, bail};
 use clap::Args;
 use rayon::prelude::*;
 use satz_core::config::VaultConfig;
@@ -25,20 +25,18 @@ pub struct FmtArgs {
 
 struct FileResult {
     rel_path: PathBuf,
+    /// The formatted text differs from what is on disk.
     changed: bool,
+    /// Set when `changed` and the file could not be written back (`--write` only).
+    write_error: Option<String>,
 }
 
 pub fn run(args: FmtArgs) -> Result<()> {
-    let vault_root = fs::canonicalize(&args.path).unwrap_or_else(|_| args.path.clone());
+    let vault_root = super::vault_dir(&args.path)?;
 
-    let config_path = vault_root.join(".satz.toml");
-    let config = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config at {}", config_path.display()))?;
-        VaultConfig::from_toml(&content).unwrap_or_default()
-    } else {
-        VaultConfig::default()
-    };
+    // A config that exists but can't be used must stop the run: formatting with defaults would
+    // rewrite every file with settings the user didn't choose.
+    let config = VaultConfig::load(&vault_root)?;
 
     if !config.formatter.enabled {
         println!("Formatter is disabled (formatter.enabled = false in .satz.toml); nothing to do.");
@@ -58,24 +56,30 @@ pub fn run(args: FmtArgs) -> Result<()> {
 
             // Skip the write entirely when the file is already formatted — no unnecessary I/O,
             // no mtime churn.
+            let mut write_error = None;
             if changed && !check_only {
                 let abs_path = vault_root.join(&doc.path);
                 if let Err(e) = fs::write(&abs_path, &formatted) {
-                    tracing::warn!("failed to write {}: {}", abs_path.display(), e);
+                    write_error = Some(e.to_string());
                 }
             }
 
             FileResult {
                 rel_path: doc.path.clone(),
                 changed,
+                write_error,
             }
         })
         .collect();
 
     results.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
-    let changed_count = results.iter().filter(|r| r.changed).count();
-    let clean_count = results.len() - changed_count;
+    // Files that could not be written are neither "formatted" nor "clean".
+    let changed_count = results
+        .iter()
+        .filter(|r| r.changed && r.write_error.is_none())
+        .count();
+    let clean_count = results.iter().filter(|r| !r.changed).count();
     let elapsed = t0.elapsed();
 
     if check_only {
@@ -105,6 +109,18 @@ pub fn run(args: FmtArgs) -> Result<()> {
             clean_count,
             elapsed.as_millis()
         );
+    }
+
+    let failures: Vec<&FileResult> = results.iter().filter(|r| r.write_error.is_some()).collect();
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!(
+                "error: cannot write {}: {}",
+                vault_root.join(&f.rel_path).display(),
+                f.write_error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        bail!("{} file(s) could not be written", failures.len());
     }
 
     Ok(())

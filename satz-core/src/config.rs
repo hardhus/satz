@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VaultConfig {
     pub id_scheme: IdSchemeConfig,
     pub daily_note: DailyNoteConfig,
@@ -12,7 +12,7 @@ pub struct VaultConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     pub moc_tags: Vec<String>,
     pub workspace: bool,
@@ -28,7 +28,7 @@ impl Default for DiagnosticsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HoverConfig {
     pub preview_lines: usize,
 }
@@ -40,7 +40,7 @@ impl Default for HoverConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FormatterConfig {
     pub enabled: bool,
     pub line_width: usize,
@@ -72,7 +72,7 @@ impl Default for FormatterConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WrapConfig {
     /// Reflow top-level paragraphs to `line_width`. Default: false (opt-in — existing vaults
     /// are never silently rewrapped; add `[formatter.wrap] enable = true` to turn it on).
@@ -98,7 +98,7 @@ impl Default for WrapConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TablesConfig {
     /// Enable GFM pipe-table detection and column alignment. Default: true.
     pub enable: bool,
@@ -119,7 +119,7 @@ impl Default for TablesConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ListsConfig {
     /// Enable list marker and task-checkbox normalization. Default: true.
     pub enable: bool,
@@ -141,7 +141,7 @@ impl Default for ListsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EmphasisConfig {
     /// Enable emphasis/strong delimiter normalization. Default: true.
     pub enable: bool,
@@ -162,7 +162,7 @@ impl Default for EmphasisConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MiscConfig {
     /// Enable thematic-break and code-fence style normalization. Default: true.
     pub enable: bool,
@@ -187,7 +187,7 @@ impl Default for MiscConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LspConfig {
     pub codelens: CodelensConfig,
     pub inlay_hints: InlayHintConfig,
@@ -215,7 +215,7 @@ impl Default for LspConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SemanticTokensConfig {
     /// Splits a `[[target|display]]` / `![[target|display]]` link's semantic token in two at the
     /// `|`, so the displayed alias text can be themed differently from the target/heading part.
@@ -232,14 +232,14 @@ impl Default for SemanticTokensConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CodelensConfig {
     /// Enable CodeLens backlink count. Default: false (terminal-first).
     pub enable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct InlayHintConfig {
     /// Enable Inlay hints for links. Default: true.
     pub enable: bool,
@@ -260,7 +260,7 @@ pub enum IdSchemeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DailyNoteConfig {
     pub folder: String,
     pub format: String,
@@ -268,7 +268,7 @@ pub struct DailyNoteConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DailyAliasesConfig {
     pub today: Vec<String>,
     pub yesterday: Vec<String>,
@@ -308,14 +308,58 @@ impl Default for DailyNoteConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FrontmatterConfig {
     pub required_fields: Vec<String>,
 }
 
+/// The vault-root file holding a vault's configuration. Only this exact file in the vault ROOT is
+/// read; there is no other config file name and no per-folder config.
+pub const CONFIG_FILE_NAME: &str = ".satz.toml";
+
 impl VaultConfig {
+    /// Parses and validates a configuration. Unknown keys are errors (every config struct is
+    /// `deny_unknown_fields`), so a typo like `enabled` for `enable` is reported instead of
+    /// silently ignored.
     pub fn from_toml(toml_str: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(toml_str)
+        use serde::de::Error as _;
+        let config: Self = toml::from_str(toml_str)?;
+        config.validate().map_err(toml::de::Error::custom)?;
+        Ok(config)
+    }
+
+    /// Checks values serde alone can't: `daily_note.format` must be a valid `strftime` string,
+    /// because formatting a date with an invalid one panics (`satz daily`, and relative daily
+    /// links like `[[bugün]]` in the language server).
+    fn validate(&self) -> Result<(), String> {
+        use chrono::format::{Item, StrftimeItems};
+        if StrftimeItems::new(&self.daily_note.format).any(|item| matches!(item, Item::Error)) {
+            return Err(format!(
+                "invalid daily_note.format {:?}: not a valid strftime format string",
+                self.daily_note.format
+            ));
+        }
+        Ok(())
+    }
+
+    /// Loads `<vault_root>/.satz.toml`.
+    ///
+    /// - missing file -> the default configuration
+    /// - present but unreadable (a directory, permissions, not UTF-8) or invalid (bad TOML,
+    ///   unknown key, wrong type, invalid `daily_note.format`) -> an error naming the file and,
+    ///   for TOML errors, the line and column. It never silently falls back to defaults: callers
+    ///   decide how to surface the error, but they always get it.
+    ///
+    /// A leading UTF-8 byte-order mark (which Windows editors add) is accepted: the `toml` parser
+    /// skips it itself (covered by `load_accepts_a_utf8_bom`, which fails if that ever changes).
+    pub fn load(vault_root: &std::path::Path) -> anyhow::Result<Self> {
+        let path = vault_root.join(CONFIG_FILE_NAME);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => anyhow::bail!("failed to read {}: {}", path.display(), e),
+        };
+        Self::from_toml(&content).map_err(|e| anyhow::anyhow!("invalid {}: {}", path.display(), e))
     }
 }
 
@@ -451,5 +495,290 @@ link_width_mode = "display"
         assert!(!cfg.formatter.misc.blockquote_single_space);
         assert!(cfg.formatter.wrap.enable);
         assert_eq!(cfg.formatter.wrap.link_width_mode, "display");
+    }
+
+    // ---- strict parsing / loading -------------------------------------------------------
+
+    fn err_of(toml_str: &str) -> String {
+        match VaultConfig::from_toml(toml_str) {
+            Ok(_) => panic!("expected a config error for:\n{toml_str}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Every table a user can write in `.satz.toml` (`""` = the top level).
+    const ALL_SECTIONS: &[&str] = &[
+        "",
+        "formatter",
+        "formatter.tables",
+        "formatter.lists",
+        "formatter.emphasis",
+        "formatter.misc",
+        "formatter.wrap",
+        "lsp",
+        "lsp.codelens",
+        "lsp.inlay_hints",
+        "lsp.semantic_tokens",
+        "hover",
+        "diagnostics",
+        "daily_note",
+        "daily_note.aliases",
+        "frontmatter",
+    ];
+
+    #[test]
+    fn unknown_key_rejected_in_every_section() {
+        // One assertion per config struct: forgetting `deny_unknown_fields` on any of them
+        // would let a typo in that section pass silently.
+        for section in ALL_SECTIONS {
+            let toml_str = if section.is_empty() {
+                "bogus_key = 1\n".to_string()
+            } else {
+                format!("[{section}]\nbogus_key = 1\n")
+            };
+            let msg = err_of(&toml_str);
+            assert!(
+                msg.contains("bogus_key"),
+                "section {section:?}: error should name the unknown key, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_key_is_rejected_even_next_to_valid_ones() {
+        let msg = err_of("[formatter]\nline_width = 100\nlinewidth = 90\n");
+        assert!(msg.contains("linewidth"), "{msg}");
+    }
+
+    #[test]
+    fn typo_of_a_real_key_names_the_expected_keys() {
+        let msg = err_of("[formatter.wrap]\nenabled = true\n");
+        assert!(msg.contains("enabled"), "{msg}");
+        assert!(msg.contains("enable"), "should list the real key: {msg}");
+    }
+
+    #[test]
+    fn partial_and_empty_configs_still_load() {
+        assert_eq!(VaultConfig::from_toml("").unwrap(), VaultConfig::default());
+        assert_eq!(
+            VaultConfig::from_toml("# just a comment\n").unwrap(),
+            VaultConfig::default()
+        );
+
+        let cfg = VaultConfig::from_toml("[formatter]\nline_width = 100\n").unwrap();
+        assert_eq!(cfg.formatter.line_width, 100);
+        assert!(
+            cfg.formatter.enabled,
+            "untouched fields keep their defaults"
+        );
+        assert_eq!(cfg.daily_note, VaultConfig::default().daily_note);
+
+        let cfg = VaultConfig::from_toml("[daily_note]\nfolder = \"x\"\n").unwrap();
+        assert_eq!(cfg.daily_note.folder, "x");
+        assert_eq!(cfg.daily_note.format, "%Y-%m-%d");
+        assert_eq!(cfg.formatter, VaultConfig::default().formatter);
+    }
+
+    #[test]
+    fn wrong_types_and_ranges_are_rejected() {
+        for (label, toml_str) in [
+            ("string for integer", "[formatter]\nline_width = \"wide\"\n"),
+            (
+                "u8 overflow",
+                "[formatter]\nblank_lines_around_headings = 300\n",
+            ),
+            ("negative usize", "[formatter]\nline_width = -1\n"),
+            ("string for bool", "[formatter.wrap]\nenable = \"yes\"\n"),
+            ("float for integer", "[hover]\npreview_lines = 1.5\n"),
+            ("unknown enum value", "id_scheme = \"bogus\"\n"),
+            (
+                "string for list",
+                "[daily_note.aliases]\ntoday = \"bugun\"\n",
+            ),
+            ("table for scalar", "[formatter]\nline_width = { a = 1 }\n"),
+            ("broken toml", "[formatter\nline_width = 1\n"),
+        ] {
+            assert!(
+                VaultConfig::from_toml(toml_str).is_err(),
+                "{label}: should be rejected: {toml_str:?}"
+            );
+        }
+    }
+
+    /// The fenced ```toml block under `## Full example` in docs/configuration.md.
+    fn docs_full_example() -> &'static str {
+        const DOC: &str = include_str!("../../docs/configuration.md");
+        let start = DOC
+            .find("## Full example")
+            .expect("docs must have a Full example section");
+        let rest = &DOC[start..];
+        let fence = rest
+            .find("```toml")
+            .expect("docs example must be a toml block");
+        let body_start = fence + rest[fence..].find('\n').expect("fence line ends") + 1;
+        // The closing fence is a ``` at the start of a line; a mid-line "```" (as in
+        // `code_fence_style = "```"`) must not end the block.
+        let body = &rest[body_start..];
+        let end = body
+            .match_indices("\n```")
+            .map(|(i, _)| i)
+            .find(|&i| {
+                let after = &body[i + 4..];
+                after.is_empty() || after.starts_with('\n') || after.starts_with('\r')
+            })
+            .expect("docs example must be closed");
+        &body[..end + 1]
+    }
+
+    #[test]
+    fn docs_full_example_matches_defaults_exactly() {
+        // Comparing whole TOML trees (not just parsed structs) means the docs must list EVERY
+        // key, each with its actual default -- a key added to the code but not to the docs, or a
+        // default changed without updating the docs, fails here.
+        let documented: toml::Value = toml::from_str(docs_full_example()).unwrap();
+        let actual = toml::Value::try_from(VaultConfig::default()).unwrap();
+        assert_eq!(documented, actual);
+        assert_eq!(
+            VaultConfig::from_toml(docs_full_example()).unwrap(),
+            VaultConfig::default()
+        );
+    }
+
+    #[test]
+    fn daily_note_format_is_validated_without_panicking() {
+        for ok in [
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "daily-%d.%m",
+            "%B",
+            "100%%",
+            "plain",
+        ] {
+            let cfg = VaultConfig::from_toml(&format!("[daily_note]\nformat = \"{ok}\"\n"))
+                .unwrap_or_else(|e| panic!("{ok:?} should be valid: {e}"));
+            // Actually formatting with an accepted string must never panic.
+            let _ = chrono::NaiveDate::from_ymd_opt(2026, 9, 19)
+                .unwrap()
+                .format(&cfg.daily_note.format)
+                .to_string();
+        }
+        for bad in ["%Q", "%", "%Y%", "%-", "%!"] {
+            let msg = err_of(&format!("[daily_note]\nformat = \"{bad}\"\n"));
+            assert!(msg.contains("daily_note.format"), "{bad:?}: {msg}");
+        }
+    }
+
+    /// A unique, self-cleaning temp directory (no extra dev-dependency needed).
+    struct TempVault(std::path::PathBuf);
+    impl TempVault {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "satz_cfg_{tag}_{}_{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn write(&self, bytes: &[u8]) {
+            std::fs::write(self.0.join(CONFIG_FILE_NAME), bytes).unwrap();
+        }
+    }
+    impl Drop for TempVault {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_file_name_is_dot_satz_toml() {
+        assert_eq!(CONFIG_FILE_NAME, ".satz.toml");
+    }
+
+    #[test]
+    fn load_missing_and_empty_files_give_defaults() {
+        let v = TempVault::new("missing");
+        assert_eq!(VaultConfig::load(&v.0).unwrap(), VaultConfig::default());
+        v.write(b"");
+        assert_eq!(VaultConfig::load(&v.0).unwrap(), VaultConfig::default());
+        v.write(b"   \n\n# only comments\n");
+        assert_eq!(VaultConfig::load(&v.0).unwrap(), VaultConfig::default());
+    }
+
+    #[test]
+    fn load_applies_a_valid_file() {
+        let v = TempVault::new("valid");
+        v.write(b"[hover]\npreview_lines = 3\n[formatter.lists]\nmarker = \"*\"\n");
+        let cfg = VaultConfig::load(&v.0).unwrap();
+        assert_eq!(cfg.hover.preview_lines, 3);
+        assert_eq!(cfg.formatter.lists.marker, "*");
+        assert_eq!(
+            cfg.formatter.tables,
+            VaultConfig::default().formatter.tables
+        );
+    }
+
+    #[test]
+    fn load_reports_file_path_and_location_for_invalid_toml() {
+        let v = TempVault::new("badtoml");
+        v.write(b"[formatter]\nline_width = 100\nthis is not toml\n");
+        let msg = VaultConfig::load(&v.0).unwrap_err().to_string();
+        assert!(
+            msg.contains(CONFIG_FILE_NAME),
+            "should name the file: {msg}"
+        );
+        assert!(msg.contains("line 3"), "should give the line: {msg}");
+    }
+
+    #[test]
+    fn load_rejects_unknown_keys_and_names_them() {
+        let v = TempVault::new("unknown");
+        v.write(b"[formatter.wrap]\nenabled = true\n");
+        let msg = VaultConfig::load(&v.0).unwrap_err().to_string();
+        assert!(
+            msg.contains(CONFIG_FILE_NAME) && msg.contains("enabled"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_a_utf8_bom() {
+        // Windows editors such as Notepad prepend a BOM; the file is still a valid config.
+        let v = TempVault::new("bom");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"[hover]\npreview_lines = 5\n");
+        v.write(&bytes);
+        assert_eq!(VaultConfig::load(&v.0).unwrap().hover.preview_lines, 5);
+    }
+
+    #[test]
+    fn load_fails_when_config_path_is_a_directory() {
+        let v = TempVault::new("isdir");
+        std::fs::create_dir_all(v.0.join(CONFIG_FILE_NAME)).unwrap();
+        let msg = VaultConfig::load(&v.0).unwrap_err().to_string();
+        assert!(msg.contains(CONFIG_FILE_NAME), "{msg}");
+    }
+
+    #[test]
+    fn load_fails_on_non_utf8_bytes() {
+        let v = TempVault::new("nonutf8");
+        v.write(&[0xFF, 0xFE, 0x00, b'[', 0x80]);
+        let msg = VaultConfig::load(&v.0).unwrap_err().to_string();
+        assert!(msg.contains(CONFIG_FILE_NAME), "{msg}");
+    }
+
+    #[test]
+    fn load_does_not_read_config_files_from_subdirectories() {
+        // Only the vault root's `.satz.toml` counts; a stray one in a subfolder must not.
+        let v = TempVault::new("subdir");
+        std::fs::create_dir_all(v.0.join("sub")).unwrap();
+        std::fs::write(
+            v.0.join("sub").join(CONFIG_FILE_NAME),
+            "[hover]\npreview_lines = 1\n",
+        )
+        .unwrap();
+        assert_eq!(VaultConfig::load(&v.0).unwrap(), VaultConfig::default());
     }
 }

@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{DocumentFormattingParams, TextEdit};
 /// `TextEdit`s (via a line-based diff) rather than one edit replacing the whole document — this
 /// keeps the editor's undo history and the LSP payload proportional to what actually changed.
 pub fn formatting(params: DocumentFormattingParams, state: &SatzState) -> Option<Vec<TextEdit>> {
-    if !state.config.formatter.enabled {
+    if !state.formatting_allowed() {
         return Some(vec![]);
     }
 
@@ -122,6 +122,55 @@ mod tests {
 
         let edits = formatting(params, &state).expect("Edits expected");
         assert!(edits.is_empty());
+    }
+
+    fn dirty_state() -> (SatzState, DocumentFormattingParams) {
+        let text = "Line 1   \n\n\n\nLine 2   ";
+        let rel_path = Path::new("test.md");
+        let mut state = SatzState {
+            index: Index::build(vec![parse_document(text, rel_path)]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            "file:///test.md".to_string(),
+            crate::state::OpenDocument::new("file:///test.md", rel_path.to_path_buf(), text, 1),
+        );
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier {
+                uri: "file:///test.md".parse().unwrap(),
+            },
+            options: tower_lsp_server::ls_types::FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+        };
+        (state, params)
+    }
+
+    #[test]
+    fn formatting_is_off_while_the_config_is_invalid_and_back_on_once_fixed() {
+        let (mut state, params) = dirty_state();
+
+        // Control: a valid config formats the dirty document (so "no edits" below is meaningful).
+        let edits = formatting(params.clone(), &state).expect("Some");
+        assert!(
+            !edits.is_empty(),
+            "control: dirty text should produce edits"
+        );
+
+        state.config_error = Some("invalid .satz.toml: line 1".to_string());
+        let edits = formatting(params.clone(), &state).expect("Some");
+        assert!(
+            edits.is_empty(),
+            "an unusable config must not format with defaults: {edits:?}"
+        );
+
+        state.config_error = None;
+        let edits = formatting(params, &state).expect("Some");
+        assert!(!edits.is_empty(), "fixing the config re-enables formatting");
     }
 
     #[test]

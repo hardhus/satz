@@ -121,8 +121,10 @@ Behavior:
 
 | Flag/Arg | Default | Meaning |
 |---|---|---|
-| `path` (positional) | `.` | Vault root. |
-| `-c, --create <bool>` | `true` | Whether to create the file if missing, e.g. `satz daily . --create false` to only report the path without creating anything. |
+| `path` (positional) | `.` | Vault root directory. It must be an existing directory: a file or a missing path is an error, and nothing is created. |
+| `-c, --create <bool>` | `true` | Whether to create the file if missing, e.g. `satz daily . --create false` to only report the path without creating anything. The value (`true` or `false`) is required. |
+
+Errors (exit status `1`, nothing created): an invalid `.satz.toml` (see [When the file is invalid](configuration.md#when-the-file-is-invalid)), or a `daily_note.folder` / `daily_note.format` that would leave the vault (a `..` component, or a drive letter such as `C:`). `daily_note.format` may contain `/` to nest notes in subfolders (for example `%Y/%m/%d`); the note's folders are created as needed. The printed path never carries Windows' `\\?\` prefix.
 
 ## `satz fmt [path]`
 
@@ -140,11 +142,13 @@ notes/mixed-emphasis.md
 ✗ 2 file(s) need formatting, 41 file(s) already clean (18ms)
 ```
 
+If `.satz.toml` is invalid the command stops with an error (exit status `1`) and changes nothing — it never formats with settings you didn't choose. If a file can't be written (read-only, permissions), each failure is reported on stderr as `error: cannot write <path>: <reason>`, the other files are still formatted, the summary only counts files that were really written, and the exit status is non-zero.
+
 Runs in parallel (`rayon`) over every parsed document; a file whose formatted output is byte-identical to its current content is never written (no unnecessary I/O or mtime churn) in `--write` mode. If `formatter.enabled = false` in `.satz.toml`, the command prints a notice and exits successfully without touching anything.
 
 | Flag/Arg | Default | Meaning |
 |---|---|---|
-| `path` (positional) | `.` | Vault root. |
+| `path` (positional) | `.` | Vault root directory (an existing directory; a file or missing path is an error). |
 | `--check` | off | Report which files would change (one relative path per line, sorted) without writing anything. Exits with status `1` if any file would change — usable directly as a CI or pre-commit check. Mutually exclusive with `--write`. |
 | `--write` | on (default) | Format files in place. This is what happens when neither flag is passed; passing it explicitly is only for clarity in scripts. Mutually exclusive with `--check`. |
 

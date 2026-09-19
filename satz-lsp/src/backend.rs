@@ -145,6 +145,7 @@ impl LanguageServer for Backend {
                 match result {
                     Ok(Ok(mut new_state)) => {
                         let doc_count = new_state.index.doc_count();
+                        let startup_config_error = new_state.config_error.clone();
                         tracing::info!(doc_count, vault_root = ?new_state.vault_root, "walk_vault: succeeded");
 
                         {
@@ -177,6 +178,14 @@ impl LanguageServer for Backend {
                                 format!("satz: indexed {} documents", doc_count),
                             )
                             .await;
+
+                        // A `.satz.toml` that exists but can't be used must be visible: falling
+                        // back to defaults silently would look like the settings were ignored.
+                        if let Some(error) = startup_config_error {
+                            let message = crate::state::config_error_message(&error, "default");
+                            client.log_message(MessageType::WARNING, &message).await;
+                            client.show_message(MessageType::WARNING, message).await;
+                        }
 
                         let (supports_pull, uris) = {
                             let s = state_arc.read().await;

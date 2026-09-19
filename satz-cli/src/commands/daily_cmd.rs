@@ -3,32 +3,26 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::Local;
-use clap::Args;
+use clap::{ArgAction, Args};
 use satz_core::config::VaultConfig;
 
 #[derive(Args, Debug)]
 pub struct DailyArgs {
-    /// Path to the vault root (defaults to current directory)
+    /// Path to the vault root directory (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Create the daily note file if it doesn't already exist
-    #[arg(short, long, default_value_t = true)]
+    /// Whether to create the daily note file if it doesn't already exist (`--create false` only
+    /// prints the path)
+    #[arg(short, long, default_value_t = true, action = ArgAction::Set)]
     pub create: bool,
 }
 
 pub fn run(args: DailyArgs) -> Result<()> {
-    let vault_root = fs::canonicalize(&args.path).unwrap_or(args.path);
+    let vault_root = super::vault_dir(&args.path)?;
 
-    // Read config if present
-    let config_path = vault_root.join(".satz.toml");
-    let config = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config at {}", config_path.display()))?;
-        VaultConfig::from_toml(&content).unwrap_or_default()
-    } else {
-        VaultConfig::default()
-    };
+    // A config that exists but can't be used is an error, never a silent fallback to defaults.
+    let config = VaultConfig::load(&vault_root)?;
 
     let now = Local::now();
     let formatted_date = now.format(&config.daily_note.format).to_string();
@@ -39,15 +33,23 @@ pub fn run(args: DailyArgs) -> Result<()> {
         format!("{}.md", formatted_date)
     };
 
-    let target_dir = if config.daily_note.folder.is_empty() {
-        vault_root.clone()
-    } else {
-        vault_root.join(&config.daily_note.folder)
-    };
-
-    let target_file = target_dir.join(&filename);
+    // Both settings are joined onto the vault root, so neither may climb out of it: `..` would
+    // let a config in a cloned/untrusted vault make `satz daily` write anywhere on disk.
+    let mut target_file = vault_root.clone();
+    for part in relative_parts("daily_note.folder", &config.daily_note.folder)? {
+        target_file.push(part);
+    }
+    for part in relative_parts("daily_note.format", &filename)? {
+        target_file.push(part);
+    }
+    let target_dir = target_file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| vault_root.clone());
 
     if args.create && !target_file.exists() {
+        // `format` may contain `/` (e.g. `%Y/%m/%d`), so the note's own parent directory is
+        // created, not just the configured folder.
         fs::create_dir_all(&target_dir)
             .with_context(|| format!("Failed to create directory {}", target_dir.display()))?;
 
@@ -61,4 +63,70 @@ pub fn run(args: DailyArgs) -> Result<()> {
 
     println!("{}", target_file.display());
     Ok(())
+}
+
+/// Splits a configured path setting into components that are safe to join onto the vault root.
+///
+/// Empty components (leading, trailing or doubled separators) are dropped, so an "absolute-looking"
+/// value like `/journal` stays inside the vault as `journal`. `.` / `..` and components containing
+/// `:` (drive letters, NTFS alternate streams) or NUL are rejected.
+fn relative_parts(setting: &str, value: &str) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    for part in value.split(['/', '\\']).filter(|p| !p.is_empty()) {
+        if part == "." || part == ".." || part.contains(':') || part.contains('\0') {
+            anyhow::bail!("{setting} must stay inside the vault, but {value:?} contains {part:?}");
+        }
+        parts.push(part.to_string());
+    }
+    Ok(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_parts;
+
+    #[test]
+    fn relative_parts_splits_and_drops_empty_components() {
+        let p = |v: &str| relative_parts("s", v).unwrap();
+        assert_eq!(p(""), Vec::<String>::new());
+        assert_eq!(p("daily"), ["daily"]);
+        assert_eq!(p("2026/09/19.md"), ["2026", "09", "19.md"]);
+        assert_eq!(p("a\\b/c"), ["a", "b", "c"]);
+        // Absolute-looking values are made relative, never followed.
+        assert_eq!(p("/abs/path"), ["abs", "path"]);
+        assert_eq!(p("trailing/"), ["trailing"]);
+        assert_eq!(p("a//b"), ["a", "b"]);
+    }
+
+    #[test]
+    fn relative_parts_rejects_anything_that_could_leave_the_vault() {
+        for bad in [
+            "..",
+            "../x",
+            "a/../b",
+            "a/..",
+            "./x",
+            "..\\x",
+            "C:\\x",
+            "C:x",
+            "d:",
+            "x/y:stream",
+            "a\0b",
+        ] {
+            let err = relative_parts("daily_note.folder", bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("daily_note.folder"), "{bad:?}: {err}");
+            assert!(err.contains("inside the vault"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn relative_parts_accepts_dots_that_are_part_of_a_name() {
+        let p = |v: &str| relative_parts("s", v).unwrap();
+        assert_eq!(p("v1.2"), ["v1.2"]);
+        assert_eq!(p("...hidden"), ["...hidden"]);
+        assert_eq!(p("a..b/c"), ["a..b", "c"]);
+        assert_eq!(p(".md"), [".md"]);
+    }
 }
