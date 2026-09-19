@@ -102,16 +102,21 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
     links.extend(structure.footnote_refs);
     links.sort_by_key(|link| link.range.start);
 
+    let footnotes = FootnoteTable {
+        definitions: structure.footnote_defs,
+    };
+
     // A footnote candidate is "broken" iff its label has no matching definition -- this also
     // correctly excludes every already-resolved reference (already counted above via
     // `structure.footnote_refs`) and each definition's own `[^label]:` marker occurrence, since
-    // both trivially have a matching definition by construction.
+    // both trivially have a matching definition by construction. Labels match
+    // case-insensitively, exactly as pulldown-cmark resolves them (`FootnoteTable::find_def`).
     let broken_footnote_refs: Vec<Link> = inline
         .footnote_candidates
         .into_iter()
         .filter(|candidate| {
             let label = candidate.display.as_deref().unwrap_or("");
-            !structure.footnote_defs.iter().any(|d| d.label == label)
+            footnotes.find_def(label).is_none()
         })
         .collect();
 
@@ -127,9 +132,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         headings: structure.headings,
         links,
         tags,
-        footnotes: FootnoteTable {
-            definitions: structure.footnote_defs,
-        },
+        footnotes,
         broken_footnote_refs,
         blocks: inline.blocks,
         line_index,
@@ -207,6 +210,47 @@ Here is a tag: #syntax and a footnote[^1].
         );
         // The resolved one stays in `links` as usual, not duplicated into `broken_footnote_refs`.
         assert!(doc.links.iter().any(|l| l.kind == LinkKind::Footnote));
+    }
+
+    #[test]
+    fn footnote_label_matching_is_case_insensitive() {
+        // pulldown-cmark resolves footnote labels case-insensitively (including non-ASCII), so a
+        // reference `[^A]` DOES have its `[^a]:` definition -- it must not also be "broken".
+        for md in ["Ref[^A]\n\n[^a]: x\n", "Ref[^Ü]\n\n[^ü]: x\n"] {
+            let doc = parse_document(md, Path::new("notes/test.md"));
+            assert!(
+                doc.links.iter().any(|l| l.kind == LinkKind::Footnote),
+                "pulldown should resolve the reference in {md:?}"
+            );
+            assert!(
+                doc.broken_footnote_refs.is_empty(),
+                "case-differing label wrongly reported broken in {md:?}: {:?}",
+                doc.broken_footnote_refs
+            );
+        }
+    }
+
+    #[test]
+    fn footnote_label_with_space_is_valid_when_defined() {
+        // pulldown-cmark accepts spaces inside a footnote label, so `[^a b]` must not be
+        // reported broken when `[^a b]: ...` exists; an undefined one still is.
+        let doc = parse_document("Ref[^a b]\n\n[^a b]: x\n", Path::new("notes/test.md"));
+        assert!(doc.broken_footnote_refs.is_empty());
+
+        let doc = parse_document("Ref[^no def]\n", Path::new("notes/test.md"));
+        assert_eq!(doc.broken_footnote_refs.len(), 1);
+    }
+
+    #[test]
+    fn bracket_in_footnote_label_is_never_a_footnote() {
+        // pulldown-cmark does not treat `[^a[b]` as a footnote even when "defined", so it must
+        // not surface as a broken reference (and the definition marker must not either).
+        let doc = parse_document("Ref[^a[b]\n\n[^a[b]: x\n", Path::new("notes/test.md"));
+        assert!(
+            doc.broken_footnote_refs.is_empty(),
+            "{:?}",
+            doc.broken_footnote_refs
+        );
     }
 
     #[test]

@@ -200,7 +200,15 @@ fn parse_footnote_candidate(source: &str, start: usize) -> Option<(Link, usize)>
     let rest = &source[label_start..];
     let end_bracket = rest.find(']')?;
     let label = &rest[..end_bracket];
-    if label.is_empty() || label.contains('\n') || label.contains('\r') {
+    // pulldown-cmark never treats a label containing `[` as a footnote (even when "defined"), and
+    // an empty or whitespace-padded one (`[^]`, `[^ x]`, `[^x ]`) is prose, not a reference.
+    // A space in the middle is valid (`[^a b]`).
+    if label.is_empty()
+        || label != label.trim()
+        || label.contains('[')
+        || label.contains('\n')
+        || label.contains('\r')
+    {
         return None;
     }
 
@@ -380,6 +388,23 @@ mod tests {
         assert_eq!(output.footnote_candidates[0].kind, LinkKind::Footnote);
         assert_eq!(output.footnote_candidates[0].display.as_deref(), Some("a"));
         assert_eq!(output.footnote_candidates[1].display.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn test_footnote_candidate_rejects_bracket_and_padded_labels() {
+        // `[` inside the label is never a footnote; a label with leading/trailing whitespace
+        // (`[^ x]`, `[^x ]`) is far more likely prose than a footnote reference.
+        for text in ["a [^x[y] b", "a [^ x] b", "a [^x ] b", "a [^] b"] {
+            let output = scan_inline(text, &[]);
+            assert!(
+                output.footnote_candidates.is_empty(),
+                "{text:?} -> {:?}",
+                output.footnote_candidates
+            );
+        }
+        // A space in the middle is fine: pulldown-cmark accepts `[^a b]`.
+        let output = scan_inline("a [^a b] c", &[]);
+        assert_eq!(output.footnote_candidates.len(), 1);
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub fn goto_definition(
     // Special case for footnotes: jump to definition in the SAME document
     if link.kind == LinkKind::Footnote
         && let Some(label) = &link.display
-        && let Some(def) = doc.footnotes.definitions.iter().find(|d| d.label == *label)
+        && let Some(def) = doc.footnotes.find_def(label)
     {
         let range = byte_range_to_lsp(def.range, &doc.line_index);
         let doc_path = match &state.vault_root {
@@ -175,6 +175,54 @@ mod tests {
         } else {
             panic!("Expected scalar location");
         }
+    }
+
+    #[test]
+    fn footnote_definition_found_when_label_case_differs() {
+        // pulldown-cmark matches footnote labels case-insensitively: `[^A]` refers to `[^a]:`.
+        let abs_a = if cfg!(windows) {
+            Path::new("C:\\doc-a.md")
+        } else {
+            Path::new("/doc-a.md")
+        };
+        let rel_a = Path::new("doc-a.md");
+        let content = "Here is a note[^A].\n\n[^a]: This is the footnote definition.";
+        let doc_a = parse_document(content, rel_a);
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.vault_root = Some(if cfg!(windows) {
+            Path::new("C:\\").to_path_buf()
+        } else {
+            Path::new("/").to_path_buf()
+        });
+        let uri = if cfg!(windows) {
+            "file:///C:/doc-a.md"
+        } else {
+            "file:///doc-a.md"
+        };
+        state.open_docs.insert(
+            uri.to_string(),
+            crate::state::OpenDocument::new(uri, abs_a.to_path_buf(), content, 1),
+        );
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                position: tower_lsp_server::ls_types::Position::new(0, 15), // on [^A]
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let def = goto_definition(params, &state)
+            .expect("footnote definition should be found despite the label's case");
+        let GotoDefinitionResponse::Scalar(loc) = def else {
+            panic!("Expected scalar location");
+        };
+        assert_eq!(loc.range.start.line, 2);
     }
 
     #[test]

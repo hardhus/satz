@@ -39,7 +39,7 @@ Diagnostic codes you'll see in `diagnostic.code`:
 | `duplicate-heading` | Warning | Two headings in the same document slugify to the same value, making `#Heading` links to either of them ambiguous. |
 | `missing-frontmatter-field` | Warning | A field listed in `frontmatter.required_fields` is missing (see [`docs/configuration.md`](configuration.md#frontmatter--used-by-the-lsps-diagnostics)). |
 | `orphan-note` | Hint | Nothing links to this document, and it has at least one link or heading of its own (so brand-new empty notes don't get flagged). Suppressed for notes tagged with any of `diagnostics.moc_tags`. |
-| `broken-footnote` | Warning | A `[^label]` reference has no matching `[^label]: ...` definition in the same document (footnotes, like standard Markdown, are always same-document). Found via a manual text scan independent of the structural parser, since pulldown-cmark itself never recognizes an undefined `[^label]` as a footnote reference at all. |
+| `broken-footnote` | Warning | A `[^label]` reference has no matching `[^label]: ...` definition in the same document (footnotes, like standard Markdown, are always same-document). Found via a manual text scan independent of the structural parser, since pulldown-cmark itself never recognizes an undefined `[^label]` as a footnote reference at all. Labels match case-insensitively (`[^A]` refers to `[^a]:`), the same way pulldown-cmark resolves them. Known limit: prose that merely looks like a footnote reference outside a code span (for example a regex character class written as `[^a-z]`) is indistinguishable from one and will be flagged. |
 
 ## Code actions
 

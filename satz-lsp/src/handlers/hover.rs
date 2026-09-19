@@ -29,7 +29,7 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
 
     if link.kind == LinkKind::Footnote {
         if let Some(label) = &link.display {
-            if let Some(def) = doc.footnotes.definitions.iter().find(|d| d.label == *label) {
+            if let Some(def) = doc.footnotes.find_def(label) {
                 let source = doc.line_index.source();
                 let def_text = &source[def.range.start..def.range.end];
                 let value = format!("```markdown\n{}\n```", def_text.trim());
@@ -193,6 +193,37 @@ mod tests {
     use satz_core::{Index, parse_document};
     use std::path::Path;
     use tower_lsp_server::ls_types::{TextDocumentIdentifier, TextDocumentPositionParams};
+
+    #[test]
+    fn footnote_hover_found_when_label_case_differs() {
+        let rel_a = Path::new("doc-a.md");
+        let content = "Here is a note[^A].\n\n[^a]: The footnote body.";
+        let doc_a = parse_document(content, rel_a);
+
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        let uri = "file:///doc-a.md";
+        state.open_docs.insert(
+            uri.to_string(),
+            crate::state::OpenDocument::new(uri, rel_a.to_path_buf(), content, 1),
+        );
+
+        let params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                position: tower_lsp_server::ls_types::Position::new(0, 15), // on [^A]
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let hover = hover(params, &state).expect("hover should find the footnote body");
+        let HoverContents::Markup(m) = hover.contents else {
+            panic!("Expected markup content");
+        };
+        assert!(m.value.contains("The footnote body."), "{}", m.value);
+    }
 
     #[test]
     fn test_hover_skips_frontmatter_and_first_h1() {
