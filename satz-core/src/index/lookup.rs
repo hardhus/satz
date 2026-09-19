@@ -315,8 +315,7 @@ impl Index {
                     if matches!(
                         l.kind,
                         LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-                    ) && !l.target_doc.starts_with("http://")
-                        && !l.target_doc.starts_with("https://")
+                    ) && !crate::model::link::is_external_target(&l.target_doc)
                     {
                         let res = self.resolve_link_full(l, Some(doc));
                         if matches!(
@@ -348,7 +347,7 @@ impl Index {
     /// heading/block (`[[#Heading]]`) is a self-link; everything else goes through
     /// `resolve_link`.
     pub(crate) fn link_target(&self, src: &DocId, link: &Link) -> Option<DocId> {
-        if link.target_doc.starts_with("http://") || link.target_doc.starts_with("https://") {
+        if crate::model::link::is_external_target(&link.target_doc) {
             return None;
         }
         match link.kind {

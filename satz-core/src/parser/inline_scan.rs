@@ -140,15 +140,12 @@ fn parse_wikilink(source: &str, start: usize, is_embed: bool) -> Option<(Link, u
     let prefix_len = if is_embed { 3 } else { 2 };
     let inner_start = start + prefix_len;
 
-    // Find closing `]]` on the same line
+    // Find the closing `]]` on the same line only: searching further would make every unclosed
+    // `[[` scan to the end of the document.
     let rest = &source[inner_start..];
-    let end_bracket = rest.find("]]")?;
-
-    // Must not span multiple lines
-    let inner_slice = &rest[..end_bracket];
-    if inner_slice.contains('\n') || inner_slice.contains('\r') {
-        return None;
-    }
+    let line = &rest[..rest.find(['\n', '\r']).unwrap_or(rest.len())];
+    let end_bracket = line.find("]]")?;
+    let inner_slice = &line[..end_bracket];
 
     let full_end = inner_start + end_bracket + 2;
     let range = ByteRange::new(start, full_end);
@@ -158,11 +155,18 @@ fn parse_wikilink(source: &str, start: usize, is_embed: bool) -> Option<(Link, u
         LinkKind::WikiLink
     };
 
-    // Parse target and display
-    let (target_raw, display) = if let Some((target, disp)) = inner_slice.split_once('|') {
-        (target.trim(), Some(disp.trim().to_string()))
-    } else {
-        (inner_slice.trim(), None)
+    // Parse target and display. Inside a table cell the separator is written `\|`; that one
+    // backslash belongs to the separator, not to the target.
+    let (target_raw, display) = match inner_slice.find('|') {
+        Some(pipe) => {
+            let target = &inner_slice[..pipe];
+            let target = target.strip_suffix('\\').unwrap_or(target);
+            (
+                target.trim(),
+                Some(inner_slice[pipe + 1..].trim().to_string()),
+            )
+        }
+        None => (inner_slice.trim(), None),
     };
 
     // Parse heading or block anchor inside target_raw
@@ -178,6 +182,13 @@ fn parse_wikilink(source: &str, start: usize, is_embed: bool) -> Option<(Link, u
         } else {
             (target_raw.to_string(), None, None)
         };
+
+    // Nothing to point at (`[[]]`, `[[|x]]`, `[[#]]`): plain text, not a link.
+    let target_heading = target_heading.filter(|h| !h.is_empty());
+    let target_block = target_block.filter(|b| !b.is_empty());
+    if target_doc.is_empty() && target_heading.is_none() && target_block.is_none() {
+        return None;
+    }
 
     Some((
         Link::new(
@@ -198,8 +209,9 @@ fn parse_wikilink(source: &str, start: usize, is_embed: bool) -> Option<(Link, u
 fn parse_footnote_candidate(source: &str, start: usize) -> Option<(Link, usize)> {
     let label_start = start + 2;
     let rest = &source[label_start..];
-    let end_bracket = rest.find(']')?;
-    let label = &rest[..end_bracket];
+    let line = &rest[..rest.find(['\n', '\r']).unwrap_or(rest.len())];
+    let end_bracket = line.find(']')?;
+    let label = &line[..end_bracket];
     // pulldown-cmark never treats a label containing `[` as a footnote (even when "defined"), and
     // an empty or whitespace-padded one (`[^]`, `[^ x]`, `[^x ]`) is prose, not a reference.
     // A space in the middle is valid (`[^a b]`).
@@ -288,11 +300,15 @@ fn parse_block_anchor(source: &str, start: usize) -> Option<(BlockAnchor, usize)
     let id = &rest[..end];
     let full_end = start + 1 + end;
 
-    // Check trailing character: must be end of string, whitespace, or punctuation
-    if let Some(next_ch) = source[full_end..].chars().next()
-        && !next_ch.is_whitespace()
-        && !matches!(next_ch, '.' | ',' | ';' | ':' | ')' | ']' | '}')
-    {
+    // An anchor ends its line (optionally followed by one sentence punctuation mark): `2 ^3 power`
+    // is arithmetic, not a block.
+    let after = &source[full_end..];
+    let tail = &after[..after.find(['\n', '\r']).unwrap_or(after.len())];
+    let tail = match tail.chars().next() {
+        Some('.' | ',' | ';' | ':' | ')' | ']' | '}') => &tail[1..],
+        _ => tail,
+    };
+    if !tail.trim().is_empty() {
         return None;
     }
 
@@ -414,5 +430,160 @@ mod tests {
         let output = scan_inline(text, &code_spans);
         assert_eq!(output.footnote_candidates.len(), 1);
         assert_eq!(output.footnote_candidates[0].display.as_deref(), Some("a"));
+    }
+
+    type Parts = (String, Option<String>, Option<String>, Option<String>);
+
+    /// `(target_doc, heading, block, display)` of every wikilink in `text`.
+    fn wiki(text: &str) -> Vec<Parts> {
+        scan_inline(text, &[])
+            .wiki_links
+            .into_iter()
+            .map(|l| (l.target_doc, l.target_heading, l.target_block, l.display))
+            .collect()
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    // ---- F01-02: `\|` is the alias separator inside tables ----
+
+    #[test]
+    fn an_escaped_pipe_separates_target_and_alias_like_a_plain_one() {
+        assert_eq!(
+            wiki("| [[note\\|alias]] |"),
+            vec![("note".into(), None, None, some("alias"))]
+        );
+        assert_eq!(
+            wiki("[[a#h\\|x]]"),
+            vec![("a".into(), some("h"), None, some("x"))]
+        );
+        assert_eq!(
+            wiki("[[a#^b\\|x]]"),
+            vec![("a".into(), None, some("b"), some("x"))]
+        );
+        assert_eq!(
+            wiki("[[note\\|  spaced alias ]]"),
+            vec![("note".into(), None, None, some("spaced alias"))]
+        );
+        // The plain pipe is unchanged.
+        assert_eq!(
+            wiki("[[note|alias]]"),
+            vec![("note".into(), None, None, some("alias"))]
+        );
+    }
+
+    #[test]
+    fn a_backslash_that_does_not_escape_a_pipe_stays_in_the_target() {
+        // Two backslashes: the first is a literal one, the second escapes the pipe.
+        assert_eq!(
+            wiki("[[note\\\\|alias]]"),
+            vec![("note\\".into(), None, None, some("alias"))]
+        );
+        // No pipe at all: nothing to strip.
+        assert_eq!(
+            wiki("[[note\\]]"),
+            vec![("note\\".into(), None, None, None)]
+        );
+    }
+
+    // ---- F01-09: unclosed brackets do not scan past their own line ----
+
+    #[test]
+    fn brackets_never_close_on_a_later_line() {
+        for text in ["[[a\nb]]", "[[a\r\nb]]", "![[a\nb]]", "[[a\n\n]]", "[[a"] {
+            assert!(wiki(text).is_empty(), "{text:?}");
+        }
+        for text in ["[^a\nb]", "[^a\r\nb]", "[^a"] {
+            assert!(
+                scan_inline(text, &[]).footnote_candidates.is_empty(),
+                "{text:?}"
+            );
+        }
+        // A closed one on the next line is still found.
+        assert_eq!(wiki("[[a\n[[b]]").len(), 1);
+        assert_eq!(wiki("[[a\r\n[[b]]")[0].0, "b");
+    }
+
+    #[test]
+    fn many_unclosed_openers_scan_in_linear_time() {
+        let text = "[[unclosed link and [^unclosed note\n".repeat(20_000);
+        let start = std::time::Instant::now();
+        let out = scan_inline(&text, &[]);
+        assert!(out.wiki_links.is_empty() && out.footnote_candidates.is_empty());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    // ---- F01-19: links with nothing to point at are not links ----
+
+    #[test]
+    fn degenerate_wikilinks_are_not_links() {
+        for text in [
+            "[[]]",
+            "[[ ]]",
+            "[[|x]]",
+            "[[ | x ]]",
+            "[[#]]",
+            "[[#^]]",
+            "![[]]",
+            "![[|x]]",
+            "[[\\|x]]",
+        ] {
+            assert!(wiki(text).is_empty(), "{text:?} -> {:?}", wiki(text));
+        }
+        // Same-note anchors are real links.
+        assert_eq!(wiki("[[#h]]"), vec![("".into(), some("h"), None, None)]);
+        assert_eq!(wiki("[[#^b]]"), vec![("".into(), None, some("b"), None)]);
+        // Neighbours are unaffected.
+        assert_eq!(wiki("[[]] [[a]]"), vec![("a".into(), None, None, None)]);
+        assert_eq!(wiki("[[a]] [[]] [[b]]").len(), 2);
+    }
+
+    // ---- F01-12: a block anchor ends its line ----
+
+    fn blocks(text: &str) -> Vec<String> {
+        scan_inline(text, &[])
+            .blocks
+            .into_iter()
+            .map(|b| b.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_caret_word_inside_a_sentence_is_not_a_block_anchor() {
+        for text in [
+            "2 ^3 power",
+            "x ^a b",
+            "a ^b c ^d e",
+            "^a and more",
+            "^a_b",
+            "see ^a\u{00e9}",
+        ] {
+            assert!(blocks(text).is_empty(), "{text:?} -> {:?}", blocks(text));
+        }
+    }
+
+    #[test]
+    fn a_trailing_caret_word_is_a_block_anchor() {
+        for (text, id) in [
+            ("text ^id", "id"),
+            ("text ^id  ", "id"),
+            ("text ^id\t", "id"),
+            ("text ^id\nnext", "id"),
+            ("text ^id\r\nnext", "id"),
+            ("^id", "id"),
+            ("## Title ^blk", "blk"),
+            ("- item ^it-1", "it-1"),
+            ("End of sentence ^my-block.", "my-block"),
+        ] {
+            assert_eq!(blocks(text), vec![id.to_string()], "{text:?}");
+        }
+        assert_eq!(blocks("a ^b c ^d"), vec!["d"]);
+        assert_eq!(blocks("first ^one\nsecond ^two"), vec!["one", "two"]);
     }
 }

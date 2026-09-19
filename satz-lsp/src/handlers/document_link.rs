@@ -22,7 +22,7 @@ pub fn document_link(params: DocumentLinkParams, state: &SatzState) -> Option<Ve
     for l in &doc.links {
         let range = byte_range_to_lsp(l.range, &doc.line_index);
 
-        if l.target_doc.starts_with("http://") || l.target_doc.starts_with("https://") {
+        if satz_core::model::link::is_external_target(&l.target_doc) {
             if let Ok(url) = l.target_doc.parse::<Uri>() {
                 links.push(DocumentLink {
                     range,

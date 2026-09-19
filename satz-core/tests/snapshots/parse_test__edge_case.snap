@@ -1,6 +1,5 @@
 ---
 source: satz-core/tests/parse_test.rs
-assertion_line: 168
 expression: doc
 ---
 id: tests/edge_case.md
@@ -72,30 +71,6 @@ links:
     range:
       start: 555
       end: 591
-  - kind: WikiLink
-    target_doc: ""
-    target_heading: ~
-    target_block: ~
-    display: ~
-    range:
-      start: 635
-      end: 639
-  - kind: WikiLink
-    target_doc: ""
-    target_heading: ""
-    target_block: ~
-    display: ~
-    range:
-      start: 640
-      end: 645
-  - kind: WikiLink
-    target_doc: ""
-    target_heading: ~
-    target_block: ~
-    display: sadece-display
-    range:
-      start: 646
-      end: 665
   - kind: WikiLink
     target_doc: normal-link
     target_heading: ~

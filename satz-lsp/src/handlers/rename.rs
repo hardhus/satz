@@ -65,17 +65,7 @@ fn heading_text_range(source: &str, heading: &Heading) -> Option<HeadingText> {
     };
 
     // A trailing ` ^block-id` belongs to the heading, not to its text.
-    let text = &block[start..end];
-    if let Some(caret) = text.rfind('^') {
-        let id = &text[caret + 1..];
-        if caret > 0
-            && text[..caret].ends_with(is_blank)
-            && !id.is_empty()
-            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
-            end = start + text[..caret].trim_end_matches(is_blank).len();
-        }
-    }
+    end = start + Heading::split_block_id(&block[start..end]).0.len();
 
     Some(HeadingText {
         range: ByteRange::new(base + start, base + end),
@@ -910,6 +900,17 @@ mod tests {
         let applied = v.rename("b.md", 0, 8, "New").unwrap();
         assert_eq!(applied.texts["a.md"], "## New\nfoo\n");
         assert_eq!(applied.texts["b.md"], "See [[a#New]] here\n");
+    }
+
+    #[test]
+    fn a_link_to_a_heading_that_has_a_block_id_resolves_and_renames_it() {
+        let v = vault(&[
+            ("a.md", "## Old ^blk\nfoo\n"),
+            ("b.md", "See [[a#Old]] and [[a#^blk]]\n"),
+        ]);
+        let applied = v.rename("b.md", 0, 8, "New").unwrap();
+        assert_eq!(applied.texts["a.md"], "## New ^blk\nfoo\n");
+        assert_eq!(applied.texts["b.md"], "See [[a#New]] and [[a#^blk]]\n");
     }
 
     #[test]

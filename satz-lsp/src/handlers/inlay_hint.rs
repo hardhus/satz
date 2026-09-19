@@ -24,8 +24,7 @@ pub fn inlay_hint(params: InlayHintParams, state: &SatzState) -> Option<Vec<Inla
         match link.kind {
             LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown => {
                 if link.target_doc.is_empty()
-                    || link.target_doc.starts_with("http://")
-                    || link.target_doc.starts_with("https://")
+                    || satz_core::model::link::is_external_target(&link.target_doc)
                 {
                     continue;
                 }

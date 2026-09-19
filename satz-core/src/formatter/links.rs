@@ -72,7 +72,8 @@ mod tests {
         assert_eq!(norm("![[ img.png ]]"), "![[img.png]]");
         assert_eq!(norm("[[a#h|b]]"), "[[a#h|b]]");
         assert_eq!(norm("[[]]"), "[[]]");
-        assert_eq!(norm("[[ ]]"), "[[]]");
+        // Not a link any more (nothing to point at), so it is left exactly as written.
+        assert_eq!(norm("[[ ]]"), "[[ ]]");
         assert_eq!(norm("[[|]]"), "[[|]]");
     }
 

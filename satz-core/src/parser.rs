@@ -94,7 +94,13 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
             }
         }
     }
-    tags.extend(inline.tags);
+    // `[x](#anchor)` and `<a href="#x">` contain anchors, not tags.
+    tags.extend(inline.tags.into_iter().filter(|t| {
+        !structure
+            .non_text_spans
+            .iter()
+            .any(|s| s.overlaps(&t.range))
+    }));
 
     // Combine all links: markdown, wikilinks, and footnote references
     let mut links = structure.std_links;
@@ -288,5 +294,53 @@ Here is a tag: #syntax and a footnote[^1].
         assert_eq!(&md[tag.range.start..tag.range.end], "rust");
         let tags_key_pos = md.find("tags:").unwrap();
         assert!(tag.range.start > tags_key_pos);
+    }
+
+    fn body_tags(md: &str) -> Vec<String> {
+        parse_document(md, Path::new("doc.md"))
+            .tags
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    #[test]
+    fn a_hash_inside_a_link_destination_is_an_anchor_not_a_tag() {
+        for md in [
+            "See [jump](#heading) here",
+            "See [jump](doc.md#heading) here",
+            "See [jump]( #heading ) here",
+            "See [a](x_(b)#c) here",
+            "Türkçe ünlü [git](#başlık) şimdi",
+            "line\r\nSee [jump](#heading)\r\n",
+            "![img](pic.png#frag)",
+        ] {
+            assert!(body_tags(md).is_empty(), "{md:?} -> {:?}", body_tags(md));
+        }
+    }
+
+    #[test]
+    fn a_hash_inside_html_is_not_a_tag() {
+        for md in [
+            "<a href=\"#x\">go</a>",
+            "text <span id=\"#y\">z</span> text",
+            "<div id=\"#y\">\nbody\n</div>\n",
+            "<!-- #hidden -->",
+        ] {
+            assert!(body_tags(md).is_empty(), "{md:?} -> {:?}", body_tags(md));
+        }
+    }
+
+    #[test]
+    fn real_tags_next_to_links_and_html_are_kept() {
+        // Link TEXT is ordinary text.
+        assert_eq!(body_tags("[#real](x.md)"), vec!["real"]);
+        assert_eq!(body_tags("[a #real b](x.md)"), vec!["real"]);
+        // Text around a link, and the plain-text `(#tag)` form, stay tags (as in Obsidian).
+        assert_eq!(body_tags("[a](#anchor) and #after"), vec!["after"]);
+        assert_eq!(body_tags("#before and [a](#anchor)"), vec!["before"]);
+        assert_eq!(body_tags("colour (#fff) here"), vec!["fff"]);
+        assert_eq!(body_tags("<b>bold</b> #kept"), vec!["kept"]);
+        assert_eq!(body_tags("<!-- c -->\n\n#kept"), vec!["kept"]);
     }
 }

@@ -75,6 +75,19 @@ pub struct StructureOutput {
     /// Every HTML block (`<div>`, `<pre>`, `<!-- -->`, ...), whose raw text is passed through to
     /// the output verbatim.
     pub html_block_spans: Vec<ByteRange>,
+    /// Regions that look like text to a raw scan but are markup: an inline link's or image's
+    /// `(destination)` and raw HTML. A `#anchor` in there is not a tag.
+    pub non_text_spans: Vec<ByteRange>,
+}
+
+/// The `(destination ...)` part of an inline link/image whose whole source range is `range`,
+/// i.e. from the `(` after the last `](`. `None` for links without one (reference style,
+/// autolinks), whose destination is not inside the range.
+fn destination_span(source: &str, range: std::ops::Range<usize>) -> Option<ByteRange> {
+    let text = source.get(range.clone())?;
+    let idx = text.rfind("](")?;
+    text.ends_with(')')
+        .then(|| ByteRange::new(range.start + idx + 1, range.end))
 }
 
 /// Parses the structural markdown components using `pulldown-cmark`.
@@ -258,7 +271,8 @@ pub fn parse_structure(source: &str) -> StructureOutput {
             Event::End(TagEnd::Heading(_)) => {
                 if in_heading {
                     in_heading = false;
-                    let trimmed_text = heading_text.trim().to_string();
+                    // A trailing ` ^block-id` labels the heading; it is not part of its name.
+                    let trimmed_text = Heading::split_block_id(heading_text.trim()).0.to_string();
                     let slug = slugify(&trimmed_text);
                     output.headings.push(Heading::new(
                         heading_level,
@@ -319,6 +333,9 @@ pub fn parse_structure(source: &str) -> StructureOutput {
             Event::End(TagEnd::Link) => {
                 if in_link {
                     in_link = false;
+                    if let Some(span) = destination_span(source, range.clone()) {
+                        output.non_text_spans.push(span);
+                    }
                     let (target_doc, target_heading) = parse_link_dest(&link_dest);
                     let display = if link_text.is_empty() {
                         None
@@ -335,6 +352,20 @@ pub fn parse_structure(source: &str) -> StructureOutput {
                         ByteRange::new(link_start, range.end),
                     ));
                 }
+            }
+
+            // --- Images: the `(dest)` part is not text either ---
+            Event::End(TagEnd::Image) => {
+                if let Some(span) = destination_span(source, range) {
+                    output.non_text_spans.push(span);
+                }
+            }
+
+            // --- Raw HTML (attribute values are not text) ---
+            Event::Html(_) | Event::InlineHtml(_) => {
+                output
+                    .non_text_spans
+                    .push(ByteRange::new(range.start, range.end));
             }
 
             // --- Footnotes ---
@@ -382,6 +413,10 @@ pub fn parse_structure(source: &str) -> StructureOutput {
 }
 
 fn parse_link_dest(dest: &str) -> (String, Option<String>) {
+    // An external URL is one opaque target: its `#fragment` is not a note heading.
+    if crate::model::link::is_external_target(dest) {
+        return (dest.to_string(), None);
+    }
     if let Some((doc, heading)) = dest.split_once('#') {
         (doc.to_string(), Some(heading.to_string()))
     } else {

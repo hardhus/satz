@@ -144,8 +144,7 @@ pub fn compute_diagnostics(
                 }
             }
             LinkKind::Markdown => {
-                if link.target_doc.starts_with("http://")
-                    || link.target_doc.starts_with("https://")
+                if satz_core::model::link::is_external_target(&link.target_doc)
                     || link.target_doc.is_empty()
                 {
                     continue;

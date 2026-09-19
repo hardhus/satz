@@ -46,3 +46,84 @@ impl Link {
         }
     }
 }
+
+/// Schemes that are followed by no `//` (`mailto:a@b.c`); any other scheme needs the `://`.
+const OPAQUE_SCHEMES: &[&str] = &[
+    "mailto",
+    "tel",
+    "sms",
+    "geo",
+    "data",
+    "javascript",
+    "urn",
+    "magnet",
+];
+
+/// Whether a link target points outside the vault: `scheme://...` (`https://`, `obsidian://`,
+/// `file:///`) or one of the opaque schemes (`mailto:`, `tel:`). A single-letter scheme is a
+/// Windows drive (`C:\notes\x.md`) and a note may legitimately have a colon in its name
+/// (`Project:Alpha`), so both stay internal.
+pub fn is_external_target(target: &str) -> bool {
+    let Some((scheme, rest)) = target.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    let scheme_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme.len() >= 2
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+    if !scheme_ok {
+        return false;
+    }
+    rest.starts_with("//")
+        || OPAQUE_SCHEMES
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(scheme))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls_with_a_scheme_are_external() {
+        for t in [
+            "http://a.b",
+            "https://a.b/c#frag",
+            "HTTPS://A.B",
+            "mailto:a@b.c",
+            "tel:+90555",
+            "ftp://host/x",
+            "obsidian://open?vault=x",
+            "file:///x",
+            "git+ssh://h/r",
+            "sms:123",
+            "javascript:void(0)",
+            "urn:isbn:123",
+        ] {
+            assert!(is_external_target(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn note_names_and_paths_are_not_external() {
+        for t in [
+            "",
+            "note",
+            "folder/note",
+            "note.md",
+            "C:\\dir\\x.md",
+            "C:/dir/x.md",
+            "a:b",
+            "1abc:x",
+            ":x",
+            "a b:c",
+            "note: with colon",
+            "Project:Alpha",
+            "Note:Title",
+            "sub/mailto:x",
+            "./x:y",
+        ] {
+            assert!(!is_external_target(t), "{t:?}");
+        }
+    }
+}

@@ -83,8 +83,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
         if matches!(
             link.kind,
             LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-        ) && !link.target_doc.starts_with("http://")
-            && !link.target_doc.starts_with("https://")
+        ) && !satz_core::model::link::is_external_target(&link.target_doc)
         {
             match state.index.resolve_link_full(link, Some(doc)) {
                 satz_core::LinkResolution::DocMissing if !link.target_doc.is_empty() => {
