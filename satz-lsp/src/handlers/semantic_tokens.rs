@@ -62,6 +62,120 @@ fn push_link_tokens(
     });
 }
 
+/// A token on a single line, in LSP coordinates (UTF-16 columns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AbsToken {
+    line: u32,
+    start: u32,
+    length: u32,
+    token_type: u32,
+}
+
+/// Turns raw byte-range tokens into non-overlapping, single-line, sorted tokens.
+///
+/// The LSP forbids overlapping tokens (unless the client opts in) and a token can't span lines:
+/// - a range is cut at every line break (the break itself is never coloured), so a link that
+///   wraps is coloured on each of its lines;
+/// - where tokens overlap, the shorter one wins and the longer one is cut around it, so a
+///   heading keeps its colour on the words but yields to the link/tag/anchor inside it. Between
+///   equally long ones the one listed first wins. A leftover piece that is only whitespace is
+///   dropped.
+fn layout_tokens(raw: Vec<RawToken>, line_index: &satz_core::LineIndex) -> Vec<AbsToken> {
+    let source = line_index.source();
+
+    // 1. Cut into per-line pieces: (start, end, type, order).
+    let mut pieces: Vec<(usize, usize, u32, usize)> = Vec::new();
+    for (order, token) in raw.iter().enumerate() {
+        let end = token.range.end.min(source.len());
+        let mut start = token.range.start.min(end);
+        while start < end {
+            let line_end = source[start..end].find('\n').map_or(end, |i| start + i);
+            let piece_end = source[start..line_end].trim_end_matches('\r').len() + start;
+            if piece_end > start {
+                pieces.push((start, piece_end, token.token_type, order));
+            }
+            start = line_end + 1;
+        }
+    }
+
+    // 2. Shorter first; each piece takes the parts of its range no shorter piece already holds.
+    pieces.sort_by_key(|&(start, end, _, order)| (end - start, order));
+    let mut occupied: Vec<(usize, usize)> = Vec::new(); // disjoint, sorted by start
+    let mut placed: Vec<(usize, usize, u32)> = Vec::new();
+    for (start, end, token_type, _) in pieces {
+        let mut cursor = start;
+        let mut fragments: Vec<(usize, usize)> = Vec::new();
+        let first = occupied.partition_point(|&(_, occ_end)| occ_end <= start);
+        for &(occ_start, occ_end) in &occupied[first..] {
+            if occ_start >= end {
+                break;
+            }
+            if occ_start > cursor {
+                fragments.push((cursor, occ_start));
+            }
+            cursor = cursor.max(occ_end);
+        }
+        if cursor < end {
+            fragments.push((cursor, end));
+        }
+        for (frag_start, frag_end) in fragments {
+            let was_cut = (frag_start, frag_end) != (start, end);
+            if was_cut && source[frag_start..frag_end].trim().is_empty() {
+                continue;
+            }
+            let at = occupied.partition_point(|&(s, _)| s < frag_start);
+            occupied.insert(at, (frag_start, frag_end));
+            placed.push((frag_start, frag_end, token_type));
+        }
+    }
+
+    // 3. Sorted, in LSP coordinates.
+    placed.sort_by_key(|&(start, _, _)| start);
+    placed
+        .into_iter()
+        .filter_map(|(start, end, token_type)| {
+            let from = line_index.byte_to_position(start);
+            let to = line_index.byte_to_position(end);
+            debug_assert_eq!(from.line, to.line, "pieces are single-line");
+            let length = to.character.saturating_sub(from.character);
+            (length > 0).then_some(AbsToken {
+                line: from.line,
+                start: from.character,
+                length,
+                token_type,
+            })
+        })
+        .collect()
+}
+
+/// Delta-encodes sorted, non-overlapping tokens as the LSP wants them.
+fn encode_tokens(tokens: Vec<AbsToken>) -> Vec<SemanticToken> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let (mut prev_line, mut prev_start) = (0u32, 0u32);
+    for token in tokens {
+        debug_assert!(
+            token.line > prev_line || (token.line == prev_line && token.start >= prev_start),
+            "tokens must be sorted"
+        );
+        let delta_line = token.line - prev_line;
+        let delta_start = if delta_line == 0 {
+            token.start - prev_start
+        } else {
+            token.start
+        };
+        out.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.length,
+            token_type: token.token_type,
+            token_modifiers_bitset: 0,
+        });
+        prev_line = token.line;
+        prev_start = token.start;
+    }
+    out
+}
+
 /// Computes SemanticTokens for links, tags, headings, and block anchors across the full document.
 pub fn semantic_tokens_full(
     params: SemanticTokensParams,
@@ -153,61 +267,7 @@ pub fn semantic_tokens_full(
         });
     }
 
-    // Sort tokens by start byte offset
-    raw_tokens.sort_by_key(|t| t.range.start);
-
-    let mut semantic_tokens: Vec<SemanticToken> = Vec::with_capacity(raw_tokens.len());
-    let mut prev_line = 0u32;
-    let mut prev_start = 0u32;
-
-    for raw in raw_tokens {
-        if raw.range.is_empty() {
-            continue;
-        }
-
-        let start_pos = doc.line_index.byte_to_position(raw.range.start);
-        // Trim trailing newline or CRLF from the token range
-        let mut end_byte = raw.range.end;
-        while end_byte > raw.range.start {
-            let b = doc.line_index.source().as_bytes().get(end_byte - 1);
-            if b == Some(&b'\n') || b == Some(&b'\r') {
-                end_byte -= 1;
-            } else {
-                break;
-            }
-        }
-        let end_pos = doc.line_index.byte_to_position(end_byte);
-
-        let line = start_pos.line;
-        let start_char = start_pos.character;
-        let length = if end_pos.line == line {
-            end_pos.character.saturating_sub(start_char)
-        } else {
-            1
-        };
-
-        if length == 0 {
-            continue;
-        }
-
-        let delta_line = line.saturating_sub(prev_line);
-        let delta_start = if delta_line == 0 {
-            start_char.saturating_sub(prev_start)
-        } else {
-            start_char
-        };
-
-        semantic_tokens.push(SemanticToken {
-            delta_line,
-            delta_start,
-            length,
-            token_type: raw.token_type,
-            token_modifiers_bitset: 0,
-        });
-
-        prev_line = line;
-        prev_start = start_char;
-    }
+    let semantic_tokens = encode_tokens(layout_tokens(raw_tokens, &doc.line_index));
 
     Some(SemanticTokensResult::Tokens(SemanticTokens {
         result_id: None,
@@ -407,5 +467,114 @@ mod tests {
         assert_eq!(data.len(), 2);
         assert_eq!(data[0].token_type, 0); // [^a] resolved
         assert_eq!(data[1].token_type, 1); // [^b] broken
+    }
+
+    // ---- tokens never overlap, and never span lines ----
+
+    /// Absolute `(line, start, length, type)` of every token of `text` (a note `doc-a.md` next to
+    /// an existing `doc-b.md`, so `[[doc-b]]` resolves).
+    fn decoded(text: &str) -> Vec<(u32, u32, u32, u32)> {
+        let rel_path = Path::new("doc-a.md");
+        let mut state = SatzState {
+            index: Index::build(vec![
+                parse_document(text, rel_path),
+                parse_document("# Doc B", Path::new("doc-b.md")),
+            ]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            "file:///doc-a.md".to_string(),
+            crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),
+        );
+        let params = SemanticTokensParams {
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            text_document: TextDocumentIdentifier {
+                uri: "file:///doc-a.md".parse().unwrap(),
+            },
+        };
+        let Some(SemanticTokensResult::Tokens(tokens)) = semantic_tokens_full(params, &state)
+        else {
+            panic!("tokens expected");
+        };
+        let (mut line, mut start) = (0u32, 0u32);
+        tokens
+            .data
+            .iter()
+            .map(|t| {
+                line += t.delta_line;
+                start = if t.delta_line == 0 {
+                    start + t.delta_start
+                } else {
+                    t.delta_start
+                };
+                (line, start, t.length, t.token_type)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_heading_is_split_around_the_tokens_inside_it() {
+        assert_eq!(
+            decoded("## See [[doc-b]] #tag"),
+            vec![(0, 0, 7, 3), (0, 7, 9, 0), (0, 17, 4, 2)]
+        );
+        assert_eq!(decoded("## Title ^blk"), vec![(0, 0, 9, 3), (0, 9, 4, 5)]);
+        assert_eq!(
+            decoded("## A [[doc-b]] end"),
+            vec![(0, 0, 5, 3), (0, 5, 9, 0), (0, 14, 4, 3)]
+        );
+        // Two tokens inside one heading.
+        assert_eq!(
+            decoded("# [[doc-b]] and [[nope]]"),
+            vec![(0, 0, 2, 3), (0, 2, 9, 0), (0, 11, 5, 3), (0, 16, 8, 1)]
+        );
+    }
+
+    #[test]
+    fn utf16_lengths_are_used_for_the_split_pieces() {
+        // "## Türkçe 🦀 " is 13 UTF-16 units (the crab is a surrogate pair).
+        assert_eq!(
+            decoded("## Türkçe 🦀 [[doc-b]]"),
+            vec![(0, 0, 13, 3), (0, 13, 9, 0)]
+        );
+    }
+
+    #[test]
+    fn a_link_wrapping_across_lines_is_coloured_on_every_line() {
+        assert_eq!(
+            decoded("[a\nb](doc-b.md) tail"),
+            vec![(0, 0, 2, 0), (1, 0, 12, 0)]
+        );
+        assert_eq!(
+            decoded("[a\r\nb](doc-b.md) tail"),
+            vec![(0, 0, 2, 0), (1, 0, 12, 0)]
+        );
+        assert_eq!(
+            decoded("x [one\ntwo\nthree](doc-b.md)"),
+            vec![(0, 2, 4, 0), (1, 0, 3, 0), (2, 0, 16, 0)]
+        );
+    }
+
+    #[test]
+    fn tokens_are_strictly_ordered_and_never_overlap() {
+        for text in [
+            "## See [[doc-b]] #tag ^blk\n\n[a\nb](doc-b.md) #t [[nope|x]] [^1]\n\n[^1]: n\n",
+            "# [[doc-b]][[doc-b]]#a#b\n",
+            "### ![[doc-b]] ^x\r\n\r\n#tag [[doc-b#h]]\r\n",
+            "Setext [[doc-b]] #t\n=====\n",
+        ] {
+            let tokens = decoded(text);
+            for pair in tokens.windows(2) {
+                let (l1, s1, n1, _) = pair[0];
+                let (l2, s2, _, _) = pair[1];
+                assert!(
+                    l2 > l1 || (l2 == l1 && s2 >= s1 + n1),
+                    "overlap or misorder {pair:?} in {text:?}: {tokens:?}"
+                );
+            }
+            assert!(tokens.iter().all(|t| t.2 > 0), "{text:?}");
+        }
     }
 }

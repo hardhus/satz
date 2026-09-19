@@ -211,6 +211,8 @@ pub fn reload_config(state: &mut SatzState, vault_root: &Path) -> ReloadOutcome 
         .exists();
     match satz_core::VaultConfig::load(vault_root) {
         Ok(config) => {
+            // Cached formatted texts were computed with the old settings (and capacity).
+            state.format_cache = crate::state::FormatCache::new(config.lsp.format_cache_capacity);
             state.config = config;
             state.config_error = None;
             if existed {
@@ -543,5 +545,83 @@ mod tests {
         assert_eq!(apply_fs_change(&mut state, &dir, &path), FsChange::Skipped);
         assert_eq!(targets(&state, "a.md"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the workspace-format cache must not outlive the settings it was computed with ----
+
+    fn state_with_list_doc() -> SatzState {
+        let mut state = SatzState::default();
+        state.index = satz_core::Index::build(vec![satz_core::parse_document(
+            "- a\n- b\n",
+            Path::new("a.md"),
+        )]);
+        state
+    }
+
+    fn format_and_cache(state: &mut SatzState) -> Vec<String> {
+        let result = crate::handlers::execute_command::compute_format_changes(state);
+        for (hash, formatted) in result.cache_updates {
+            state.format_cache.insert(hash, formatted);
+        }
+        result.changes.into_iter().map(|c| c.formatted).collect()
+    }
+
+    #[test]
+    fn changing_formatter_settings_changes_what_workspace_format_produces() {
+        let v = TempVault::new("fmt-cache");
+        let mut state = state_with_list_doc();
+        state.vault_root = Some(v.0.clone());
+
+        // Default settings: already clean. The (unchanged) result is cached.
+        assert_eq!(
+            reload_config(&mut state, &v.0),
+            ReloadOutcome::RevertedToDefaults
+        );
+        assert!(format_and_cache(&mut state).is_empty());
+        assert!(!state.format_cache.is_empty());
+
+        // The user switches the list marker: the next run must use the new setting.
+        v.write("[formatter.lists]\nmarker = \"*\"\n");
+        assert_eq!(reload_config(&mut state, &v.0), ReloadOutcome::Reloaded);
+        assert_eq!(format_and_cache(&mut state), vec!["* a\n* b\n".to_string()]);
+
+        // And back again.
+        v.delete();
+        assert_eq!(
+            reload_config(&mut state, &v.0),
+            ReloadOutcome::RevertedToDefaults
+        );
+        assert!(format_and_cache(&mut state).is_empty());
+    }
+
+    #[test]
+    fn a_reload_replaces_the_cache_and_applies_the_new_capacity() {
+        let v = TempVault::new("fmt-cap");
+        let mut state = SatzState::default();
+        state.format_cache.insert(1, "x".to_string());
+
+        v.write("[lsp]\nformat_cache_capacity = 7\n");
+        assert_eq!(reload_config(&mut state, &v.0), ReloadOutcome::Reloaded);
+
+        assert!(state.format_cache.is_empty());
+        for hash in 0..20u64 {
+            state.format_cache.insert(hash, String::new());
+        }
+        assert_eq!(state.format_cache.len(), 7);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_settings_and_so_the_cache() {
+        let v = TempVault::new("fmt-failed");
+        let mut state = SatzState::default();
+        state.format_cache.insert(1, "kept".to_string());
+
+        v.write("[formatter\nbroken = \n");
+        assert!(matches!(
+            reload_config(&mut state, &v.0),
+            ReloadOutcome::Failed(_)
+        ));
+
+        assert_eq!(state.format_cache.get(1), Some("kept"));
     }
 }

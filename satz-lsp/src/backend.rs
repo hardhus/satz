@@ -410,16 +410,19 @@ impl LanguageServer for Backend {
 
             publish_for(&client_clone, &state_arc, &uri_clone).await;
 
-            if peers_dirty {
-                if supports_pull {
-                    let _ = client_clone
-                        .send_request::<WorkspaceDiagnosticRefresh>(())
-                        .await;
-                } else {
-                    for other_uri in other_uris {
-                        publish_for(&client_clone, &state_arc, &other_uri).await;
-                    }
+            let plan = refresh_after_reparse(peers_dirty, supports_pull);
+            if plan.pull_diagnostics {
+                let _ = client_clone
+                    .send_request::<WorkspaceDiagnosticRefresh>(())
+                    .await;
+            }
+            if plan.push_peers {
+                for other_uri in other_uris {
+                    publish_for(&client_clone, &state_arc, &other_uri).await;
                 }
+            }
+            if plan.semantic_tokens {
+                let _ = client_clone.send_request::<SemanticTokensRefresh>(()).await;
             }
         });
 
@@ -773,5 +776,65 @@ impl LanguageServer for Backend {
         Ok(WorkspaceDiagnosticReportResult::Report(
             WorkspaceDiagnosticReport { items },
         ))
+    }
+}
+
+/// What to tell the client after an open document has been re-parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefreshPlan {
+    /// Send `workspace/diagnostic/refresh` so a pull client fetches the new results.
+    pub pull_diagnostics: bool,
+    /// Publish diagnostics for the other open documents (push clients).
+    pub push_peers: bool,
+    /// Send `workspace/semanticTokens/refresh`.
+    pub semantic_tokens: bool,
+}
+
+/// Decides the notifications after a debounced re-parse.
+///
+/// The client fetches diagnostics and tokens right after each edit -- before the debounced
+/// re-parse has updated the index -- so it always holds results one edit old. A pull client is
+/// therefore asked to fetch again after EVERY re-parse (not only when other documents are
+/// affected), and semantic tokens are refreshed too. A push client already gets its own
+/// document's diagnostics published; other documents only when what they depend on changed.
+pub(crate) fn refresh_after_reparse(peers_dirty: bool, supports_pull: bool) -> RefreshPlan {
+    RefreshPlan {
+        pull_diagnostics: supports_pull,
+        push_peers: peers_dirty && !supports_pull,
+        semantic_tokens: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pull_client_is_always_asked_to_refetch_after_a_reparse() {
+        for peers_dirty in [false, true] {
+            let plan = refresh_after_reparse(peers_dirty, true);
+            assert!(plan.pull_diagnostics, "peers_dirty={peers_dirty}");
+            assert!(!plan.push_peers, "a pull client is not pushed to");
+        }
+    }
+
+    #[test]
+    fn a_push_client_gets_peers_only_when_they_are_affected() {
+        let clean = refresh_after_reparse(false, false);
+        assert!(!clean.pull_diagnostics && !clean.push_peers);
+        let dirty = refresh_after_reparse(true, false);
+        assert!(!dirty.pull_diagnostics && dirty.push_peers);
+    }
+
+    #[test]
+    fn semantic_tokens_are_refreshed_after_every_reparse() {
+        for peers_dirty in [false, true] {
+            for supports_pull in [false, true] {
+                assert!(
+                    refresh_after_reparse(peers_dirty, supports_pull).semantic_tokens,
+                    "peers_dirty={peers_dirty} supports_pull={supports_pull}"
+                );
+            }
+        }
     }
 }

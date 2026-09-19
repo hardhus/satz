@@ -202,7 +202,9 @@ pub fn compute_diagnostics(
     // 3. Duplicate heading slugs
     let mut seen_slugs = std::collections::HashSet::new();
     for heading in &doc.headings {
-        if !seen_slugs.insert(&heading.slug) {
+        // A heading with no slug (`# 🙂`, `# !!!`, an empty one) cannot be linked to by name, so
+        // two of them are not "ambiguous targets".
+        if !heading.slug.is_empty() && !seen_slugs.insert(&heading.slug) {
             let range = byte_range_to_lsp(heading.range, &doc.line_index);
             diagnostics.push(lsp::Diagnostic {
                 range,
@@ -352,6 +354,38 @@ mod tests {
             diagnostics[0].code,
             Some(lsp::NumberOrString::String("duplicate-heading".to_string()))
         );
+    }
+
+
+    /// Number of `duplicate-heading` diagnostics for a document, with a backlink so the orphan
+    /// hint does not interfere.
+    fn duplicate_heading_count(body: &str) -> usize {
+        let doc_a = parse_document(body, Path::new("doc-a.md"));
+        let doc_b = parse_document("# B\n\n[[doc-a]]", Path::new("doc-b.md"));
+        let index = Index::build(vec![doc_a.clone(), doc_b]);
+        compute_diagnostics(&doc_a, &index, &VaultConfig::default())
+            .iter()
+            .filter(|d| {
+                d.code == Some(lsp::NumberOrString::String("duplicate-heading".to_string()))
+            })
+            .count()
+    }
+
+    #[test]
+    fn headings_without_a_slug_are_not_duplicates_of_each_other() {
+        // Nothing can link to them by name, so "ambiguous target" makes no sense.
+        assert_eq!(duplicate_heading_count("# 🙂\n\n# !!!\n"), 0);
+        assert_eq!(duplicate_heading_count("# 🙂\n\n## 🙂\n\n### ...\n"), 0);
+        assert_eq!(duplicate_heading_count("#\n\n#\n"), 0);
+    }
+
+    #[test]
+    fn real_duplicate_headings_are_still_reported() {
+        assert_eq!(duplicate_heading_count("# Same\n\n# Same\n"), 1);
+        assert_eq!(duplicate_heading_count("# A\n\n## a\n"), 1);
+        assert_eq!(duplicate_heading_count("# Same\n\n## Same\n\n### Same\n"), 2);
+        // A slug-less heading between two real duplicates changes nothing.
+        assert_eq!(duplicate_heading_count("# Same\n\n# 🙂\n\n# Same\n"), 1);
     }
 
     #[test]
