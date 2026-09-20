@@ -152,32 +152,17 @@ async fn run_reparse(
     };
     let version = job.version;
     let parsed =
-        tokio::task::spawn_blocking(move || satz_core::parse_document(&job.content, &job.rel_path))
+        tokio::task::spawn_blocking(move || satz_core::parse_document_owned(job.content, &job.rel_path))
             .await;
     let Ok(new_doc) = parsed else {
         tracing::error!(%uri, "reparse: the parsing task failed");
         return;
     };
 
-    let (applied, peers_dirty, supports_pull, other_uris) = {
+    let (applied, peers) = {
         let mut state = state_arc.write().await;
         let applied = state.apply_reparse(&uri, version, new_doc);
-        let dirty = state.peers_dirty;
-        if applied {
-            state.peers_dirty = false;
-        }
-        let other: Vec<String> = state
-            .open_docs
-            .keys()
-            .filter(|u| **u != uri)
-            .cloned()
-            .collect();
-        (
-            applied,
-            dirty && applied,
-            state.client_supports_pull_diagnostics,
-            other,
-        )
+        (applied, state.take_peer_refresh(&uri, applied))
     };
     if !applied {
         return; // the buffer changed while parsing; the task of that change takes over
@@ -185,13 +170,13 @@ async fn run_reparse(
 
     publish_for(&client, &state_arc, &uri).await;
 
-    let plan = refresh_after_reparse(peers_dirty, supports_pull);
+    let plan = refresh_after_reparse(peers.dirty, peers.supports_pull);
     if plan.pull_diagnostics {
         refresh_diagnostics(&client, &state_arc).await;
     }
     if plan.push_peers {
-        for other_uri in other_uris {
-            publish_for(&client, &state_arc, &other_uri).await;
+        for other_uri in &peers.others {
+            publish_for(&client, &state_arc, other_uri).await;
         }
     }
     if plan.semantic_tokens {
@@ -203,6 +188,8 @@ pub struct Backend {
     pub client: Client,
     pub state: Arc<RwLock<SatzState>>,
     log_reload_handle: LogReloadHandle,
+    /// The running file watcher, if any: a new one replaces (stops) the old, `shutdown` stops it.
+    watcher: Arc<std::sync::Mutex<Option<crate::watcher::WatcherHandle>>>,
 }
 
 /// Computes diagnostics for the specified open document URI and sends them to the client.
@@ -242,6 +229,21 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
 }
 
 impl Backend {
+    /// Tells the other open documents' diagnostics to catch up, when what they depend on changed:
+    /// a pull client is asked to fetch again, a push client is sent them.
+    async fn refresh_peers(&self, peers: &crate::state::PeerRefresh) {
+        if !peers.dirty {
+            return;
+        }
+        if peers.supports_pull {
+            refresh_diagnostics(&self.client, &self.state).await;
+        } else {
+            for other_uri in &peers.others {
+                publish_for(&self.client, &self.state, other_uri).await;
+            }
+        }
+    }
+
     /// Read access to a state whose index reflects every open buffer.
     ///
     /// The debounced reparse trails typing by a few hundred milliseconds; a request that maps the
@@ -270,6 +272,7 @@ impl Backend {
             client,
             state: Arc::new(RwLock::new(SatzState::default())),
             log_reload_handle,
+            watcher: Default::default(),
         }
     }
 
@@ -344,16 +347,20 @@ impl LanguageServer for Backend {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let root_clone = root.clone();
+            let watcher_slot = self.watcher.clone();
 
             tokio::task::spawn(async move {
                 tracing::debug!(vault_root = ?root_clone, "walk_vault: starting");
                 // Watching starts BEFORE the walk: what changes while it runs is held back until
                 // the index is complete and is then applied from what is on disk.
-                crate::watcher::spawn_watcher(
+                let handle = crate::watcher::spawn_watcher(
                     root_clone.clone(),
                     state_arc.clone(),
                     client.clone(),
                 );
+                if let Some(old) = watcher_slot.lock().unwrap().replace(handle) {
+                    old.stop();
+                }
 
                 let root_for_blocking = root_clone.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -440,6 +447,9 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
         tracing::debug!("shutdown requested");
+        if let Some(watcher) = self.watcher.lock().unwrap().take() {
+            watcher.stop();
+        }
         Ok(())
     }
 
@@ -453,31 +463,14 @@ impl LanguageServer for Backend {
             return;
         };
 
-        let (peers_dirty, supports_pull, other_uris) = {
+        let peers = {
             let mut state = self.state.write().await;
             state.open_document(&uri, &content, &path, version);
-            let dirty = state.peers_dirty;
-            state.peers_dirty = false;
-            let other: Vec<String> = state
-                .open_docs
-                .keys()
-                .filter(|u| *u != &uri)
-                .cloned()
-                .collect();
-            (dirty, state.client_supports_pull_diagnostics, other)
+            state.take_peer_refresh(&uri, true)
         };
 
         self.publish_diagnostics_for_uri(&uri).await;
-
-        if peers_dirty {
-            if supports_pull {
-                refresh_diagnostics(&self.client, &self.state).await;
-            } else {
-                for other_uri in other_uris {
-                    publish_for(&self.client, &self.state, &other_uri).await;
-                }
-            }
-        }
+        self.refresh_peers(&peers).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -520,7 +513,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         tracing::debug!(%uri, "did_save");
 
-        let (peers_dirty, supports_pull, other_uris, prev_task) = {
+        let (peers, prev_task) = {
             let mut state = self.state.write().await;
             let prev = if let Some(open_doc) = state.open_docs.get_mut(&uri) {
                 open_doc.pending_task.take()
@@ -528,15 +521,7 @@ impl LanguageServer for Backend {
                 None
             };
             state.reparse_open_document(&uri);
-            let dirty = state.peers_dirty;
-            state.peers_dirty = false;
-            let other: Vec<String> = state
-                .open_docs
-                .keys()
-                .filter(|u| *u != &uri)
-                .cloned()
-                .collect();
-            (dirty, state.client_supports_pull_diagnostics, other, prev)
+            (state.take_peer_refresh(&uri, true), prev)
         };
 
         if let Some(task) = prev_task {
@@ -544,45 +529,22 @@ impl LanguageServer for Backend {
         }
 
         self.publish_diagnostics_for_uri(&uri).await;
-
-        if peers_dirty {
-            if supports_pull {
-                refresh_diagnostics(&self.client, &self.state).await;
-            } else {
-                for other_uri in other_uris {
-                    publish_for(&self.client, &self.state, &other_uri).await;
-                }
-            }
-        }
+        self.refresh_peers(&peers).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let lsp_uri = params.text_document.uri;
         tracing::debug!(%uri, "did_close");
-        let (peers_dirty, supports_pull, other_uris) = {
+        let peers = {
             let mut state = self.state.write().await;
             state.close_document(&uri);
-            let dirty = state.peers_dirty;
-            state.peers_dirty = false;
-            (
-                dirty,
-                state.client_supports_pull_diagnostics,
-                state.open_docs.keys().cloned().collect::<Vec<_>>(),
-            )
+            state.take_peer_refresh(&uri, true)
         };
         self.client.publish_diagnostics(lsp_uri, vec![], None).await;
 
         // Discarded unsaved edits change what the remaining documents' diagnostics should say.
-        if peers_dirty {
-            if supports_pull {
-                refresh_diagnostics(&self.client, &self.state).await;
-            } else {
-                for other_uri in other_uris {
-                    publish_for(&self.client, &self.state, &other_uri).await;
-                }
-            }
-        }
+        self.refresh_peers(&peers).await;
     }
 
     async fn goto_definition(
@@ -1606,5 +1568,34 @@ mod tests {
         let state = backend.state.read().await;
         assert!(!state.open_docs.contains_key("file:///never-opened.md"));
         assert!(state.index.get_doc(&satz_core::DocId::new("never-opened.md")).is_none());
+    }
+
+    #[tokio::test]
+    async fn opening_changing_and_closing_consume_the_peer_flag_once() {
+        let (backend, _service) = shared_backend().await;
+        backend
+            .did_open(open_params("file:///p.md", 1, "# P\n\n[[a]]\n"))
+            .await;
+        assert!(!backend.state.read().await.peers_dirty, "consumed by did_open");
+
+        backend.state.write().await.peers_dirty = true;
+        backend
+            .did_change(change_params("file:///p.md", 2, "# P\n\n[[nothing]]\n"))
+            .await;
+        backend.state.write().await.peers_dirty = true;
+        backend.did_close(close_params("file:///p.md")).await;
+        assert!(!backend.state.read().await.peers_dirty, "consumed by did_close");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_running_watcher_and_is_harmless_without_one() {
+        let (backend, _service) = shared_backend().await;
+        backend.shutdown().await.unwrap();
+        let handle = crate::watcher::WatcherHandle::default();
+        *backend.watcher.lock().unwrap() = Some(handle.clone());
+        backend.shutdown().await.unwrap();
+        assert!(handle.is_stopped());
+        assert!(backend.watcher.lock().unwrap().is_none());
+        backend.shutdown().await.unwrap();
     }
 }

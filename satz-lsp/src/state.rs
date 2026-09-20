@@ -251,6 +251,17 @@ pub struct ReparseJob {
     pub version: i32,
 }
 
+/// What has to be told to the other open documents after a change to one of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerRefresh {
+    /// Something they depend on changed (`peers_dirty` was set and this change took effect).
+    pub dirty: bool,
+    /// The client fetches diagnostics itself (pull) instead of being sent them (push).
+    pub supports_pull: bool,
+    /// The other open documents, in URI order.
+    pub others: Vec<String>,
+}
+
 /// What the initial indexing came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexingOutcome {
@@ -306,10 +317,10 @@ impl SatzState {
         new_state.open_docs = std::mem::take(&mut self.open_docs);
         for doc in new_state.open_docs.values() {
             let rel_path = Self::get_rel_path(&doc.path, new_state.vault_root.as_deref());
-            let content = doc.rope.to_string();
-            new_state
-                .index
-                .replace_doc(satz_core::parse_document(&content, &rel_path));
+            new_state.index.replace_doc(satz_core::parse_document_owned(
+                doc.rope.to_string(),
+                &rel_path,
+            ));
         }
         *self = new_state;
         self.sync_daily(chrono::Local::now().date_naive());
@@ -529,6 +540,28 @@ impl SatzState {
         self.index.replace_doc(new_doc);
     }
 
+    /// Takes what the other open documents have to be told after a change to `except`. When the
+    /// change `applied`, the "peers depend on this" flag is consumed (`dirty`); a change that did
+    /// not take effect (a reparse the user typed past) leaves it for the one that does.
+    pub fn take_peer_refresh(&mut self, except: &str, applied: bool) -> PeerRefresh {
+        let dirty = self.peers_dirty && applied;
+        if applied {
+            self.peers_dirty = false;
+        }
+        let mut others: Vec<String> = self
+            .open_docs
+            .keys()
+            .filter(|uri| uri.as_str() != except)
+            .cloned()
+            .collect();
+        others.sort();
+        PeerRefresh {
+            dirty,
+            supports_pull: self.client_supports_pull_diagnostics,
+            others,
+        }
+    }
+
     /// The daily-note setting the index should have: the configured aliases and `today`.
     fn wanted_daily(&self, today: chrono::NaiveDate) -> (satz_core::config::DailyNoteConfig, chrono::NaiveDate) {
         (self.config.daily_note.clone(), today)
@@ -625,7 +658,7 @@ impl SatzState {
         let Some(job) = self.prepare_reparse(uri) else {
             return;
         };
-        let new_doc = satz_core::parse_document(&job.content, &job.rel_path);
+        let new_doc = satz_core::parse_document_owned(job.content, &job.rel_path);
         self.apply_reparse(uri, job.version, new_doc);
     }
 
@@ -652,7 +685,7 @@ impl SatzState {
             .unwrap_or_default();
         let new_signature = match std::fs::read_to_string(&doc.path) {
             Ok(content) => {
-                let disk_doc = satz_core::parse_document(&content, &rel_path);
+                let disk_doc = satz_core::parse_document_owned(content, &rel_path);
                 let signature = peer_signature(&disk_doc);
                 self.index.replace_doc(disk_doc);
                 signature
@@ -1767,5 +1800,62 @@ mod tests {
         state.peers_dirty = false;
         state.sync_daily(day(2026, 3, 14));
         assert!(!state.peers_dirty);
+    }
+
+    // ---- what the other open documents are told after a change ----
+
+    fn three_open_docs() -> SatzState {
+        let mut state = SatzState::default();
+        state.vault_root = Some(PathBuf::from("/vault"));
+        for name in ["c", "a", "b"] {
+            state.open_document(
+                &format!("file:///{name}.md"),
+                "# T\n",
+                Path::new(&format!("/vault/{name}.md")),
+                1,
+            );
+        }
+        state.peers_dirty = false;
+        state
+    }
+
+    #[test]
+    fn nothing_dirty_means_nothing_to_tell_and_the_others_are_listed_in_order() {
+        let mut state = three_open_docs();
+        let peers = state.take_peer_refresh("file:///a.md", true);
+        assert!(!peers.dirty);
+        assert_eq!(peers.others, vec!["file:///b.md", "file:///c.md"]);
+    }
+
+    #[test]
+    fn a_dirty_flag_is_taken_once_when_the_change_took_effect() {
+        let mut state = three_open_docs();
+        state.peers_dirty = true;
+        state.client_supports_pull_diagnostics = true;
+        let peers = state.take_peer_refresh("file:///b.md", true);
+        assert!(peers.dirty && peers.supports_pull);
+        assert!(!state.peers_dirty, "taken");
+        assert!(!state.take_peer_refresh("file:///b.md", true).dirty, "and not told twice");
+    }
+
+    #[test]
+    fn a_change_that_did_not_take_effect_leaves_the_flag_for_the_one_that_did() {
+        let mut state = three_open_docs();
+        state.peers_dirty = true;
+        let peers = state.take_peer_refresh("file:///b.md", false);
+        assert!(!peers.dirty, "nothing to tell yet");
+        assert!(state.peers_dirty, "still pending");
+        assert!(state.take_peer_refresh("file:///b.md", true).dirty);
+    }
+
+    #[test]
+    fn the_changed_document_and_unknown_uris_are_handled() {
+        let mut state = three_open_docs();
+        let peers = state.take_peer_refresh("file:///nope.md", true);
+        assert_eq!(peers.others.len(), 3);
+        state.close_document("file:///a.md");
+        state.close_document("file:///b.md");
+        state.close_document("file:///c.md");
+        assert!(state.take_peer_refresh("file:///a.md", true).others.is_empty());
     }
 }

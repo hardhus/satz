@@ -55,7 +55,7 @@ Offered contextually depending on what's under the cursor/selection:
 
 ## Link resolution
 
-A link target is tried in one fixed order: the exact path, the path plus `.md`, the path ignoring letter case, the file name (the last path component, without `.md`), then a note's title or alias (case- and Unicode-folded, matched whole). Because the file name decides, the folder part of a `[[wrong-folder/note]]` is a hint only: it still reaches `other/note.md` when that is the only `note.md` (the Obsidian "shortest path" habit). A dot in a name is part of the name, not an extension: `[[2.0121]]` is the note called `2.0121`.
+A link target is tried in one fixed order: the exact path, the path plus `.md`, the path ignoring letter case, the file name (the last path component, without `.md`), then a note's title or alias (case- and Unicode-folded, matched whole). Because the file name decides, the folder part of a `[[wrong-folder/note]]` is a hint only: it still reaches `other/note.md` when that is the only `note.md` (the Obsidian "shortest path" habit). A dot in a name is part of the name, not an extension: `[[2.0121]]` is the note called `2.0121`. Names, titles, headings and tags are compared after Unicode normalization, so `dünya` typed precomposed matches a file or heading written with a combining diaeresis (what macOS file systems hand out).
 
 ## Daily-note aliases
 

@@ -1,3 +1,15 @@
+/// The text in Unicode normalization form C: `u` + U+0308 becomes `ü`. File systems and editors
+/// disagree on which spelling they hand out (macOS: decomposed), so every key and slug is made from
+/// the composed one and both spellings meet. Plain ASCII, the usual case, is borrowed untouched.
+fn composed(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.is_ascii() {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        use unicode_normalization::UnicodeNormalization;
+        std::borrow::Cow::Owned(text.nfc().collect())
+    }
+}
+
 /// Generates an Obsidian-compatible heading slug.
 /// e.g. "Merhaba Dünya! (2024)" -> "merhaba-dünya-2024"
 ///
@@ -7,6 +19,7 @@
 /// 3. Consecutive '-' characters collapsed into a single '-'
 /// 4. Leading and trailing '-' characters trimmed
 pub fn slugify(text: &str) -> String {
+    let text = composed(text);
     let mut slug = String::with_capacity(text.len());
     let mut prev_is_dash = false;
 
@@ -37,6 +50,7 @@ pub fn slugify(text: &str) -> String {
 
 /// Index anahtarları için birleşik katlama. slugify ile aynı İ/U+0307 davranışı.
 pub fn fold_key_ext(s: &str, turkish_i_folding: bool) -> String {
+    let s = composed(s);
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for c in s.trim().chars() {

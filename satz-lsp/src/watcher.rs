@@ -9,56 +9,94 @@ use tower_lsp_server::Client;
 
 use crate::state::SatzState;
 
-/// Spawns a background task that watches `vault_root` for `.md` file changes.
-pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client: Client) {
-    tracing::debug!(vault_root = %vault_root.display(), "watcher: spawning");
-    let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
+/// Lets the watcher of a vault be stopped: the file system thread ends and the debounce task with it.
+#[derive(Debug, Clone, Default)]
+pub struct WatcherHandle {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
 
-    // 1. Setup notify watcher
-    std::thread::spawn({
-        let vault_root = vault_root.clone();
-        move || {
-            let (event_tx, event_rx) = std::sync::mpsc::channel();
-            let mut watcher = match RecommendedWatcher::new(
-                event_tx,
-                notify::Config::default().with_poll_interval(Duration::from_millis(500)),
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("Failed to create file watcher: {}", e);
-                    return;
-                }
-            };
+impl WatcherHandle {
+    /// Asks the watcher to end. Harmless when called again or after it has ended.
+    pub fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
-            if let Err(e) = watcher.watch(&vault_root, RecursiveMode::Recursive) {
-                tracing::error!("Failed to watch vault root {}: {}", vault_root.display(), e);
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The thread that owns the `notify` watcher: it sends every relevant path it sees to `tx` and
+/// ends -- dropping the watcher and `tx` -- once the handle is stopped.
+pub(crate) fn spawn_notify_thread(
+    vault_root: PathBuf,
+    tx: mpsc::UnboundedSender<PathBuf>,
+    handle: WatcherHandle,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if handle.is_stopped() {
+            return;
+        }
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(
+            event_tx,
+            notify::Config::default().with_poll_interval(Duration::from_millis(500)),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("Failed to create file watcher: {}", e);
                 return;
             }
-            tracing::debug!(vault_root = %vault_root.display(), "watcher: now watching");
+        };
 
-            for res in event_rx {
-                match res {
-                    Ok(Event { paths, kind, .. }) => {
-                        tracing::trace!(?kind, ?paths, "watcher: raw fs event");
-                        if matches!(
-                            kind,
-                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                        ) {
-                            for path in paths {
-                                if is_relevant_path(&path, &vault_root) {
-                                    tracing::debug!(?path, "watcher: queued relevant change");
-                                    let _ = tx.send(path);
-                                }
+        if let Err(e) = watcher.watch(&vault_root, RecursiveMode::Recursive) {
+            tracing::error!("Failed to watch vault root {}: {}", vault_root.display(), e);
+            return;
+        }
+        tracing::debug!(vault_root = %vault_root.display(), "watcher: now watching");
+
+        while !handle.is_stopped() {
+            let res = match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(res) => res,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            match res {
+                Ok(Event { paths, kind, .. }) => {
+                    tracing::trace!(?kind, ?paths, "watcher: raw fs event");
+                    if matches!(
+                        kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) {
+                        for path in paths {
+                            if is_relevant_path(&path, &vault_root) {
+                                tracing::debug!(?path, "watcher: queued relevant change");
+                                let _ = tx.send(path);
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Watch error: {}", e);
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Watch error: {}", e);
                 }
             }
         }
-    });
+    })
+}
+
+/// Spawns a background task that watches `vault_root` for `.md` file changes. The returned handle
+/// stops it.
+pub fn spawn_watcher(
+    vault_root: PathBuf,
+    state: Arc<RwLock<SatzState>>,
+    client: Client,
+) -> WatcherHandle {
+    tracing::debug!(vault_root = %vault_root.display(), "watcher: spawning");
+    let handle = WatcherHandle::default();
+    let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
+
+    // 1. The file system thread
+    spawn_notify_thread(vault_root.clone(), tx, handle.clone());
 
     // 2. Debounce and process events in tokio runtime
     tokio::spawn(async move {
@@ -67,9 +105,11 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
 
         loop {
             tokio::select! {
-                Some(path) = rx.recv() => {
-                    pending.push(path, Instant::now());
-                }
+                message = rx.recv() => match message {
+                    Some(path) => pending.push(path, Instant::now()),
+                    // The file system thread has ended (stopped, or it could not watch): so does this.
+                    None => break,
+                },
                 _ = tokio::time::sleep(Duration::from_millis(50)), if !pending.is_empty() => {
                     let now = Instant::now();
                     for path in pending.take_ready(now, debounce_duration) {
@@ -82,6 +122,7 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
             }
         }
     });
+    handle
 }
 
 /// Collects file system events and hands each path out once it has been quiet for a while, so a
@@ -243,9 +284,9 @@ pub(crate) fn prepare_fs_change(path: &Path, vault_root: &Path) -> PreparedChang
             return PreparedChange::RemoveDoc(satz_core::DocId::new(rel));
         }
         return match std::fs::read_to_string(path) {
-            Ok(content) => {
-                PreparedChange::Doc(Box::new(satz_core::parse_document(&content, &rel_path)))
-            }
+            Ok(content) => PreparedChange::Doc(Box::new(satz_core::parse_document_owned(
+                content, &rel_path,
+            ))),
             Err(_) => PreparedChange::Skip,
         };
     }
@@ -1175,5 +1216,75 @@ today = [\"heute\"]
         let change = apply_prepared(&mut state, Path::new("/v/x.txt"), PreparedChange::Skip);
         assert_eq!(change, FsChange::Skipped);
         assert_eq!(state.index.revision(), before);
+    }
+
+    // ---- the watcher can be stopped ----
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "timed out: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn the_notify_thread_reports_changes_and_ends_when_stopped() {
+        let v = TempVault::new("stop");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = WatcherHandle::default();
+        let thread = spawn_notify_thread(v.0.clone(), tx, handle.clone());
+        std::thread::sleep(Duration::from_millis(300)); // let it start watching
+
+        std::fs::write(v.0.join("first.md"), "# one\n").unwrap();
+        let mut seen = Vec::new();
+        wait_until("an event for first.md", || {
+            while let Ok(path) = rx.try_recv() {
+                seen.push(path);
+            }
+            seen.iter().any(|p| p.ends_with("first.md"))
+        });
+
+        handle.stop();
+        wait_until("the thread to end", || thread.is_finished());
+        thread.join().unwrap();
+
+        std::fs::write(v.0.join("second.md"), "# two\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(path) = rx.try_recv() {
+            assert!(
+                !path.ends_with("second.md"),
+                "an event after the stop: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_before_or_after_the_thread_ran_is_harmless() {
+        let v = TempVault::new("stop-early");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handle = WatcherHandle::default();
+        handle.stop();
+        handle.stop();
+        let thread = spawn_notify_thread(v.0.clone(), tx, handle.clone());
+        wait_until("the thread to end", || thread.is_finished());
+        assert!(handle.is_stopped());
+        handle.stop();
+    }
+
+    #[test]
+    fn a_missing_vault_root_ends_the_thread_at_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let missing = std::env::temp_dir().join("satz_watch_does_not_exist_xyz");
+        let thread = spawn_notify_thread(missing, tx, WatcherHandle::default());
+        wait_until("the thread to end", || thread.is_finished());
+        // The channel is closed with it: nothing is left listening on a dead watcher.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 }

@@ -32,12 +32,22 @@ pub struct LineIndex {
 impl LineIndex {
     /// Builds a new `LineIndex` from the given source string.
     pub fn new(source: &str) -> Self {
-        Self::with_limit(source, u64::from(u32::MAX))
+        Self::from_string(source.to_string())
+    }
+
+    /// Like `new`, for text the caller owns: it is kept as it is instead of being copied.
+    pub fn from_string(source: String) -> Self {
+        Self::with_limit_owned(source, u64::from(u32::MAX))
     }
 
     /// Like `new`, but only lines starting at a byte offset `<= limit` get their own entry; the rest
     /// of the text is one long last line (offsets are `u32`, so `new` passes `u32::MAX`).
+    #[cfg(test)]
     fn with_limit(source: &str, limit: u64) -> Self {
+        Self::with_limit_owned(source.to_string(), limit)
+    }
+
+    fn with_limit_owned(source: String, limit: u64) -> Self {
         let mut line_starts = vec![0];
         for (i, b) in source.bytes().enumerate() {
             if b == b'\n' {
@@ -54,7 +64,7 @@ impl LineIndex {
         }
         Self {
             line_starts,
-            source: source.to_string(),
+            source,
         }
     }
 

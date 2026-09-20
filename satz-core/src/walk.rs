@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 use crate::model::Document;
-use crate::parser::parse_document;
+use crate::parser::parse_document_owned;
 
 pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -102,7 +102,7 @@ pub fn walk_subtree(vault_root: &Path, dir: &Path) -> Result<Vec<Document>> {
         .filter_map(|path| match std::fs::read_to_string(path) {
             Ok(source) => {
                 let rel_path = path.strip_prefix(vault_root).unwrap_or(path);
-                Some(parse_document(&source, rel_path))
+                Some(parse_document_owned(source, rel_path))
             }
             Err(e) => {
                 tracing::warn!("failed to read markdown file {}: {}", path.display(), e);

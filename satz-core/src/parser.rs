@@ -126,6 +126,16 @@ pub fn content_hash(source: &str) -> u64 {
     hasher.finish()
 }
 
+/// `parse_document` for text the caller owns: the text moves into the document instead of being copied.
+pub fn parse_document_owned(mut source: String, path: &Path) -> Document {
+    // A leading UTF-8 byte order mark is a property of the file, not content: it must not stop the
+    // frontmatter fence from being recognised or shift the first line.
+    if source.starts_with('\u{feff}') {
+        source.drain(..'\u{feff}'.len_utf8());
+    }
+    parse_prepared(source, path)
+}
+
 /// Parses a single Markdown source text into a complete `Document`.
 ///
 /// This is the primary single-file entry point in `satz-core`.
@@ -134,14 +144,16 @@ pub fn content_hash(source: &str) -> u64 {
 ///
 /// Never panics; if frontmatter has YAML syntax errors, it falls back to empty frontmatter.
 pub fn parse_document(source: &str, path: &Path) -> Document {
-    // A leading UTF-8 byte order mark is a property of the file, not content: it must not stop the
-    // frontmatter fence from being recognised or shift the first line.
-    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
-    let line_index = LineIndex::new(source);
+    parse_document_owned(source.to_string(), path)
+}
 
+/// The parse itself, of text that has no byte order mark any more. The text ends up in the
+/// document's `LineIndex`, moved there once everything has been read from it.
+fn parse_prepared(text: String, path: &Path) -> Document {
+    let source = text.as_str();
     let content_hash = content_hash(source);
 
-    let structure = structure::parse_structure(source);
+    let mut structure = structure::parse_structure(source);
 
     // A block that cannot be read is treated as empty (nothing of it is used) but the reason is kept,
     // so it can be shown to the user instead of silently dropping their title, aliases and tags.
@@ -153,7 +165,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         None => (Default::default(), None),
     };
 
-    let mut code_spans = structure.code_spans.clone();
+    let mut code_spans = std::mem::take(&mut structure.code_spans);
     if let Some(fm_range) = structure.frontmatter_range {
         code_spans.push(fm_range);
     }
@@ -232,7 +244,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
         footnotes,
         broken_footnote_refs,
         blocks: inline.blocks,
-        line_index,
+        line_index: LineIndex::from_string(text),
         content_hash,
     }
 }
