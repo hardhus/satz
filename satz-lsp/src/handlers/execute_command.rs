@@ -69,6 +69,23 @@ pub fn show_backlinks(
     Ok(locations)
 }
 
+/// Runs the commands that only read state. `None`: not one of them (the caller handles it, or
+/// rejects it as unknown); `Some(Err(reason))`: unusable arguments.
+pub fn run_read_only_command(
+    state: &SatzState,
+    command: &str,
+    arguments: &[serde_json::Value],
+) -> Option<Result<serde_json::Value, String>> {
+    match command {
+        SHOW_BACKLINKS_COMMAND => {
+            Some(show_backlinks(state, arguments).map(|locations| {
+                serde_json::to_value(locations).unwrap_or(serde_json::Value::Null)
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// One document's computed formatting result: its client URI, the full replacement text (used to
 /// keep an open document's in-memory rope in sync after the client confirms the edit), and the
 /// minimal set of line-range `TextEdit`s that turn its current content into the formatted version.
@@ -430,6 +447,59 @@ mod tests {
         ] {
             let err = show_backlinks(&state, &args).unwrap_err();
             assert!(!err.is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_read_only_command_answers_with_a_json_array_of_locations() {
+        let state = state_with(vec![
+            parse_document("# A\n", Path::new("a.md")),
+            parse_document("see [[a]]\n", Path::new("b.md")),
+        ]);
+        let answer = run_read_only_command(
+            &state,
+            SHOW_BACKLINKS_COMMAND,
+            &[serde_json::json!(uri_for("a.md"))],
+        )
+        .expect("the command is handled")
+        .expect("valid arguments");
+        let list = answer.as_array().expect("an array");
+        assert_eq!(list.len(), 1);
+        assert!(list[0]["uri"].as_str().unwrap().ends_with("b.md"));
+        assert_eq!(list[0]["range"]["start"]["line"], 0);
+        assert_eq!(list[0]["range"]["start"]["character"], 4);
+        assert_eq!(list[0]["range"]["end"]["character"], 9);
+    }
+
+    #[test]
+    fn bad_arguments_are_an_error_and_other_commands_are_not_handled_here() {
+        let state = state_with(vec![parse_document("# A\n", Path::new("a.md"))]);
+        let err = run_read_only_command(&state, SHOW_BACKLINKS_COMMAND, &[])
+            .expect("handled")
+            .unwrap_err();
+        assert!(!err.is_empty());
+        for other in [
+            FORMAT_WORKSPACE_COMMAND,
+            "satz.unknown",
+            "",
+            "SATZ.SHOWBACKLINKS",
+        ] {
+            assert!(
+                run_read_only_command(&state, other, &[]).is_none(),
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_advertised_command_is_handled_somewhere() {
+        let state = state_with(vec![parse_document("# A\n", Path::new("a.md"))]);
+        for command in SUPPORTED_COMMANDS {
+            let read_only = run_read_only_command(&state, command, &[]).is_some();
+            assert!(
+                read_only || command == FORMAT_WORKSPACE_COMMAND,
+                "{command} is advertised but nothing handles it"
+            );
         }
     }
 }

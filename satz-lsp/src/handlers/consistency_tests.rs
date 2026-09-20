@@ -4,15 +4,16 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use crate::handlers::{
-    diagnostics::compute_diagnostics, document_highlight::document_highlight,
-    document_link::document_link, inlay_hint::inlay_hint,
+    code_action::code_action, diagnostics::compute_diagnostics,
+    document_highlight::document_highlight, document_link::document_link, inlay_hint::inlay_hint,
 };
 use crate::state::{OpenDocument, SatzState};
 use satz_core::{Index, VaultConfig, parse_document};
 use std::path::Path;
 use tower_lsp_server::ls_types::{
-    DocumentHighlightParams, DocumentLinkParams, InlayHintLabel, InlayHintParams, Position, Range,
-    TextDocumentIdentifier, TextDocumentPositionParams,
+    CodeActionOrCommand, CodeActionParams, DocumentHighlightParams, DocumentLinkParams,
+    InlayHintLabel, InlayHintParams, Position, Range, TextDocumentIdentifier,
+    TextDocumentPositionParams,
 };
 
 /// What each handler says about the first link of the opened note.
@@ -26,6 +27,8 @@ struct Verdict {
     hints: Vec<String>,
     /// Number of highlights when the cursor is on the first link.
     highlights: usize,
+    /// "Create note" code actions offered with the cursor on the first link.
+    create_note: usize,
 }
 
 fn judge(open: &str, files: &[(&str, &str)], config: VaultConfig) -> Verdict {
@@ -116,11 +119,35 @@ fn judge(open: &str, files: &[(&str, &str)], config: VaultConfig) -> Verdict {
     )
     .map_or(0, |h| h.len());
 
+    let create_note = code_action(
+        CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.parse().unwrap(),
+            },
+            range: Range::new(
+                Position::new(start.line, start.character + 1),
+                Position::new(start.line, start.character + 1),
+            ),
+            context: Default::default(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+        &state,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|a| match a {
+        CodeActionOrCommand::CodeAction(a) => a.title.starts_with("Create note"),
+        CodeActionOrCommand::Command(_) => false,
+    })
+    .count();
+
     Verdict {
         diagnostics,
         link_targets,
         hints,
         highlights,
+        create_note,
     }
 }
 
@@ -144,6 +171,7 @@ fn a_folder_relative_markdown_link_is_resolved_by_every_handler() {
     assert_eq!(v.hints.len(), 2);
     assert!(v.hints.iter().all(|h| !h.contains('⚠')), "{:?}", v.hints);
     assert_eq!(v.highlights, 2, "both links to b.md are highlighted");
+    assert_eq!(v.create_note, 0);
 }
 
 #[test]
@@ -153,6 +181,8 @@ fn a_link_that_leaves_the_vault_is_broken_everywhere() {
     assert_eq!(v.diagnostics, vec!["broken-link"]);
     assert!(v.link_targets.is_empty(), "{:?}", v.link_targets);
     assert_eq!(v.hints, vec![" ⚠ not found"]);
+    // Broken, but a note outside the vault must not be offered for creation either.
+    assert_eq!(v.create_note, 0);
 }
 
 #[test]
@@ -167,6 +197,7 @@ fn a_relative_daily_alias_is_resolved_by_every_handler() {
     assert_eq!(v.hints.len(), 2);
     assert!(v.hints.iter().all(|h| !h.contains('⚠')), "{:?}", v.hints);
     assert_eq!(v.highlights, 2);
+    assert_eq!(v.create_note, 0, "a resolved daily alias needs no new note");
 }
 
 #[test]
@@ -219,4 +250,16 @@ fn the_same_file_name_in_two_folders_is_told_apart_by_every_handler() {
     assert_eq!(v.diagnostics, Vec::<String>::new());
     assert_eq!(v.link_targets, vec!["b.md", "b.md"]);
     assert_eq!(v.highlights, 1, "only the link to sub/b.md itself");
+}
+
+#[test]
+fn a_really_missing_note_is_reported_and_offered_for_creation() {
+    for link in ["[[ghost]]", "[t](ghost.md)"] {
+        let files = [("a.md", format!("{link}\n"))];
+        let refs: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        let v = judge("a.md", &refs, daily_config());
+        assert_eq!(v.diagnostics, vec!["broken-link"], "{link}");
+        assert_eq!(v.create_note, 1, "{link}");
+        assert_eq!(v.hints, vec![" ⚠ not found"], "{link}");
+    }
 }

@@ -23,12 +23,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     let pos = params.text_document_position.position;
     tracing::debug!(uri, ?pos, "completion");
 
-    let open_doc = state.open_docs.get(uri)?;
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (open_doc, doc) = state.doc_for_uri(uri)?;
 
     // Byte-offset/text-scan against the LIVE rope, not `doc.line_index`: `doc` is the
     // debounced (200-500ms) reparse snapshot, but completion re-fires immediately on every
@@ -70,7 +65,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
         if let Some((target_doc_str, heading_or_block)) = inside_wikilink.split_once('#') {
             let heading_or_block_start = inside_wikilink_start + target_doc_str.len() + 1;
             let target_id = if target_doc_str.is_empty() {
-                &doc_id
+                &doc.id
             } else if let Some(resolved) = state.index.resolve_link(target_doc_str) {
                 resolved
             } else {

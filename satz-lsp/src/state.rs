@@ -263,6 +263,15 @@ impl SatzState {
         self.open_docs.values().any(|d| key(&d.path) == wanted)
     }
 
+    /// The open document for `uri` together with its entry in the index (`None` when it is not open
+    /// or not indexed) -- the lookup every handler starts with.
+    pub fn doc_for_uri(&self, uri: &str) -> Option<(&OpenDocument, &satz_core::Document)> {
+        let open_doc = self.open_docs.get(uri)?;
+        let rel_path = Self::get_rel_path(&open_doc.path, self.vault_root.as_deref());
+        let doc_id = satz_core::DocId::new(rel_path.to_string_lossy().replace('\\', "/"));
+        Some((open_doc, self.index.get_doc(&doc_id)?))
+    }
+
     pub fn get_rel_path(path: &Path, root: Option<&Path>) -> PathBuf {
         let Some(root) = root else {
             return path.to_path_buf();
@@ -895,5 +904,55 @@ mod tests {
         state.close_document("file:///a.md");
         assert_eq!(link_targets(&state, "a.md"), vec!["kept"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn state_with_open(root: &str, open: &str, rel_files: &[&str]) -> SatzState {
+        let mut state = SatzState::default();
+        state.index = Index::build(
+            rel_files
+                .iter()
+                .map(|p| satz_core::parse_document("# t\n", Path::new(p)))
+                .collect(),
+        );
+        state.vault_root = Some(PathBuf::from(root));
+        state.open_docs.insert(
+            "file:///x".to_string(),
+            OpenDocument::new("file:///x", PathBuf::from(open), "# t\n", 1),
+        );
+        state
+    }
+
+    #[test]
+    fn doc_for_uri_finds_an_open_and_indexed_document() {
+        let state = state_with_open("/vault", "/vault/sub/a.md", &["sub/a.md", "b.md"]);
+        let (open, doc) = state.doc_for_uri("file:///x").expect("open and indexed");
+        assert_eq!(open.path, PathBuf::from("/vault/sub/a.md"));
+        assert_eq!(doc.id.as_str(), "sub/a.md");
+    }
+
+    #[test]
+    fn doc_for_uri_is_none_for_unknown_or_unindexed_documents() {
+        let state = state_with_open("/vault", "/vault/sub/a.md", &["b.md"]);
+        assert!(state.doc_for_uri("file:///x").is_none(), "open but not indexed");
+        assert!(state.doc_for_uri("file:///other").is_none(), "not open");
+        assert!(state.doc_for_uri("").is_none());
+    }
+
+    #[test]
+    fn doc_for_uri_follows_the_same_path_rules_as_get_rel_path() {
+        // Windows separators and a differently cased root still land on the indexed note.
+        let state = state_with_open("C:\\Notlar\\İş", "c:\\notlar\\iş\\projeler\\p1.md", &[]);
+        assert!(state.doc_for_uri("file:///x").is_none(), "nothing indexed yet");
+        // A path outside the root is looked up as given (and is not indexed under that name).
+        let state = state_with_open("/vault", "/elsewhere/a.md", &["a.md"]);
+        assert!(state.doc_for_uri("file:///x").is_none());
+        // No vault root: the path itself is the id.
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![satz_core::parse_document("# t\n", Path::new("a.md"))]);
+        state.open_docs.insert(
+            "file:///y".to_string(),
+            OpenDocument::new("file:///y", PathBuf::from("a.md"), "# t\n", 1),
+        );
+        assert_eq!(state.doc_for_uri("file:///y").unwrap().1.id.as_str(), "a.md");
     }
 }

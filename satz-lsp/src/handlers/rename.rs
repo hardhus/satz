@@ -81,12 +81,7 @@ pub fn prepare_rename(
     let pos = params.position;
     tracing::debug!(uri, ?pos, "prepare_rename");
 
-    let open_doc = state.open_docs.get(uri)?;
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (_, doc) = state.doc_for_uri(uri)?;
 
     let satz_pos = lsp_pos_to_satz(pos);
     let byte_offset = doc.line_index.position_to_byte(satz_pos);
@@ -129,14 +124,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
     let new_name = params.new_name.trim();
     tracing::debug!(uri, ?pos, new_name, "rename");
 
-    let Some(open_doc) = state.open_docs.get(uri) else {
-        return Ok(None);
-    };
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let Some(doc) = state.index.get_doc(&doc_id) else {
+    let Some((_, doc)) = state.doc_for_uri(uri) else {
         return Ok(None);
     };
 
@@ -146,7 +134,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
     // 1. Cursor on a heading definition
     if let Some(h) = doc.headings.iter().find(|h| h.range.contains(byte_offset)) {
         validate_heading_name(new_name)?;
-        return Ok(rename_heading(state, &doc_id, doc, h, new_name));
+        return Ok(rename_heading(state, &doc.id, doc, h, new_name));
     }
 
     // 2. Cursor on a link
@@ -157,7 +145,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
     // A) A link with a heading renames that heading, wherever it is defined.
     if let Some(target_heading) = &link.target_heading {
         let target_id = if link.target_doc.is_empty() {
-            &doc_id
+            &doc.id
         } else {
             state.index.resolve_link(&link.target_doc).ok_or_else(|| {
                 format!("cannot rename: note '{}' does not exist", link.target_doc)
@@ -1478,5 +1466,22 @@ mod tests {
         };
         let out = rename(params, &state);
         assert!(out.is_err(), "{out:?}");
+    }
+
+    #[test]
+    fn renaming_from_a_nested_link_renames_the_innermost_one() {
+        let v = vault(&[
+            ("a.md", "[see [[inner#Head]]](outer.md#Top)\n"),
+            ("inner.md", "# Head\n"),
+            ("outer.md", "# Top\n"),
+        ]);
+        assert_eq!(
+            v.text_after("a.md", 0, 10, "Renamed"),
+            "[see [[inner#Renamed]]](outer.md#Top)\n"
+        );
+        // The label text and the destination belong to the outer link.
+        let after_outer = v.text_after("a.md", 0, 30, "Other");
+        assert!(after_outer.contains("[[inner#Head]]"), "{after_outer}");
+        assert!(after_outer.contains("Other"), "{after_outer}");
     }
 }

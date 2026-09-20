@@ -183,12 +183,7 @@ pub fn semantic_tokens_full(
 ) -> Option<SemanticTokensResult> {
     let uri = params.text_document.uri.as_str();
     tracing::debug!(uri, "semantic_tokens_full");
-    let open_doc = state.open_docs.get(uri)?;
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (_, doc) = state.doc_for_uri(uri)?;
 
     let mut raw_tokens: Vec<RawToken> = Vec::new();
 

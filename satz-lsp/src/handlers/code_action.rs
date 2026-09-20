@@ -55,12 +55,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
     let uri = params.text_document.uri.as_str();
     tracing::debug!(uri, "code_action");
 
-    let open_doc = state.open_docs.get(uri)?;
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (_, doc) = state.doc_for_uri(uri)?;
 
     let satz_start = lsp_pos_to_satz(params.range.start);
     let satz_end = lsp_pos_to_satz(params.range.end);
@@ -85,7 +80,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
             LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
         ) && !satz_core::model::link::is_external_target(&link.target_doc)
         {
-            match state.index.resolve_link_full(link, Some(doc)) {
+            match state.resolve(link, doc) {
                 satz_core::LinkResolution::DocMissing if !link.target_doc.is_empty() => {
                     let components = note_components(&link.target_doc);
                     let target_path = components.as_ref().map(|parts| {

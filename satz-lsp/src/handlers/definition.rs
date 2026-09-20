@@ -18,11 +18,7 @@ pub fn goto_definition(
     tracing::debug!(uri, ?pos, "goto_definition");
 
     // Get the current document
-    let open_doc = state.open_docs.get(uri)?;
-    let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (_, doc) = state.doc_for_uri(uri)?;
 
     // Convert position to byte offset
     let satz_pos = lsp_pos_to_satz(pos);

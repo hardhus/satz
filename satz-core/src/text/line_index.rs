@@ -32,13 +32,23 @@ pub struct LineIndex {
 impl LineIndex {
     /// Builds a new `LineIndex` from the given source string.
     pub fn new(source: &str) -> Self {
+        Self::with_limit(source, u64::from(u32::MAX))
+    }
+
+    /// Like `new`, but only lines starting at a byte offset `<= limit` get their own entry; the rest
+    /// of the text is one long last line (offsets are `u32`, so `new` passes `u32::MAX`).
+    fn with_limit(source: &str, limit: u64) -> Self {
         let mut line_starts = vec![0];
         for (i, b) in source.bytes().enumerate() {
             if b == b'\n' {
-                // A document past 4 GiB keeps the lines it can address; the rest is one long last line.
-                let Ok(start) = u32::try_from(i + 1) else {
+                // Offsets are stored as `u32`: never truncate one, stop at the limit instead.
+                let start = (i + 1) as u64;
+                let Ok(start) = u32::try_from(start) else {
                     break;
                 };
+                if u64::from(start) > limit {
+                    break;
+                }
                 line_starts.push(start);
             }
         }
@@ -301,6 +311,56 @@ mod tests {
                 };
                 assert_eq!(back, expected, "{text:?} @ {byte}");
             }
+        }
+    }
+
+    #[test]
+    fn lines_beyond_the_offset_limit_become_one_long_last_line() {
+        let text = "a\nb\nc\nd\n";
+        let limited = LineIndex::with_limit(text, 4);
+        // Line starts at 0, 2 and 4 fit; the ones at 6 and 8 do not.
+        assert_eq!(limited.line_count(), 3);
+        assert_eq!(limited.position_to_byte(Position::new(2, 0)), 4);
+        assert_eq!(limited.position_to_byte(Position::new(3, 0)), text.len());
+        assert_eq!(limited.byte_to_position(4), Position::new(2, 0));
+        // Offsets past the limit map onto the last kept line without panicking.
+        for byte in 0..=text.len() {
+            let pos = limited.byte_to_position(byte);
+            assert!((pos.line as usize) < limited.line_count());
+            assert!(limited.position_to_byte(pos) <= text.len());
+        }
+        // The kept prefix behaves exactly like an unlimited index.
+        let full = LineIndex::new(text);
+        for byte in 0..=4 {
+            assert_eq!(limited.byte_to_position(byte), full.byte_to_position(byte));
+        }
+    }
+
+    #[test]
+    fn a_limit_of_zero_keeps_a_single_line_and_a_huge_limit_changes_nothing() {
+        let text = "x\ny\n";
+        assert_eq!(LineIndex::with_limit(text, 0).line_count(), 1);
+        assert_eq!(LineIndex::with_limit(text, u64::MAX), LineIndex::new(text));
+        assert_eq!(LineIndex::with_limit("", 0).line_count(), 1);
+    }
+
+    #[test]
+    fn the_normal_constructor_is_the_unlimited_one_on_varied_text() {
+        // Deterministic pseudo-random mixes of LF, CRLF, emoji and Turkish letters.
+        let pieces = ["a", "\n", "\r\n", "😀", "ığ", " ", "[[x]]", "\n\n", "é"];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..200 {
+            let mut text = String::new();
+            for _ in 0..40 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                text.push_str(pieces[(seed % pieces.len() as u64) as usize]);
+            }
+            let index = LineIndex::new(&text);
+            assert_eq!(index, LineIndex::with_limit(&text, u64::MAX));
+            let expected = 1 + text.bytes().filter(|&b| b == b'\n').count();
+            assert_eq!(index.line_count(), expected);
         }
     }
 }

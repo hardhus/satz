@@ -2,9 +2,11 @@ use chrono::Local;
 
 /// Generates a standard frontmatter block with title, date, aliases, and tags.
 pub fn generate_frontmatter_block(title: &str, date: Option<&str>) -> String {
+    // Only a real `YYYY-MM-DD` date is written as given: anything else (a made-up day, free text, a
+    // value with a line break that would add YAML keys) falls back to today.
     let date_str = match date {
-        Some(d) => d.to_string(),
-        None => Local::now().format("%Y-%m-%d").to_string(),
+        Some(d) if is_iso_date(d) => d.to_string(),
+        _ => Local::now().format("%Y-%m-%d").to_string(),
     };
 
     format!(
@@ -12,6 +14,18 @@ pub fn generate_frontmatter_block(title: &str, date: Option<&str>) -> String {
         yaml_scalar(title),
         date_str
     )
+}
+
+/// Exactly `YYYY-MM-DD` (ASCII digits, zero padded) and a day that exists in the calendar.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
 }
 
 /// Generates complete initial document content with frontmatter and H1 heading.
@@ -274,5 +288,83 @@ mod tests {
             doc,
             "---\ntitle: My Note\ndate: 2026-08-30\naliases: []\ntags: []\n---\n\n# My Note\n"
         );
+    }
+
+    /// The `date:` value of a generated frontmatter block.
+    fn date_of(date: Option<&str>) -> String {
+        let block = generate_frontmatter_block("T", date);
+        block
+            .lines()
+            .find_map(|l| l.strip_prefix("date: "))
+            .expect("a date line")
+            .to_string()
+    }
+
+    fn today() -> String {
+        Local::now().format("%Y-%m-%d").to_string()
+    }
+
+    /// `today()` read before and after, so a midnight rollover cannot fail the test.
+    fn is_today(value: &str, before: &str) -> bool {
+        value == before || value == today()
+    }
+
+    #[test]
+    fn a_real_date_is_written_as_given() {
+        assert_eq!(date_of(Some("2026-01-31")), "2026-01-31");
+        assert_eq!(date_of(Some("2024-02-29")), "2024-02-29");
+        assert_eq!(date_of(Some("0001-01-01")), "0001-01-01");
+    }
+
+    #[test]
+    fn anything_that_is_not_a_real_date_becomes_today() {
+        for bad in [
+            "2026-02-30",
+            "2023-02-29",
+            "2026-13-01",
+            "",
+            " ",
+            "tomorrow",
+            "2026-1-5",
+            "20260105",
+            "2026-01-05 ",
+            "2026-01-05T10:00",
+            "٢٠٢٦-٠١-٠١",
+        ] {
+            let before = today();
+            let value = date_of(Some(bad));
+            assert!(is_today(&value, &before), "{bad:?} gave {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_date_cannot_inject_frontmatter_keys() {
+        for evil in [
+            "2026-01-01\naliases: [evil]",
+            "2026-01-01\r\ntags: [x]",
+            "x\n---\n# Injected",
+            "2026-01-01: y",
+            "[a, b]",
+        ] {
+            let doc = generate_document_template("Safe", Some(evil));
+            let parsed = crate::parse_document(&doc, Path::new("safe.md"));
+            assert_eq!(parsed.frontmatter_error, None, "{evil:?}");
+            assert!(parsed.frontmatter.aliases.is_empty(), "{evil:?}");
+            assert!(parsed.frontmatter.tags.is_empty(), "{evil:?}");
+            assert_eq!(parsed.title, "Safe", "{evil:?}");
+            assert_eq!(parsed.headings.len(), 1, "{evil:?}");
+        }
+    }
+
+    #[test]
+    fn no_date_means_today_and_every_block_is_valid_yaml() {
+        let before = today();
+        assert!(is_today(&date_of(None), &before));
+        for date in [None, Some("2026-05-05"), Some("garbage")] {
+            let doc = generate_document_template("A: b", date);
+            let parsed = crate::parse_document(&doc, Path::new("a.md"));
+            assert_eq!(parsed.frontmatter_error, None);
+            assert_eq!(parsed.title, "A: b");
+        }
     }
 }

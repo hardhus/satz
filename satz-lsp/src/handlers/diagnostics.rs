@@ -17,15 +17,8 @@ pub fn pull_document_diagnostics(uri: &str, state: &SatzState) -> Vec<lsp::Diagn
         return Vec::new();
     }
 
-    let Some(open_doc) = state.open_docs.get(uri) else {
-        return Vec::new();
-    };
-    let rel_path = SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-
-    match state.index.get_doc(&doc_id) {
-        Some(doc) => compute_diagnostics(doc, &state.index, &state.config),
+    match state.doc_for_uri(uri) {
+        Some((_, doc)) => compute_diagnostics(doc, &state.index, &state.config),
         None => Vec::new(),
     }
 }

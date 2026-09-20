@@ -645,15 +645,18 @@ impl LanguageServer for Backend {
         params: ExecuteCommandParams,
     ) -> jsonrpc::Result<Option<serde_json::Value>> {
         tracing::debug!(command = %params.command, "execute_command");
-        if params.command == crate::handlers::execute_command::SHOW_BACKLINKS_COMMAND {
+        {
             let state = self.state.read().await;
-            return match crate::handlers::execute_command::show_backlinks(&state, &params.arguments)
-            {
-                Ok(locations) => Ok(Some(
-                    serde_json::to_value(locations).unwrap_or(serde_json::Value::Null),
-                )),
-                Err(reason) => Err(jsonrpc::Error::invalid_params(reason)),
-            };
+            if let Some(answer) = crate::handlers::execute_command::run_read_only_command(
+                &state,
+                &params.command,
+                &params.arguments,
+            ) {
+                return match answer {
+                    Ok(value) => Ok(Some(value)),
+                    Err(reason) => Err(jsonrpc::Error::invalid_params(reason)),
+                };
+            }
         }
         if params.command != crate::handlers::execute_command::FORMAT_WORKSPACE_COMMAND {
             return Err(jsonrpc::Error::method_not_found());

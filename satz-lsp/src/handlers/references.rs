@@ -82,13 +82,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
     let pos = params.text_document_position.position;
     tracing::debug!(uri, ?pos, "find_references");
 
-    let open_doc = state.open_docs.get(uri)?;
-
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (_, doc) = state.doc_for_uri(uri)?;
 
     let satz_pos = lsp_pos_to_satz(pos);
     let byte_offset = doc.line_index.position_to_byte(satz_pos);
@@ -555,5 +549,40 @@ mod tests {
             refs(&docs, "b.md", (0, 2), true),
             vec![at("a.md", 0), at("b.md", 0), at("b.md", 0)]
         );
+    }
+
+    #[test]
+    fn references_from_a_nested_link_follow_the_innermost_link() {
+        let files = [
+            ("a.md", "[see [[inner]]](outer.md)\n"),
+            ("inner.md", "# inner\n"),
+            ("outer.md", "# outer\n"),
+            ("uses_inner.md", "[[inner]]\n"),
+            ("uses_outer.md", "[[outer]]\n"),
+        ];
+        let names = |found: Vec<(String, u32)>| -> Vec<String> {
+            let mut v: Vec<String> = found.into_iter().map(|(f, _)| f).collect();
+            v.sort();
+            v
+        };
+        let inner = names(refs(&files, "a.md", (0, 8), false));
+        assert_eq!(inner, vec!["a.md", "uses_inner.md"]);
+        let outer = names(refs(&files, "a.md", (0, 2), false));
+        assert_eq!(outer, vec!["a.md", "uses_outer.md"]);
+    }
+
+    #[test]
+    fn a_block_reference_matches_its_definition_ignoring_case() {
+        let files = [("a.md", "para ^abc\n"), ("b.md", "see [[a#^ABC]]\n")];
+        let mut found = refs(&files, "b.md", (0, 7), true);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![("a.md".to_string(), 0), ("b.md".to_string(), 0)]
+        );
+        // From the definition side too.
+        let mut back = refs(&files, "a.md", (0, 7), true);
+        back.sort();
+        assert_eq!(back, vec![("a.md".to_string(), 0), ("b.md".to_string(), 0)]);
     }
 }

@@ -163,12 +163,7 @@ pub fn document_highlight(
     tracing::debug!(uri, "document_highlight");
     let pos = params.text_document_position_params.position;
 
-    let open_doc = state.open_docs.get(uri)?;
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (_, doc) = state.doc_for_uri(uri)?;
 
     let satz_pos = lsp_pos_to_satz(pos);
     let byte_offset = doc.line_index.position_to_byte(satz_pos);
@@ -503,6 +498,18 @@ mod behavior_tests {
         );
         assert_eq!(one(text, (99, 0)), None);
         assert_eq!(one("", (0, 0)), None);
+    }
+
+    #[test]
+    fn a_link_inside_a_link_label_highlights_as_the_inner_link() {
+        let text = "[see [[inner]]](outer.md) and [[inner]]
+";
+        assert_eq!(
+            one(text, (0, 8)),
+            Some(vec![(0, 5, 14, false), (0, 30, 39, false)])
+        );
+        assert_eq!(one(text, (0, 2)), Some(vec![(0, 0, 25, false)]));
+        assert_eq!(one(text, (0, 20)), Some(vec![(0, 0, 25, false)]));
     }
 
     #[test]

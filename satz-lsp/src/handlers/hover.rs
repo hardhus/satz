@@ -15,12 +15,7 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
     let pos = params.text_document_position_params.position;
     tracing::debug!(uri, ?pos, "hover");
 
-    let open_doc = state.open_docs.get(uri)?;
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
-    let doc = state.index.get_doc(&doc_id)?;
+    let (_, doc) = state.doc_for_uri(uri)?;
 
     let satz_pos = lsp_pos_to_satz(pos);
     let byte_offset = doc.line_index.position_to_byte(satz_pos);
@@ -696,5 +691,79 @@ mod tests {
         let out = format_hover_content(&target, &link, Some("Nope"), 8);
         assert!(out.contains("⚠ 'Nope' not found"), "{out}");
         assert!(!out.contains("bulunamadı"), "{out}");
+    }
+
+    /// The hover text at `at` in `open`, with `files` indexed under a vault root.
+    fn hover_text(files: &[(&str, &str)], open: &str, at: (u32, u32)) -> Option<String> {
+        let root = if cfg!(windows) {
+            Path::new("C:\\vault").to_path_buf()
+        } else {
+            Path::new("/vault").to_path_buf()
+        };
+        let mut state = SatzState::default();
+        state.index = Index::build(
+            files
+                .iter()
+                .map(|(p, t)| parse_document(t, Path::new(p)))
+                .collect(),
+        );
+        state.vault_root = Some(root.clone());
+        let uri = crate::convert::path_to_uri(&root.join(open))
+            .unwrap()
+            .as_str()
+            .to_string();
+        let text = files.iter().find(|(p, _)| *p == open).unwrap().1;
+        state.open_docs.insert(
+            uri.clone(),
+            crate::state::OpenDocument::new(&uri, root.join(open), text, 1),
+        );
+        let params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                position: tower_lsp_server::ls_types::Position::new(at.0, at.1),
+            },
+            work_done_progress_params: Default::default(),
+        };
+        match hover(params, &state)?.contents {
+            HoverContents::Markup(m) => Some(m.value),
+            _ => panic!("markup expected"),
+        }
+    }
+
+    #[test]
+    fn hovering_a_link_inside_a_link_label_shows_the_inner_note() {
+        let files = [
+            ("a.md", "[see [[inner]]](outer.md)\n"),
+            ("inner.md", "# Inner Title\n\ninner body\n"),
+            ("outer.md", "# Outer Title\n\nouter body\n"),
+        ];
+        let inner = hover_text(&files, "a.md", (0, 8)).unwrap();
+        assert!(
+            inner.contains("inner body") && !inner.contains("outer body"),
+            "{inner}"
+        );
+        for col in [2, 16, 22] {
+            let outer = hover_text(&files, "a.md", (0, col)).unwrap();
+            assert!(
+                outer.contains("outer body") && !outer.contains("inner body"),
+                "{col}: {outer}"
+            );
+        }
+        assert!(hover_text(&files, "a.md", (0, 30)).is_none());
+    }
+
+    #[test]
+    fn a_block_reference_finds_its_block_whatever_the_case() {
+        let files = [
+            ("a.md", "first\n\nthe block text ^abc\n\nlast\n"),
+            ("b.md", "[[a#^ABC]] and [[a#^abd]]\n"),
+        ];
+        let found = hover_text(&files, "b.md", (0, 3)).unwrap();
+        assert!(found.contains("the block text"), "{found}");
+        assert!(!found.contains("not found"), "{found}");
+        let missing = hover_text(&files, "b.md", (0, 16)).unwrap();
+        assert!(missing.contains("not found"), "{missing}");
     }
 }
