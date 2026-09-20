@@ -14,6 +14,7 @@ test:
 
 check:
     cargo check --workspace --all-targets
+    cargo fmt --all -- --check
 
 build:
     cargo build --workspace
