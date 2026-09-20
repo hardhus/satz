@@ -635,12 +635,14 @@ impl LanguageServer for Backend {
         &self,
         params: CompletionParams,
     ) -> jsonrpc::Result<Option<CompletionResponse>> {
-        let state = self.read_fresh().await;
+        // Completion reads the live text of the buffer itself, so it does not wait for the index to
+        // be re-parsed (that would parse the whole note on every `[` typed).
+        let state = self.state.read().await;
         Ok(crate::handlers::completion::completion(params, &state))
     }
 
     async fn completion_resolve(&self, params: CompletionItem) -> jsonrpc::Result<CompletionItem> {
-        let state = self.read_fresh().await;
+        let state = self.state.read().await;
         Ok(crate::handlers::completion::completion_resolve(
             params, &state,
         ))
@@ -1774,5 +1776,26 @@ mod tests {
         // Folders win over the legacy root.
         let both = pick_workspace_root(&[uri("f")], Some(&uri("legacy")));
         assert_eq!(both.root, Some(root().join("f")));
+    }
+
+    #[tokio::test]
+    async fn completion_answers_from_the_live_buffer_without_waiting_for_a_reparse() {
+        // The note is stale (typed since the last parse) and another reader holds the state: a
+        // request that had to re-parse first would wait for that reader; completion reads the
+        // live text and must not.
+        let (backend, _service) = backend_with_an_unparsed_link().await;
+        let _other_reader = backend.state.read().await;
+        let params = CompletionParams {
+            text_document_position: position_params("file:///a.md", 2, 6),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.completion(params),
+        )
+        .await;
+        assert!(answer.is_ok(), "completion waited for a re-parse");
     }
 }

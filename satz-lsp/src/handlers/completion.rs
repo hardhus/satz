@@ -9,15 +9,51 @@ use crate::state::SatzState;
 /// The answer for a candidate list: sorted (by folded label, then detail) so the same request always
 /// gives the same list whatever order the index iterates in, and cut at `limit` (0 = no limit). A cut
 /// answer is a list marked incomplete, so the client asks again as the user types.
-fn respond(mut items: Vec<CompletionItem>, limit: usize) -> CompletionResponse {
-    items.sort_by(|a, b| {
+fn respond(mut items: Vec<CompletionItem>, limit: usize, query: &str) -> CompletionResponse {
+    let by_label = |a: &CompletionItem, b: &CompletionItem| {
         satz_core::fold_key(&a.label)
             .cmp(&satz_core::fold_key(&b.label))
             .then_with(|| a.label.cmp(&b.label))
             .then_with(|| a.detail.cmp(&b.detail))
-    });
-    if limit > 0 && items.len() > limit {
-        items.truncate(limit);
+    };
+    if limit == 0 || items.len() <= limit {
+        items.sort_by(by_label);
+        return CompletionResponse::Array(items);
+    }
+
+    // The list has to be cut. What the user has typed decides what stays: without that, the cut
+    // keeps the first candidates of the alphabet and a note or heading further down (`Nesne`) is
+    // never offered, however much of its name is typed.
+    let query = satz_core::fold_key(query);
+    if !query.is_empty() {
+        let mut ranker = crate::rank::Ranker::new(&query);
+        let mut scored: Vec<(u8, u32, CompletionItem)> = items
+            .into_iter()
+            .filter_map(|item| {
+                let text = satz_core::fold_key(item.filter_text.as_deref().unwrap_or(&item.label));
+                let score = ranker.score(&text)?;
+                let tier = if text == query {
+                    0
+                } else if text.starts_with(&query) {
+                    1
+                } else {
+                    2
+                };
+                Some((tier, score, item))
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| by_label(&a.2, &b.2))
+        });
+        items = scored.into_iter().map(|(_, _, item)| item).collect();
+    } else {
+        items.sort_by(by_label);
+    }
+    let cut = items.len() > limit;
+    items.truncate(limit);
+    if cut {
         return CompletionResponse::List(CompletionList {
             is_incomplete: true,
             items,
@@ -79,12 +115,12 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
 
     // The rest of the word the cursor is inside (`[[Ol|gu]]`) is part of what is being replaced,
     // or the completion would leave it behind (`[[doc-bgu]]`). It ends at a bracket, `|`, `#` or `^`.
-    // A link that is not closed yet on this line has no such end: the word ends at a space then.
+    // Whitespace ends the word too, whichever comes first: text further along the line (`x^2`, a
+    // later `#tag`, a table `|`) is not part of what is being completed and must survive.
     let tail = &source[byte_offset..];
     let word_end = byte_offset
         + tail
-            .find([']', '|', '#', '^'])
-            .or_else(|| tail.find(char::is_whitespace))
+            .find(|c: char| matches!(c, ']' | '|' | '#' | '^') || c.is_whitespace())
             .unwrap_or(tail.len());
     // Closing brackets after the word: none -> `]]`, one -> the missing `]`, both -> nothing.
     // (The link may continue with `|display` or `#anchor` before its closing `]]`.)
@@ -282,7 +318,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 count = items.len(),
                 "completion: returning candidates (documents/headings/aliases)"
             );
-            return Some(respond(items, limit));
+            return Some(respond(items, limit, inside_wikilink));
         }
     }
 
@@ -337,6 +373,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                         label: format!("#{}", tag_name),
                         kind: Some(CompletionItemKind::KEYWORD),
                         detail: Some("Tag".to_string()),
+                        filter_text: Some(tag_name.to_string()),
                         text_edit: Some(completion_text_edit(range, tag_name.to_string())),
                         ..Default::default()
                     }
@@ -346,7 +383,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 count = items.len(),
                 "completion: returning candidates (tags)"
             );
-            return Some(respond(items, limit));
+            return Some(respond(items, limit, &line_prefix[hash_idx + 1..]));
         }
     }
 
@@ -1363,5 +1400,215 @@ body"
         };
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["B", "Same", "Other"]);
+    }
+
+    // ---- a long list is narrowed by what was typed before it is cut (R-01, R-03) ----
+
+    fn alfa_notes(count: usize) -> Vec<(String, String)> {
+        (0..count)
+            .map(|i| (format!("alfa-{i:04}.md"), format!("# Alfa {i:04}\n")))
+            .collect()
+    }
+
+    /// 600 notes that sort before everything below, plus a glossary with the headings that are
+    /// looked for.
+    fn big_vault_with_glossary(glossary: &str) -> Vec<(String, String)> {
+        let mut files = alfa_notes(600);
+        files.push(("tlp/sozluk.md".to_string(), glossary.to_string()));
+        files
+    }
+
+    fn as_refs(files: &[(String, String)]) -> Vec<(&str, &str)> {
+        files
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect()
+    }
+
+    const GLOSSARY: &str = "# Sözlük\n\n## Nesne\n\n## Olgu\n\n## Zeytin\n";
+
+    #[test]
+    fn a_heading_far_down_the_alphabet_is_found_first_by_what_was_typed() {
+        let files = big_vault_with_glossary(GLOSSARY);
+        for typed in ["Nesne", "Nes", "nesne", "NESNE", "N"] {
+            let (items, incomplete) =
+                complete_marked(&as_refs(&files), &format!("[[{typed}‸"), |_| {});
+            assert!(
+                !items.is_empty(),
+                "typed {typed:?}: nothing offered although the heading exists"
+            );
+            assert_eq!(
+                items[0].0,
+                "Nesne",
+                "typed {typed:?}: {:?}",
+                &items[..3.min(items.len())]
+            );
+            assert_eq!(items[0].1, "[[tlp/sozluk#Nesne]]", "typed {typed:?}");
+            assert!(items.len() <= 200 && (incomplete || items.len() < 200));
+        }
+    }
+
+    #[test]
+    fn turkish_capital_and_dotless_letters_find_their_ascii_spellings() {
+        let files = big_vault_with_glossary("# Sözlük\n\n## İşlem\n\n## Işık\n");
+        for typed in ["işlem", "islem", "İŞLEM", "isik", "ışık"] {
+            let (items, _) = complete_marked(&as_refs(&files), &format!("[[{typed}‸"), |_| {});
+            let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+            let wanted = if typed.contains('k') {
+                "Işık"
+            } else {
+                "İşlem"
+            };
+            assert_eq!(
+                labels.first().copied(),
+                Some(wanted),
+                "typed {typed:?}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_match_comes_before_a_prefix_match_before_a_fuzzy_one() {
+        let files = big_vault_with_glossary(
+            "# Sözlük\n\n## Bir nesne daha\n\n## Nesneler\n\n## Nesne\n\n## Sadece not\n",
+        );
+        let (items, _) = complete_marked(&as_refs(&files), "[[nesne‸", |_| {});
+        let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            &labels[..3],
+            ["Nesne", "Nesneler", "Bir nesne daha"],
+            "{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Sadece not"),
+            "a heading that does not match is left out"
+        );
+    }
+
+    #[test]
+    fn a_small_list_is_returned_whole_whatever_was_typed() {
+        // Nothing has to be cut, so nothing is filtered: the client narrows it as it always did.
+        let (items, incomplete) = complete_marked(&[TARGET], "[[zzzz‸", |_| {});
+        assert!(!items.is_empty() && !incomplete);
+        let files = big_vault_with_glossary(GLOSSARY);
+        let (items, incomplete) = complete_marked(&as_refs(&files), "[[Nesne‸", |s| {
+            s.config.lsp.completion_limit = 0
+        });
+        assert!(
+            items.len() > 600 && !incomplete,
+            "no limit: everything, {}",
+            items.len()
+        );
+    }
+
+    #[test]
+    fn every_extra_letter_narrows_the_answer_and_keeps_the_target() {
+        let files = big_vault_with_glossary(GLOSSARY);
+        let mut last = usize::MAX;
+        for typed in ["N", "Ne", "Nes", "Nesn", "Nesne"] {
+            let (items, _) = complete_marked(&as_refs(&files), &format!("[[{typed}‸"), |_| {});
+            assert!(items.iter().any(|(l, _)| l == "Nesne"), "typed {typed:?}");
+            assert!(
+                items.len() <= last,
+                "typed {typed:?}: {} > {last}",
+                items.len()
+            );
+            last = items.len();
+        }
+    }
+
+    #[test]
+    fn the_answer_for_one_request_is_always_the_same() {
+        let files = big_vault_with_glossary(GLOSSARY);
+        let first = complete_marked(&as_refs(&files), "[[Ne‸", |_| {});
+        for _ in 0..20 {
+            assert_eq!(complete_marked(&as_refs(&files), "[[Ne‸", |_| {}), first);
+        }
+    }
+
+    #[test]
+    fn a_tag_far_down_the_alphabet_is_found_by_what_was_typed() {
+        let mut files: Vec<(String, String)> = (0..300)
+            .map(|i| {
+                (
+                    format!("t-{i:03}.md"),
+                    format!("---\ntags: [tag{i:03}]\n---\n# T\n"),
+                )
+            })
+            .collect();
+        files.push((
+            "z.md".to_string(),
+            "---\ntags: [zulu]\n---\n# Z\n".to_string(),
+        ));
+        for typed in ["zul", "zulu", "ZUL"] {
+            let (items, _) = complete_marked(&as_refs(&files), &format!("#{typed}‸"), |_| {});
+            // The tag being typed is in the open note itself and is offered too; the vault's own
+            // `zulu` must be among the first few, not lost behind 300 alphabetically earlier tags.
+            let position = items.iter().position(|(l, _)| l == "#zulu");
+            assert!(
+                position.is_some_and(|p| p <= 1),
+                "typed {typed:?}: {:?}",
+                items.iter().take(3).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn strange_queries_do_not_panic_and_give_a_sensible_answer() {
+        let files = big_vault_with_glossary(GLOSSARY);
+        let long = "n".repeat(10_000);
+        for typed in [
+            "]",
+            "|x",
+            "a#b",
+            "^^^",
+            "🦀",
+            "ne\u{301}sne",
+            long.as_str(),
+            "  ",
+            "İİİ",
+            "$",
+            "!x",
+            "'q",
+        ] {
+            let (items, _) = complete_marked(&as_refs(&files), &format!("[[{typed}‸"), |_| {});
+            assert!(items.len() <= 601 + 300, "typed {typed:?}: {}", items.len());
+        }
+    }
+
+    // ---- what stands after the cursor is left alone (R-02) ----
+
+    #[test]
+    fn text_after_an_unclosed_link_is_not_swallowed() {
+        for (typed, expected) in [
+            (
+                "Bu bir [[Ta‸ örnek #etiket",
+                "Bu bir [[doc-b]] örnek #etiket",
+            ),
+            ("x^2 [[Ta‸ y", "x^2 [[doc-b]] y"),
+            ("| a | [[Ta‸ | b |", "| a | [[doc-b]] | b |"),
+            ("[[Ta‸ [md](u) and ]x", "[[doc-b]] [md](u) and ]x"),
+            ("[[Ta‸ ^blockid", "[[doc-b]] ^blockid"),
+        ] {
+            let (items, _) = complete_marked(&[TARGET], typed, |_| {});
+            assert_eq!(edited(&items, "Target"), expected, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn text_after_an_unclosed_heading_or_block_reference_is_not_swallowed() {
+        let (items, _) = complete_marked(&[TARGET], "[[doc-b#He‸ text #tag", |_| {});
+        assert_eq!(edited(&items, "Head"), "[[doc-b#Head]] text #tag");
+        let (items, _) = complete_marked(&[TARGET], "[[doc-b#^bl‸ and ^2", |_| {});
+        assert_eq!(edited(&items, "^blk"), "[[doc-b#^blk]] and ^2");
+    }
+
+    #[test]
+    fn a_word_inside_a_real_link_is_still_replaced_whole() {
+        // Unchanged from before: what is left of a word that ends at a bracket, `|` or `#` goes too.
+        let (items, _) = complete_marked(&[TARGET], "[[Ta‸rget]] tail", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b]] tail");
+        let (items, _) = complete_marked(&[TARGET], "[[Ta‸rget|shown]] x^2", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b|shown]] x^2");
     }
 }
