@@ -52,7 +52,10 @@ pub fn pull_document_report(
     state: &SatzState,
 ) -> DocumentPull {
     if !state.is_indexing_complete() {
-        tracing::debug!(uri, "pull_document_report: initial indexing not complete yet");
+        tracing::debug!(
+            uri,
+            "pull_document_report: initial indexing not complete yet"
+        );
         return DocumentPull::Full {
             items: Vec::new(),
             result_id: None,
@@ -73,7 +76,9 @@ pub fn pull_document_report(
 }
 
 /// The pull-mode `workspace/diagnostic` report across every indexed document (no previous ids).
-pub fn pull_workspace_diagnostics(state: &SatzState) -> Vec<lsp::WorkspaceDocumentDiagnosticReport> {
+pub fn pull_workspace_diagnostics(
+    state: &SatzState,
+) -> Vec<lsp::WorkspaceDocumentDiagnosticReport> {
     pull_workspace_report(&std::collections::HashMap::new(), state)
 }
 
@@ -254,7 +259,9 @@ pub fn compute_diagnostics(
         diagnostics.push(lsp::Diagnostic {
             range: byte_range_to_lsp(range, &doc.line_index),
             severity: Some(lsp::DiagnosticSeverity::WARNING),
-            code: Some(lsp::NumberOrString::String("invalid-frontmatter".to_string())),
+            code: Some(lsp::NumberOrString::String(
+                "invalid-frontmatter".to_string(),
+            )),
             source: Some("satz".to_string()),
             message: format!("Invalid frontmatter: {error}; title, aliases and tags are ignored"),
             ..Default::default()
@@ -426,7 +433,6 @@ mod tests {
         );
     }
 
-
     /// Number of `duplicate-heading` diagnostics for a document, with a backlink so the orphan
     /// hint does not interfere.
     fn duplicate_heading_count(body: &str) -> usize {
@@ -448,7 +454,10 @@ mod tests {
         compute_diagnostics(&doc_a, &index, &VaultConfig::default())
             .into_iter()
             .filter(|d| {
-                d.code == Some(lsp::NumberOrString::String("invalid-frontmatter".to_string()))
+                d.code
+                    == Some(lsp::NumberOrString::String(
+                        "invalid-frontmatter".to_string(),
+                    ))
             })
             .collect()
     }
@@ -459,7 +468,11 @@ mod tests {
         assert_eq!(found.len(), 1);
         let d = &found[0];
         assert_eq!(d.severity, Some(lsp::DiagnosticSeverity::WARNING));
-        assert!(d.message.starts_with("Invalid frontmatter"), "{}", d.message);
+        assert!(
+            d.message.starts_with("Invalid frontmatter"),
+            "{}",
+            d.message
+        );
         assert!(d.message.contains("ignored"), "{}", d.message);
         // The range is the frontmatter block: from its opening line to its closing line.
         assert_eq!(d.range.start.line, 0);
@@ -490,7 +503,10 @@ mod tests {
     fn real_duplicate_headings_are_still_reported() {
         assert_eq!(duplicate_heading_count("# Same\n\n# Same\n"), 1);
         assert_eq!(duplicate_heading_count("# A\n\n## a\n"), 1);
-        assert_eq!(duplicate_heading_count("# Same\n\n## Same\n\n### Same\n"), 2);
+        assert_eq!(
+            duplicate_heading_count("# Same\n\n## Same\n\n### Same\n"),
+            2
+        );
         // A slug-less heading between two real duplicates changes nothing.
         assert_eq!(duplicate_heading_count("# Same\n\n# 🙂\n\n# Same\n"), 1);
     }
@@ -666,10 +682,10 @@ mod tests {
                 .collect(),
         );
         state.set_vault_root(Some(if cfg!(windows) {
-                PathBuf::from("C:\\vault")
-            } else {
-                PathBuf::from("/vault")
-            }));
+            PathBuf::from("C:\\vault")
+        } else {
+            PathBuf::from("/vault")
+        }));
         state.set_indexing_complete(true);
         state
     }
@@ -683,7 +699,9 @@ mod tests {
 
     fn full_id(report: &DocumentPull) -> String {
         match report {
-            DocumentPull::Full { result_id, .. } => result_id.clone().expect("a full report has an id"),
+            DocumentPull::Full { result_id, .. } => {
+                result_id.clone().expect("a full report has an id")
+            }
             DocumentPull::Unchanged { .. } => panic!("expected a full report"),
         }
     }
@@ -692,7 +710,11 @@ mod tests {
     fn the_result_id_changes_with_the_index_and_with_the_configuration() {
         let mut state = ready_state(&[("a.md", "# A\n[[b]]\n"), ("b.md", "# B\n")]);
         let first = diagnostics_result_id(&state);
-        assert_eq!(diagnostics_result_id(&state), first, "stable while nothing changes");
+        assert_eq!(
+            diagnostics_result_id(&state),
+            first,
+            "stable while nothing changes"
+        );
 
         state
             .index
@@ -710,16 +732,31 @@ mod tests {
         let uri = uri_of(&state, "a.md");
         // The document must be open for a per-document pull.
         let mut state = state;
-        state.open_document(&uri, "# A\n[[missing]]\n", &state.vault_root().unwrap().join("a.md"), 1);
+        state.open_document(
+            &uri,
+            "# A\n[[missing]]\n",
+            &state.vault_root().unwrap().join("a.md"),
+            1,
+        );
 
         let first = pull_document_report(&uri, None, &state);
         let id = full_id(&first);
-        let DocumentPull::Full { items, .. } = &first else { unreachable!() };
-        assert!(items.iter().any(|d| d.message.contains("missing")), "the broken link: {items:?}");
+        let DocumentPull::Full { items, .. } = &first else {
+            unreachable!()
+        };
+        assert!(
+            items.iter().any(|d| d.message.contains("missing")),
+            "the broken link: {items:?}"
+        );
 
         let computed_before = compute_calls();
         let again = pull_document_report(&uri, Some(&id), &state);
-        assert_eq!(again, DocumentPull::Unchanged { result_id: id.clone() });
+        assert_eq!(
+            again,
+            DocumentPull::Unchanged {
+                result_id: id.clone()
+            }
+        );
         assert_eq!(compute_calls(), computed_before, "nothing was computed");
 
         // A stale, foreign or garbled id gets the full report again.
@@ -733,7 +770,12 @@ mod tests {
     fn a_change_anywhere_invalidates_every_result_id() {
         let mut state = ready_state(&[("a.md", "# A\n[[b]]\n"), ("b.md", "# B\n")]);
         let uri = uri_of(&state, "a.md");
-        state.open_document(&uri, "# A\n[[b]]\n", &state.vault_root().unwrap().join("a.md"), 1);
+        state.open_document(
+            &uri,
+            "# A\n[[b]]\n",
+            &state.vault_root().unwrap().join("a.md"),
+            1,
+        );
         let id = full_id(&pull_document_report(&uri, None, &state));
 
         // Removing `b.md` breaks the link in a.md: its diagnostics change though a.md did not.
@@ -742,7 +784,10 @@ mod tests {
         let DocumentPull::Full { items, result_id } = report else {
             panic!("the old id must not be accepted")
         };
-        assert!(items.iter().any(|d| d.message.contains("'b'")), "the newly broken link: {items:?}");
+        assert!(
+            items.iter().any(|d| d.message.contains("'b'")),
+            "the newly broken link: {items:?}"
+        );
         assert_ne!(result_id.unwrap(), id);
     }
 
@@ -791,9 +836,11 @@ mod tests {
         let before = compute_calls();
         let second = pull_workspace_report(&ids, &state);
         assert_eq!(second.len(), 3);
-        assert!(second
-            .iter()
-            .all(|r| matches!(r, lsp::WorkspaceDocumentDiagnosticReport::Unchanged(_))));
+        assert!(
+            second
+                .iter()
+                .all(|r| matches!(r, lsp::WorkspaceDocumentDiagnosticReport::Unchanged(_)))
+        );
         assert_eq!(compute_calls(), before);
 
         // Only some ids known (and one wrong): those are `Unchanged`, the rest `Full`.
@@ -806,8 +853,14 @@ mod tests {
             mixed
                 .iter()
                 .find_map(|r| match r {
-                    lsp::WorkspaceDocumentDiagnosticReport::Full(f) if f.uri.as_str() == uri => Some("full"),
-                    lsp::WorkspaceDocumentDiagnosticReport::Unchanged(u) if u.uri.as_str() == uri => Some("unchanged"),
+                    lsp::WorkspaceDocumentDiagnosticReport::Full(f) if f.uri.as_str() == uri => {
+                        Some("full")
+                    }
+                    lsp::WorkspaceDocumentDiagnosticReport::Unchanged(u)
+                        if u.uri.as_str() == uri =>
+                    {
+                        Some("unchanged")
+                    }
                     _ => None,
                 })
                 .unwrap()
@@ -824,20 +877,35 @@ mod tests {
         let uri = uri_of(&state, "a.md");
         state.open_document(&uri, "# A\n", &path, 7);
         let full = pull_workspace_report(&HashMap::new(), &state);
-        let lsp::WorkspaceDocumentDiagnosticReport::Full(f) = &full[0] else { panic!() };
+        let lsp::WorkspaceDocumentDiagnosticReport::Full(f) = &full[0] else {
+            panic!()
+        };
         assert_eq!(f.version, Some(7));
-        let ids = HashMap::from([(uri.clone(), f.full_document_diagnostic_report.result_id.clone().unwrap())]);
+        let ids = HashMap::from([(
+            uri.clone(),
+            f.full_document_diagnostic_report.result_id.clone().unwrap(),
+        )]);
         let unchanged = pull_workspace_report(&ids, &state);
-        let lsp::WorkspaceDocumentDiagnosticReport::Unchanged(u) = &unchanged[0] else { panic!() };
+        let lsp::WorkspaceDocumentDiagnosticReport::Unchanged(u) = &unchanged[0] else {
+            panic!()
+        };
         assert_eq!(u.version, Some(7));
     }
 
     #[test]
     fn a_big_idle_vault_is_answered_quickly_the_second_time() {
         let files: Vec<(String, String)> = (0..2000)
-            .map(|i| (format!("n{i}.md"), format!("# N{i}\n[[n{}]] [[missing{i}]]\n", (i + 1) % 2000)))
+            .map(|i| {
+                (
+                    format!("n{i}.md"),
+                    format!("# N{i}\n[[n{}]] [[missing{i}]]\n", (i + 1) % 2000),
+                )
+            })
             .collect();
-        let refs: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
         let state = ready_state(&refs);
         let first = pull_workspace_report(&HashMap::new(), &state);
         let ids: HashMap<String, String> = first
@@ -852,7 +920,15 @@ mod tests {
             .collect();
         let start = std::time::Instant::now();
         let second = pull_workspace_report(&ids, &state);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
-        assert!(second.iter().all(|r| matches!(r, lsp::WorkspaceDocumentDiagnosticReport::Unchanged(_))));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(
+            second
+                .iter()
+                .all(|r| matches!(r, lsp::WorkspaceDocumentDiagnosticReport::Unchanged(_)))
+        );
     }
 }

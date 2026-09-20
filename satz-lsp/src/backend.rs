@@ -50,7 +50,10 @@ pub fn client_supports_semantic_tokens_refresh(capabilities: &ClientCapabilities
 
 /// Logs a failed refresh request (a client that said it supports it should answer) and says whether
 /// it succeeded. Nothing is retried: the client refetches on its own schedule anyway.
-pub(crate) fn refresh_succeeded<T, E: std::fmt::Display>(what: &str, result: &Result<T, E>) -> bool {
+pub(crate) fn refresh_succeeded<T, E: std::fmt::Display>(
+    what: &str,
+    result: &Result<T, E>,
+) -> bool {
     match result {
         Ok(_) => true,
         Err(error) => {
@@ -151,9 +154,10 @@ async fn run_reparse(
         return;
     };
     let version = job.version;
-    let parsed =
-        tokio::task::spawn_blocking(move || satz_core::parse_document_owned(job.content, &job.rel_path))
-            .await;
+    let parsed = tokio::task::spawn_blocking(move || {
+        satz_core::parse_document_owned(job.content, &job.rel_path)
+    })
+    .await;
     let Ok(new_doc) = parsed else {
         tracing::error!(%uri, "reparse: the parsing task failed");
         return;
@@ -232,7 +236,10 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
         }
 
         if !state_guard.is_indexing_complete() {
-            tracing::debug!(uri, "publish_for: initial indexing not complete yet, skipping");
+            tracing::debug!(
+                uri,
+                "publish_for: initial indexing not complete yet, skipping"
+            );
             return;
         }
 
@@ -355,14 +362,21 @@ impl LanguageServer for Backend {
         } = pick_workspace_root(&folder_uris, legacy_root.as_deref());
         if !ignored_folders.is_empty() {
             // One server indexes one vault; say so instead of silently serving only the first.
-            let names: Vec<String> = ignored_folders.iter().map(|p| p.display().to_string()).collect();
+            let names: Vec<String> = ignored_folders
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
             let message = format!(
                 "satz indexes one vault per server: using {} and ignoring {}. Start another server for each other folder.",
-                vault_root.as_deref().map_or_else(String::new, |p| p.display().to_string()),
+                vault_root
+                    .as_deref()
+                    .map_or_else(String::new, |p| p.display().to_string()),
                 names.join(", ")
             );
             tracing::warn!("{message}");
-            self.client.show_message(MessageType::WARNING, message).await;
+            self.client
+                .show_message(MessageType::WARNING, message)
+                .await;
         }
 
         let supports_pull = params
@@ -1251,7 +1265,11 @@ mod tests {
                         let label = format!(
                             "dirty={peers_dirty} pull={supports_pull} diag={refresh_diag} tokens={refresh_tokens}"
                         );
-                        assert_eq!(plan.pull_diagnostics, supports_pull && refresh_diag, "{label}");
+                        assert_eq!(
+                            plan.pull_diagnostics,
+                            supports_pull && refresh_diag,
+                            "{label}"
+                        );
                         assert_eq!(plan.push_peers, peers_dirty && !supports_pull, "{label}");
                         assert_eq!(plan.semantic_tokens, refresh_tokens, "{label}");
                     }
@@ -1304,13 +1322,15 @@ mod tests {
     }
 
     /// `a.md` is open; its buffer already has a link to `b.md` that the index does not know yet.
-    async fn backend_with_an_unparsed_link() -> (Arc<Backend>, tower_lsp_server::LspService<Backend>) {
+    async fn backend_with_an_unparsed_link() -> (Arc<Backend>, tower_lsp_server::LspService<Backend>)
+    {
         let (backend, service) = shared_backend().await;
         {
             let mut state = backend.state.write().await;
-            state
-                .index
-                .replace_doc(satz_core::parse_document("# B\n\nbody of b\n", std::path::Path::new("b.md")));
+            state.index.replace_doc(satz_core::parse_document(
+                "# B\n\nbody of b\n",
+                std::path::Path::new("b.md"),
+            ));
             type_full(&mut state, "file:///a.md", 2, "# A\n\nsee [[b]] here\n");
             assert!(state.has_stale_open_documents());
         }
@@ -1345,7 +1365,9 @@ mod tests {
             .await
             .unwrap()
             .expect("a hover for the fresh link");
-        let HoverContents::Markup(markup) = hover.contents else { panic!() };
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!()
+        };
         assert!(markup.value.contains("body of b"), "{}", markup.value);
     }
 
@@ -1371,7 +1393,12 @@ mod tests {
         let (backend, _service) = shared_backend().await;
         {
             let mut state = backend.state.write().await;
-            type_full(&mut state, "file:///a.md", 2, "# A\n\ntext\n\n## Sub\n\nmore\n");
+            type_full(
+                &mut state,
+                "file:///a.md",
+                2,
+                "# A\n\ntext\n\n## Sub\n\nmore\n",
+            );
         }
         let folds = backend
             .folding_range(FoldingRangeParams {
@@ -1385,7 +1412,10 @@ mod tests {
             .unwrap()
             .unwrap_or_default();
         assert_eq!(
-            folds.iter().map(|f| (f.start_line, f.end_line)).collect::<Vec<_>>(),
+            folds
+                .iter()
+                .map(|f| (f.start_line, f.end_line))
+                .collect::<Vec<_>>(),
             vec![(0, 6), (4, 6)]
         );
     }
@@ -1415,7 +1445,9 @@ mod tests {
         let mut result = typed.to_string();
         let mut seen_version = None;
         for op in ops {
-            let DocumentChangeOperation::Edit(doc_edit) = op else { continue };
+            let DocumentChangeOperation::Edit(doc_edit) = op else {
+                continue;
+            };
             seen_version = doc_edit.text_document.version;
             let edits: Vec<TextEdit> = doc_edit
                 .edits
@@ -1428,7 +1460,11 @@ mod tests {
             result = crate::convert::apply_text_edits(&result, &edits);
         }
         assert_eq!(result, "\n\n# New\n\n[[a#New]]\n");
-        assert_eq!(seen_version, Some(2), "the edit names the buffer version it was computed for");
+        assert_eq!(
+            seen_version,
+            Some(2),
+            "the edit names the buffer version it was computed for"
+        );
     }
 
     #[tokio::test]
@@ -1449,7 +1485,11 @@ mod tests {
             jobs.push(tokio::spawn(async move {
                 if i % 3 == 0 {
                     backend
-                        .did_change(change_params("file:///a.md", 2 + i, &format!("# A\n\n[[n{i}]]\n")))
+                        .did_change(change_params(
+                            "file:///a.md",
+                            2 + i,
+                            &format!("# A\n\n[[n{i}]]\n"),
+                        ))
                         .await;
                 } else {
                     let _ = backend
@@ -1484,7 +1524,9 @@ mod tests {
         {
             let mut state = backend.state.write().await;
             let config = state.config.daily_note.clone();
-            state.index.set_daily(Some((config, today.pred_opt().unwrap())));
+            state
+                .index
+                .set_daily(Some((config, today.pred_opt().unwrap())));
             assert!(state.daily_is_stale(today));
         }
         let read = backend.read_fresh().await;
@@ -1541,25 +1583,49 @@ mod tests {
         {
             let state = backend.state.read().await;
             assert!(state.open_docs.contains_key("file:///new-note.md"));
-            assert!(state.index.get_doc(&satz_core::DocId::new("new-note.md")).is_some());
-            assert_eq!(state.index.backlinks_of(&satz_core::DocId::new("a.md")).count(), 1);
+            assert!(
+                state
+                    .index
+                    .get_doc(&satz_core::DocId::new("new-note.md"))
+                    .is_some()
+            );
+            assert_eq!(
+                state
+                    .index
+                    .backlinks_of(&satz_core::DocId::new("a.md"))
+                    .count(),
+                1
+            );
         }
         backend.did_close(close_params("file:///new-note.md")).await;
         let state = backend.state.read().await;
         assert!(!state.open_docs.contains_key("file:///new-note.md"));
         assert!(
-            state.index.get_doc(&satz_core::DocId::new("new-note.md")).is_none(),
+            state
+                .index
+                .get_doc(&satz_core::DocId::new("new-note.md"))
+                .is_none(),
             "no file on disk: the unsaved note is gone with its buffer"
         );
-        assert_eq!(state.index.backlinks_of(&satz_core::DocId::new("a.md")).count(), 0);
+        assert_eq!(
+            state
+                .index
+                .backlinks_of(&satz_core::DocId::new("a.md"))
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn a_buffer_that_is_not_a_local_file_is_ignored() {
         let (backend, _service) = shared_backend().await;
         let before = backend.state.read().await.open_docs.len();
-        backend.did_open(open_params("untitled:Untitled-1", 1, "# X\n")).await;
-        backend.did_open(open_params("https://example.com/x.md", 1, "# X\n")).await;
+        backend
+            .did_open(open_params("untitled:Untitled-1", 1, "# X\n"))
+            .await;
+        backend
+            .did_open(open_params("https://example.com/x.md", 1, "# X\n"))
+            .await;
         assert_eq!(backend.state.read().await.open_docs.len(), before);
     }
 
@@ -1609,7 +1675,12 @@ mod tests {
             .await;
         let state = backend.state.read().await;
         assert!(!state.open_docs.contains_key("file:///never-opened.md"));
-        assert!(state.index.get_doc(&satz_core::DocId::new("never-opened.md")).is_none());
+        assert!(
+            state
+                .index
+                .get_doc(&satz_core::DocId::new("never-opened.md"))
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1618,7 +1689,10 @@ mod tests {
         backend
             .did_open(open_params("file:///p.md", 1, "# P\n\n[[a]]\n"))
             .await;
-        assert!(!backend.state.read().await.peers_dirty(), "consumed by did_open");
+        assert!(
+            !backend.state.read().await.peers_dirty(),
+            "consumed by did_open"
+        );
 
         backend.state.write().await.mark_peers_dirty();
         backend
@@ -1626,7 +1700,10 @@ mod tests {
             .await;
         backend.state.write().await.mark_peers_dirty();
         backend.did_close(close_params("file:///p.md")).await;
-        assert!(!backend.state.read().await.peers_dirty(), "consumed by did_close");
+        assert!(
+            !backend.state.read().await.peers_dirty(),
+            "consumed by did_close"
+        );
     }
 
     #[tokio::test]
@@ -1644,7 +1721,10 @@ mod tests {
     // ---- which workspace folder is the vault ----
 
     fn uri(path: &str) -> String {
-        crate::convert::path_to_uri(&root().join(path)).unwrap().as_str().to_string()
+        crate::convert::path_to_uri(&root().join(path))
+            .unwrap()
+            .as_str()
+            .to_string()
     }
 
     #[test]
@@ -1671,7 +1751,11 @@ mod tests {
     #[test]
     fn folders_that_are_not_local_files_are_skipped() {
         let choice = pick_workspace_root(
-            &["untitled:x".to_string(), "https://example.com/w".to_string(), uri("real")],
+            &[
+                "untitled:x".to_string(),
+                "https://example.com/w".to_string(),
+                uri("real"),
+            ],
             None,
         );
         assert_eq!(choice.root, Some(root().join("real")));
@@ -1683,7 +1767,10 @@ mod tests {
         let choice = pick_workspace_root(&[], Some(&uri("legacy")));
         assert_eq!(choice.root, Some(root().join("legacy")));
         assert_eq!(pick_workspace_root(&[], None), WorkspaceChoice::default());
-        assert_eq!(pick_workspace_root(&["untitled:x".to_string()], None).root, None);
+        assert_eq!(
+            pick_workspace_root(&["untitled:x".to_string()], None).root,
+            None
+        );
         // Folders win over the legacy root.
         let both = pick_workspace_root(&[uri("f")], Some(&uri("legacy")));
         assert_eq!(both.root, Some(root().join("f")));

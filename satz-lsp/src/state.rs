@@ -605,7 +605,10 @@ impl SatzState {
     }
 
     /// The daily-note setting the index should have: the configured aliases and `today`.
-    fn wanted_daily(&self, today: chrono::NaiveDate) -> (satz_core::config::DailyNoteConfig, chrono::NaiveDate) {
+    fn wanted_daily(
+        &self,
+        today: chrono::NaiveDate,
+    ) -> (satz_core::config::DailyNoteConfig, chrono::NaiveDate) {
         (self.config.daily_note.clone(), today)
     }
 
@@ -1702,7 +1705,11 @@ mod tests {
         assert!(!state.has_stale_open_documents());
         edit_buffer(&mut state, 2, "# A\n\n[[two]]\n");
         assert!(state.has_stale_open_documents());
-        assert_eq!(links_of_a(&state), vec!["one".to_string()], "the index is one edit behind");
+        assert_eq!(
+            links_of_a(&state),
+            vec!["one".to_string()],
+            "the index is one edit behind"
+        );
     }
 
     #[test]
@@ -1712,7 +1719,11 @@ mod tests {
         assert_eq!(state.refresh_stale_open_documents(), 1);
         assert_eq!(links_of_a(&state), vec!["two".to_string()]);
         assert!(!state.has_stale_open_documents());
-        assert_eq!(state.refresh_stale_open_documents(), 0, "nothing left to do");
+        assert_eq!(
+            state.refresh_stale_open_documents(),
+            0,
+            "nothing left to do"
+        );
         // A reparse task that fires later finds nothing to do either.
         assert!(state.prepare_reparse("file:///a.md").is_none());
     }
@@ -1784,14 +1795,23 @@ mod tests {
         let mut state = SatzState::default();
         state.vault_root = Some(PathBuf::from("/vault"));
         state.index = satz_core::Index::build(vec![
-            satz_core::parse_document("# Log
+            satz_core::parse_document(
+                "# Log
 
 [[bugün]]
-", Path::new("log.md")),
-            satz_core::parse_document("# 14
-", Path::new("daily/2026-03-14.md")),
-            satz_core::parse_document("# 15
-", Path::new("daily/2026-03-15.md")),
+",
+                Path::new("log.md"),
+            ),
+            satz_core::parse_document(
+                "# 14
+",
+                Path::new("daily/2026-03-14.md"),
+            ),
+            satz_core::parse_document(
+                "# 15
+",
+                Path::new("daily/2026-03-15.md"),
+            ),
         ]);
         state
     }
@@ -1810,7 +1830,10 @@ mod tests {
         assert!(state.sync_daily(day(2026, 3, 14)));
         assert_eq!(backlinks_to(&state, "daily/2026-03-14.md"), 1);
         assert!(!state.daily_is_stale(day(2026, 3, 14)));
-        assert!(!state.sync_daily(day(2026, 3, 14)), "nothing changed the second time");
+        assert!(
+            !state.sync_daily(day(2026, 3, 14)),
+            "nothing changed the second time"
+        );
     }
 
     #[test]
@@ -1830,7 +1853,11 @@ mod tests {
         state.config.daily_note.aliases.today = vec!["heute".to_string()];
         assert!(state.daily_is_stale(day(2026, 3, 14)));
         assert!(state.sync_daily(day(2026, 3, 14)));
-        assert_eq!(backlinks_to(&state, "daily/2026-03-14.md"), 0, "`bugün` is no longer an alias");
+        assert_eq!(
+            backlinks_to(&state, "daily/2026-03-14.md"),
+            0,
+            "`bugün` is no longer an alias"
+        );
     }
 
     #[test]
@@ -1877,7 +1904,10 @@ mod tests {
         let peers = state.take_peer_refresh("file:///b.md", true);
         assert!(peers.dirty && peers.supports_pull);
         assert!(!state.peers_dirty, "taken");
-        assert!(!state.take_peer_refresh("file:///b.md", true).dirty, "and not told twice");
+        assert!(
+            !state.take_peer_refresh("file:///b.md", true).dirty,
+            "and not told twice"
+        );
     }
 
     #[test]
@@ -1898,7 +1928,12 @@ mod tests {
         state.close_document("file:///a.md");
         state.close_document("file:///b.md");
         state.close_document("file:///c.md");
-        assert!(state.take_peer_refresh("file:///a.md", true).others.is_empty());
+        assert!(
+            state
+                .take_peer_refresh("file:///a.md", true)
+                .others
+                .is_empty()
+        );
     }
 
     // ---- the state's own invariants are read and changed through methods ----
@@ -1942,7 +1977,8 @@ mod tests {
     #[test]
     fn changing_the_root_changes_how_paths_are_made_relative() {
         let mut state = SatzState::with_vault_root("/vault");
-        let inside = |s: &SatzState| SatzState::get_rel_path(Path::new("/vault/sub/a.md"), s.vault_root());
+        let inside =
+            |s: &SatzState| SatzState::get_rel_path(Path::new("/vault/sub/a.md"), s.vault_root());
         assert_eq!(inside(&state), PathBuf::from("sub/a.md"));
         state.set_vault_root(Some(PathBuf::from("/vault/sub")));
         assert_eq!(inside(&state), PathBuf::from("a.md"));
