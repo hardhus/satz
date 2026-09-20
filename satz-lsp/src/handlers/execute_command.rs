@@ -128,6 +128,9 @@ pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
     for doc in state.index.documents() {
         let source = doc.line_index.source();
         let hash = doc.content_hash;
+        if state.format_cache.is_unchanged(hash) {
+            continue; // known to be formatted already
+        }
 
         let formatted = match state.format_cache.get(hash) {
             Some(cached) => cached.to_string(),

@@ -119,6 +119,18 @@ impl Index {
         self.by_title_alias.get(&fold_key(trimmed))
     }
 
+    /// The note a Markdown link's destination names, seen from the note at `from`: first relative to
+    /// its folder, then by the vault-wide rules; a path that climbs out of the vault is broken (it is
+    /// not matched by file name as a wikilink would be). The one rule link resolution, backlinks and
+    /// the graph all share.
+    pub(crate) fn resolve_markdown_target(&self, from: &Path, target: &str) -> Option<&DocId> {
+        match self.resolve_relative_to(from, target) {
+            RelativeResolution::Found(id) => Some(id),
+            RelativeResolution::EscapesVault => None,
+            RelativeResolution::NotApplicable => self.resolve_link(target),
+        }
+    }
+
     /// Resolves a Markdown link path against the folder of the note `from` that contains it:
     /// `.` and `..` components are applied, and the result is looked up as a vault path (with or
     /// without `.md`, ignoring case).
@@ -229,27 +241,22 @@ impl Index {
             };
         }
 
-        // A Markdown link's path is relative to the note that contains it; a path that climbs out of
-        // the vault is broken (it is not matched by file name as a wikilink would be).
-        let relative = match (link.kind, current_doc) {
-            (LinkKind::Markdown, Some(from)) if !link.target_doc.is_empty() => {
-                self.resolve_relative_to(&from.path, &link.target_doc)
-            }
-            _ => RelativeResolution::NotApplicable,
-        };
-
-        let resolved_id = if link.target_doc.is_empty() {
+        let found = if link.target_doc.is_empty() {
             None
-        } else if let RelativeResolution::Found(id) = relative {
-            Some(id)
-        } else if matches!(relative, RelativeResolution::EscapesVault) {
-            None
-        } else if let Some(id) = self.resolve_link(&link.target_doc) {
-            Some(id)
-        } else if let Some(cfg) = config {
-            self.resolve_relative_daily(&link.target_doc, &cfg.daily_note)
         } else {
-            None
+            match (link.kind, current_doc) {
+                (LinkKind::Markdown, Some(from)) => {
+                    self.resolve_markdown_target(&from.path, &link.target_doc)
+                }
+                _ => self.resolve_link(&link.target_doc),
+            }
+        };
+        let resolved_id = match (found, config) {
+            (Some(id), _) => Some(id),
+            (None, Some(cfg)) if !link.target_doc.is_empty() => {
+                self.resolve_relative_daily(&link.target_doc, &cfg.daily_note)
+            }
+            _ => None,
         };
 
         let target_doc = if link.target_doc.is_empty() {
@@ -411,7 +418,7 @@ impl Index {
     /// empty target (`[x](#h)`) never count; a wikilink/embed with an empty target but a
     /// heading/block (`[[#Heading]]`) is a self-link; everything else goes through
     /// `resolve_link`.
-    pub(crate) fn link_target(&self, src: &DocId, link: &Link) -> Option<DocId> {
+    pub(crate) fn link_target(&self, src: &Document, link: &Link) -> Option<DocId> {
         if crate::model::link::is_external_target(&link.target_doc) {
             return None;
         }
@@ -429,7 +436,7 @@ impl Index {
                 if is_degenerate {
                     None
                 } else if link.target_doc.is_empty() {
-                    Some(src.clone())
+                    Some(src.id.clone())
                 } else {
                     self.resolve_link(&link.target_doc).cloned()
                 }
@@ -438,7 +445,8 @@ impl Index {
                 if link.target_doc.is_empty() {
                     None
                 } else {
-                    self.resolve_link(&link.target_doc).cloned()
+                    self.resolve_markdown_target(&src.path, &link.target_doc)
+                        .cloned()
                 }
             }
             LinkKind::Footnote => None,
@@ -461,7 +469,7 @@ impl Index {
         let targets: HashSet<DocId> = doc
             .links
             .iter()
-            .filter_map(|link| self.link_target(id, link))
+            .filter_map(|link| self.link_target(doc, link))
             .collect();
         for target in &targets {
             self.backlinks

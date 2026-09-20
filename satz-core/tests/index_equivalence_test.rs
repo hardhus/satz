@@ -59,6 +59,19 @@ const TARGETS: &[&str] = &[
     "SUB/A",
 ];
 
+/// Markdown destinations that only mean something relative to the folder of the note they are in.
+const RELATIVE_TARGETS: &[&str] = &[
+    "./b.md",
+    "../b.md",
+    "../../b.md",
+    "../../../x.md",
+    "sub/x.md",
+    "./x",
+    "../deep/er/note.md",
+    "../books/rust",
+    "a.md#Section",
+];
+
 const TITLES: &[&str] = &["Alpha", "Beta", "Gamma Note", "Rust", "Untitled thing"];
 const ALIASES: &[&str] = &["beta", "alpha", "gam", "note", "Rust"];
 const TAGS: &[&str] = &["one", "Two", "two", "three/sub"];
@@ -83,11 +96,12 @@ fn random_document(rng: &mut Rng, path: &str) -> Document {
     }
     text.push_str("## Section\n\n");
     for _ in 0..(rng.next() % 4) {
-        match rng.next() % 5 {
+        match rng.next() % 6 {
             0 => text.push_str(&format!("[[{}]] ", rng.pick(TARGETS))),
             1 => text.push_str(&format!("[[{}#Section]] ", rng.pick(TARGETS))),
             2 => text.push_str(&format!("[t]({}.md) ", rng.pick(TARGETS))),
             3 => text.push_str(&format!("#{} ", rng.pick(TAGS))),
+            4 => text.push_str(&format!("[r]({}) ", rng.pick(RELATIVE_TARGETS))),
             _ => text.push_str("[[#Section]] "),
         }
     }

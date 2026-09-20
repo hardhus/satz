@@ -18,6 +18,63 @@ use crate::state::SatzState;
 /// runtime without an env var or a rebuild.
 pub type LogReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
+/// What the server offers the client (the `capabilities` of the `initialize` response).
+pub fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: Some("satz".to_string()),
+            inter_file_dependencies: true,
+            workspace_diagnostics: true,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            resolve_provider: Some(true),
+            trigger_characters: Some(vec!["[".into(), "#".into(), "^".into()]),
+            ..Default::default()
+        }),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        document_link_provider: Some(DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        }),
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(false),
+        }),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                work_done_progress_options: Default::default(),
+                legend: crate::handlers::semantic_tokens::semantic_tokens_legend(),
+                range: None,
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+            },
+        )),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: crate::handlers::execute_command::SUPPORTED_COMMANDS
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            work_done_progress_options: Default::default(),
+        }),
+        ..Default::default()
+    }
+}
+
 pub struct Backend {
     pub client: Client,
     pub state: Arc<RwLock<SatzState>>,
@@ -239,63 +296,7 @@ impl LanguageServer for Backend {
         }
 
         Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
-                )),
-                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                    DiagnosticOptions {
-                        identifier: Some("satz".to_string()),
-                        inter_file_dependencies: true,
-                        workspace_diagnostics: true,
-                        work_done_progress_options: WorkDoneProgressOptions::default(),
-                    },
-                )),
-                definition_provider: Some(OneOf::Left(true)),
-                references_provider: Some(OneOf::Left(true)),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                document_symbol_provider: Some(OneOf::Left(true)),
-                completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(true),
-                    trigger_characters: Some(vec!["[".into(), "#".into(), "^".into()]),
-                    ..Default::default()
-                }),
-                workspace_symbol_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Right(RenameOptions {
-                    prepare_provider: Some(true),
-                    work_done_progress_options: Default::default(),
-                })),
-                document_highlight_provider: Some(OneOf::Left(true)),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
-                document_link_provider: Some(DocumentLinkOptions {
-                    resolve_provider: Some(false),
-                    work_done_progress_options: Default::default(),
-                }),
-                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-                code_lens_provider: Some(CodeLensOptions {
-                    resolve_provider: Some(false),
-                }),
-                inlay_hint_provider: Some(OneOf::Left(true)),
-                semantic_tokens_provider: Some(
-                    SemanticTokensServerCapabilities::SemanticTokensOptions(
-                        SemanticTokensOptions {
-                            work_done_progress_options: Default::default(),
-                            legend: crate::handlers::semantic_tokens::semantic_tokens_legend(),
-                            range: None,
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
-                        },
-                    ),
-                ),
-                document_formatting_provider: Some(OneOf::Left(true)),
-                execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: crate::handlers::execute_command::SUPPORTED_COMMANDS
-                        .iter()
-                        .map(|c| c.to_string())
-                        .collect(),
-                    work_done_progress_options: Default::default(),
-                }),
-                ..Default::default()
-            },
+            capabilities: server_capabilities(),
 
             server_info: Some(ServerInfo {
                 name: "satz-lsp".to_string(),
@@ -669,9 +670,7 @@ impl LanguageServer for Backend {
 
         if !result.cache_updates.is_empty() {
             let mut state = self.state.write().await;
-            for (hash, formatted) in result.cache_updates {
-                state.format_cache.insert(hash, formatted);
-            }
+            state.apply_format_cache_updates(result.cache_updates);
         }
 
         let changes = result.changes;
@@ -849,6 +848,110 @@ mod tests {
                     "peers_dirty={peers_dirty} supports_pull={supports_pull}"
                 );
             }
+        }
+    }
+
+    // ---- the server's advertised commands and how execute_command answers them ----
+
+    /// A real `Backend` (its client end is never connected: the paths tested here do not talk to
+    /// the client).
+    fn test_service() -> tower_lsp_server::LspService<Backend> {
+        let (_layer, handle): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
+        let (service, _socket) =
+            tower_lsp_server::LspService::new(|client| Backend::new(client, handle));
+        service
+    }
+
+    fn command(name: &str, arguments: Vec<serde_json::Value>) -> ExecuteCommandParams {
+        ExecuteCommandParams {
+            command: name.to_string(),
+            arguments,
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    fn root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("C:\\vault")
+        } else {
+            PathBuf::from("/vault")
+        }
+    }
+
+    #[test]
+    fn the_server_advertises_exactly_the_supported_commands() {
+        let caps = server_capabilities();
+        let commands = caps
+            .execute_command_provider
+            .expect("execute commands are offered")
+            .commands;
+        let expected: Vec<String> = crate::handlers::execute_command::SUPPORTED_COMMANDS
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(commands, expected);
+        assert!(commands.contains(&"satz.showBacklinks".to_string()));
+        assert!(commands.contains(&"satz.formatWorkspace".to_string()));
+    }
+
+    #[tokio::test]
+    async fn show_backlinks_answers_with_the_locations_and_rejects_bad_arguments() {
+        let service = test_service();
+        let backend = service.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.vault_root = Some(root());
+            state.index = satz_core::Index::build(vec![
+                satz_core::parse_document("# A\n", std::path::Path::new("a.md")),
+                satz_core::parse_document("see [[a]]\n", std::path::Path::new("b.md")),
+            ]);
+        }
+        let uri = crate::convert::path_to_uri(&root().join("a.md"))
+            .unwrap()
+            .as_str()
+            .to_string();
+
+        let answer = backend
+            .execute_command(command("satz.showBacklinks", vec![serde_json::json!(uri)]))
+            .await
+            .expect("valid arguments")
+            .expect("a value");
+        let list = answer.as_array().expect("an array of locations");
+        assert_eq!(list.len(), 1);
+        assert!(list[0]["uri"].as_str().unwrap().ends_with("b.md"));
+
+        for bad in [
+            vec![],
+            vec![serde_json::json!(42)],
+            vec![serde_json::json!(null)],
+            vec![serde_json::json!("")],
+            vec![serde_json::json!("not a uri")],
+        ] {
+            let err = backend
+                .execute_command(command("satz.showBacklinks", bad.clone()))
+                .await
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert_eq!(err.code, jsonrpc::ErrorCode::InvalidParams, "{bad:?}");
+            assert!(!err.message.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_differently_cased_command_is_method_not_found() {
+        let service = test_service();
+        let backend = service.inner();
+        for name in [
+            "satz.nope",
+            "",
+            "SATZ.SHOWBACKLINKS",
+            "satz.showbacklinks",
+            "satz.showBacklinks ",
+        ] {
+            let err = backend
+                .execute_command(command(name, vec![]))
+                .await
+                .expect_err(&format!("{name:?} is not a command"));
+            assert_eq!(err.code, jsonrpc::ErrorCode::MethodNotFound, "{name:?}");
         }
     }
 }

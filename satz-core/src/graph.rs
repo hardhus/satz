@@ -72,13 +72,10 @@ impl VaultGraph {
                     continue;
                 }
 
-                let target_id = if link.target_doc.is_empty() {
-                    Some(&doc.id)
-                } else {
-                    index.resolve_link(&link.target_doc)
-                };
+                // The same rule backlinks use, so an edge exists exactly where a backlink does.
+                let target_id = index.link_target(doc, link);
 
-                if let Some(target_id) = target_id
+                if let Some(target_id) = target_id.as_ref()
                     && let Some(&tgt_idx) = node_indices.get(target_id)
                 {
                     let kind_str = match link.kind {

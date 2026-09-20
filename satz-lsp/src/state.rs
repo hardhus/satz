@@ -65,13 +65,24 @@ impl OpenDocument {
     }
 }
 
-/// Simple (non-LRU) cache mapping a document's content hash to its already-computed formatted
-/// text, used by `satz.formatWorkspace` to skip reformatting files whose content hasn't changed
-/// since the last workspace-format call. Once at capacity, new distinct hashes are silently not
-/// cached — existing entries keep serving hits rather than anything being evicted.
+/// What is remembered about one content hash.
+#[derive(Debug, Clone)]
+enum CachedFormat {
+    /// The document is already formatted: nothing needs to be kept.
+    Unchanged,
+    /// The formatted text, which differs from the source.
+    Changed(String),
+}
+
+/// Cache mapping a document's content hash to what formatting it produced, used by
+/// `satz.formatWorkspace` to skip reformatting files whose content has not changed since the last
+/// workspace-format call. Already formatted documents are remembered without a copy of their text.
+/// Once at capacity, new distinct hashes are not cached (existing entries keep serving hits);
+/// `retain_hashes` is how entries of documents that no longer exist are dropped, so the capacity
+/// always goes to current content.
 #[derive(Debug, Clone)]
 pub struct FormatCache {
-    entries: HashMap<u64, String>,
+    entries: HashMap<u64, CachedFormat>,
     capacity: usize,
 }
 
@@ -83,15 +94,39 @@ impl FormatCache {
         }
     }
 
+    /// The formatted text for a document that formatting changes (`None` for an unknown hash and
+    /// for an already formatted document -- see `is_unchanged`).
     pub fn get(&self, hash: u64) -> Option<&str> {
-        self.entries.get(&hash).map(String::as_str)
+        match self.entries.get(&hash) {
+            Some(CachedFormat::Changed(text)) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    fn has_room_for(&self, hash: u64) -> bool {
+        self.entries.len() < self.capacity || self.entries.contains_key(&hash)
     }
 
     pub fn insert(&mut self, hash: u64, formatted: String) {
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(&hash) {
-            return;
+        if self.has_room_for(hash) {
+            self.entries.insert(hash, CachedFormat::Changed(formatted));
         }
-        self.entries.insert(hash, formatted);
+    }
+
+    /// Remembers that a document with this content hash is already formatted (no copy is kept).
+    pub fn insert_unchanged(&mut self, hash: u64) {
+        if self.has_room_for(hash) {
+            self.entries.insert(hash, CachedFormat::Unchanged);
+        }
+    }
+
+    pub fn is_unchanged(&self, hash: u64) -> bool {
+        matches!(self.entries.get(&hash), Some(CachedFormat::Unchanged))
+    }
+
+    /// Drops every entry whose hash is not in `live`.
+    pub fn retain_hashes(&mut self, live: &std::collections::HashSet<u64>) {
+        self.entries.retain(|hash, _| live.contains(hash));
     }
 
     pub fn len(&self) -> usize {
@@ -189,6 +224,30 @@ pub fn config_error_message(error: &str, fallback: &str) -> String {
 }
 
 impl SatzState {
+    /// Records what a workspace-format pass computed. Entries of documents that no longer exist
+    /// (edited or deleted notes) are dropped first, so the cache capacity always goes to current
+    /// content; a result equal to its source is remembered as "already formatted" without a copy.
+    pub fn apply_format_cache_updates(&mut self, updates: Vec<(u64, String)>) {
+        let live: std::collections::HashSet<u64> =
+            self.index.documents().map(|d| d.content_hash).collect();
+        self.format_cache.retain_hashes(&live);
+        let sources: HashMap<u64, &str> = self
+            .index
+            .documents()
+            .map(|d| (d.content_hash, d.line_index.source()))
+            .collect();
+        for (hash, formatted) in updates {
+            if sources
+                .get(&hash)
+                .is_some_and(|source| *source == formatted)
+            {
+                self.format_cache.insert_unchanged(hash);
+            } else {
+                self.format_cache.insert(hash, formatted);
+            }
+        }
+    }
+
     /// Resolves a link of `doc` the way every handler must: folder-relative Markdown paths, relative
     /// daily aliases from the config, and the heading/block anchor check.
     pub fn resolve<'a>(
@@ -261,6 +320,32 @@ impl SatzState {
         };
         let wanted = key(path);
         self.open_docs.values().any(|d| key(&d.path) == wanted)
+    }
+
+    /// The note a link of `doc` points at (`None`: external, footnote, no target at all, or the
+    /// note does not exist). Every handler that needs "which note is this link to" asks this, so
+    /// they agree with diagnostics and go-to-definition: folder-relative Markdown paths, daily
+    /// aliases from the config. A link into the note itself (`[[#Heading]]`) names `doc`.
+    pub fn link_target_doc<'a>(
+        &'a self,
+        doc: &'a satz_core::Document,
+        link: &satz_core::Link,
+    ) -> Option<&'a satz_core::DocId> {
+        if link.kind == satz_core::LinkKind::Footnote
+            || satz_core::model::link::is_external_target(&link.target_doc)
+        {
+            return None;
+        }
+        if link.target_doc.is_empty() {
+            // `[[#Heading]]` / `[[#^id]]` point into this note; a link with nothing at all points nowhere.
+            return (link.target_heading.is_some() || link.target_block.is_some())
+                .then_some(&doc.id);
+        }
+        match self.resolve(link, doc) {
+            satz_core::LinkResolution::Resolved { doc, .. }
+            | satz_core::LinkResolution::AnchorMissing { doc } => Some(&doc.id),
+            satz_core::LinkResolution::DocMissing => None,
+        }
     }
 
     /// The open document for `uri` together with its entry in the index (`None` when it is not open
@@ -933,7 +1018,10 @@ mod tests {
     #[test]
     fn doc_for_uri_is_none_for_unknown_or_unindexed_documents() {
         let state = state_with_open("/vault", "/vault/sub/a.md", &["b.md"]);
-        assert!(state.doc_for_uri("file:///x").is_none(), "open but not indexed");
+        assert!(
+            state.doc_for_uri("file:///x").is_none(),
+            "open but not indexed"
+        );
         assert!(state.doc_for_uri("file:///other").is_none(), "not open");
         assert!(state.doc_for_uri("").is_none());
     }
@@ -942,7 +1030,10 @@ mod tests {
     fn doc_for_uri_follows_the_same_path_rules_as_get_rel_path() {
         // Windows separators and a differently cased root still land on the indexed note.
         let state = state_with_open("C:\\Notlar\\İş", "c:\\notlar\\iş\\projeler\\p1.md", &[]);
-        assert!(state.doc_for_uri("file:///x").is_none(), "nothing indexed yet");
+        assert!(
+            state.doc_for_uri("file:///x").is_none(),
+            "nothing indexed yet"
+        );
         // A path outside the root is looked up as given (and is not indexed under that name).
         let state = state_with_open("/vault", "/elsewhere/a.md", &["a.md"]);
         assert!(state.doc_for_uri("file:///x").is_none());
@@ -953,6 +1044,154 @@ mod tests {
             "file:///y".to_string(),
             OpenDocument::new("file:///y", PathBuf::from("a.md"), "# t\n", 1),
         );
-        assert_eq!(state.doc_for_uri("file:///y").unwrap().1.id.as_str(), "a.md");
+        assert_eq!(
+            state.doc_for_uri("file:///y").unwrap().1.id.as_str(),
+            "a.md"
+        );
+    }
+
+    // ---- the workspace-format cache: no stale entries, no copies of already formatted text ----
+
+    fn state_with_docs(texts: &[(&str, &str)], capacity: usize) -> SatzState {
+        let mut state = SatzState::default();
+        state.index = Index::build(
+            texts
+                .iter()
+                .map(|(p, t)| satz_core::parse_document(t, Path::new(p)))
+                .collect(),
+        );
+        state.format_cache = FormatCache::new(capacity);
+        // Formatting results need file locations, so the vault root must be absolute.
+        state.vault_root = Some(if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        });
+        state
+    }
+
+    fn hash_of(state: &SatzState, path: &str) -> u64 {
+        state
+            .index
+            .documents()
+            .find(|d| d.path == Path::new(path))
+            .unwrap()
+            .content_hash
+    }
+
+    /// One workspace-format pass: compute, then record what was computed the way the server does.
+    fn run_pass(state: &mut SatzState) -> usize {
+        let result = crate::handlers::execute_command::compute_format_changes(state);
+        let changes = result.changes.len();
+        state.apply_format_cache_updates(result.cache_updates);
+        changes
+    }
+
+    const DIRTY_A: &str = "Line 1   \n\n\n\nLine 2   ";
+    const DIRTY_B: &str = "Other   \n\n\n\nText   ";
+    const CLEAN: &str = "# Clean\n\nAlready tidy.\n";
+
+    #[test]
+    fn entries_of_documents_that_no_longer_exist_do_not_keep_current_ones_out() {
+        let mut state = state_with_docs(&[("a.md", DIRTY_A), ("b.md", DIRTY_B)], 2);
+        // The cache is full of hashes no document has any more (edited or deleted notes).
+        state.format_cache.insert(1001, "old one".to_string());
+        state.format_cache.insert(1002, "old two".to_string());
+
+        assert_eq!(run_pass(&mut state), 2);
+        assert!(state.format_cache.get(1001).is_none());
+        assert!(state.format_cache.get(1002).is_none());
+        for path in ["a.md", "b.md"] {
+            assert!(
+                state.format_cache.get(hash_of(&state, path)).is_some(),
+                "{path} should be cached"
+            );
+        }
+        assert_eq!(state.format_cache.len(), 2);
+    }
+
+    #[test]
+    fn an_already_formatted_document_is_remembered_without_a_copy() {
+        let mut state = state_with_docs(&[("clean.md", CLEAN)], 10);
+        assert_eq!(run_pass(&mut state), 0);
+        let hash = hash_of(&state, "clean.md");
+        assert!(state.format_cache.is_unchanged(hash));
+        assert!(
+            state.format_cache.get(hash).is_none(),
+            "no formatted text is stored for an unchanged document"
+        );
+        // The next pass is answered entirely from the cache.
+        let again = crate::handlers::execute_command::compute_format_changes(&state);
+        assert!(again.changes.is_empty());
+        assert!(again.cache_updates.is_empty(), "nothing was recomputed");
+    }
+
+    #[test]
+    fn changed_and_unchanged_documents_are_both_served_from_the_cache() {
+        let mut state = state_with_docs(&[("a.md", DIRTY_A), ("clean.md", CLEAN)], 10);
+        assert_eq!(run_pass(&mut state), 1);
+        let again = crate::handlers::execute_command::compute_format_changes(&state);
+        assert_eq!(
+            again.changes.len(),
+            1,
+            "the dirty note still needs its edit"
+        );
+        assert_eq!(again.changes[0].formatted, "Line 1\n\nLine 2\n");
+        assert!(again.cache_updates.is_empty());
+        assert_eq!(state.format_cache.len(), 2);
+    }
+
+    #[test]
+    fn an_edited_document_replaces_its_old_entry() {
+        let mut state = state_with_docs(&[("a.md", DIRTY_A)], 10);
+        run_pass(&mut state);
+        let old_hash = hash_of(&state, "a.md");
+        state
+            .index
+            .replace_doc(satz_core::parse_document(DIRTY_B, Path::new("a.md")));
+        run_pass(&mut state);
+        assert!(state.format_cache.get(old_hash).is_none());
+        assert!(state.format_cache.get(hash_of(&state, "a.md")).is_some());
+        assert_eq!(state.format_cache.len(), 1);
+    }
+
+    #[test]
+    fn the_capacity_is_never_exceeded_and_zero_capacity_is_harmless() {
+        let mut state = state_with_docs(
+            &[
+                ("a.md", DIRTY_A),
+                ("b.md", DIRTY_B),
+                ("c.md", "x   \n\n\n\ny"),
+            ],
+            2,
+        );
+        assert_eq!(run_pass(&mut state), 3);
+        assert_eq!(state.format_cache.len(), 2);
+
+        let mut state = state_with_docs(&[("a.md", DIRTY_A), ("clean.md", CLEAN)], 0);
+        assert_eq!(run_pass(&mut state), 1);
+        assert_eq!(state.format_cache.len(), 0);
+        assert!(state.format_cache.is_empty());
+    }
+
+    #[test]
+    fn identical_content_in_two_files_is_one_entry() {
+        let mut state = state_with_docs(&[("a.md", DIRTY_A), ("copy.md", DIRTY_A)], 10);
+        assert_eq!(run_pass(&mut state), 2);
+        assert_eq!(state.format_cache.len(), 1);
+    }
+
+    #[test]
+    fn retaining_hashes_keeps_only_the_live_ones_of_both_kinds() {
+        let mut cache = FormatCache::new(10);
+        cache.insert(1, "one".to_string());
+        cache.insert_unchanged(2);
+        cache.insert(3, "three".to_string());
+        cache.insert_unchanged(4);
+        cache.retain_hashes(&std::collections::HashSet::from([2, 3]));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(1).is_none() && !cache.is_unchanged(4));
+        assert!(cache.is_unchanged(2));
+        assert_eq!(cache.get(3), Some("three"));
     }
 }

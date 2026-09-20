@@ -1,4 +1,4 @@
-use satz_core::{ByteRange, DocId, Document, LinkKind, LinkResolution, fold_key, slugify};
+use satz_core::{ByteRange, DocId, Document, LinkKind, fold_key, slugify};
 use tower_lsp_server::ls_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
 };
@@ -22,26 +22,6 @@ enum HighlightTarget {
     Broken(String),
     /// A footnote label (lowercased), defined or not.
     Footnote(String),
-}
-
-/// The note a link points at (`None`: external, no target, footnote, or the note does not exist).
-fn link_doc(state: &SatzState, doc: &Document, link: &satz_core::Link) -> Option<DocId> {
-    if link.kind == LinkKind::Footnote
-        || satz_core::model::link::is_external_target(&link.target_doc)
-    {
-        return None;
-    }
-    if link.target_doc.is_empty() {
-        // `[[#Heading]]` / `[[#^id]]` point into this note; a link with nothing at all points nowhere.
-        return (link.target_heading.is_some() || link.target_block.is_some())
-            .then(|| doc.id.clone());
-    }
-    match state.resolve(link, doc) {
-        LinkResolution::Resolved { doc, .. } | LinkResolution::AnchorMissing { doc } => {
-            Some(doc.id.clone())
-        }
-        LinkResolution::DocMissing => None,
-    }
 }
 
 /// What a link to a missing note is grouped by: the folded note name plus its anchor.
@@ -96,7 +76,7 @@ fn cursor_target(doc: &Document, off: usize, state: &SatzState) -> Option<Highli
         if !has_target(link) {
             continue;
         }
-        let target = match link_doc(state, doc, link) {
+        let target = match state.link_target_doc(doc, link).cloned() {
             Some(target) => match (&link.target_block, &link.target_heading) {
                 (Some(b), _) => HighlightTarget::Block {
                     doc: target,
@@ -203,7 +183,7 @@ pub fn document_highlight(
             }
             // Highlight any links in this document pointing to this heading
             for link in &doc.links {
-                if link_doc(state, doc, link).as_ref() == Some(target_doc)
+                if state.link_target_doc(doc, link) == Some(target_doc)
                     && link
                         .target_heading
                         .as_deref()
@@ -225,7 +205,7 @@ pub fn document_highlight(
             }
             // Highlight any links in this document pointing to this block
             for link in &doc.links {
-                if link_doc(state, doc, link).as_ref() == Some(target_doc)
+                if state.link_target_doc(doc, link) == Some(target_doc)
                     && link
                         .target_block
                         .as_deref()
@@ -237,7 +217,7 @@ pub fn document_highlight(
         }
         HighlightTarget::Doc(ref target_doc) => {
             for link in &doc.links {
-                if link_doc(state, doc, link).as_ref() == Some(target_doc) {
+                if state.link_target_doc(doc, link) == Some(target_doc) {
                     push(link.range, DocumentHighlightKind::READ);
                 }
             }
@@ -246,7 +226,7 @@ pub fn document_highlight(
             for link in &doc.links {
                 if has_target(link)
                     && link.kind != LinkKind::Footnote
-                    && link_doc(state, doc, link).is_none()
+                    && state.link_target_doc(doc, link).is_none()
                     && broken_key(link) == *key
                 {
                     push(link.range, DocumentHighlightKind::READ);

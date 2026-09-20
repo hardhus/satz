@@ -144,21 +144,16 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
 
     // A) A link with a heading renames that heading, wherever it is defined.
     if let Some(target_heading) = &link.target_heading {
-        let target_id = if link.target_doc.is_empty() {
-            &doc.id
-        } else {
-            state.index.resolve_link(&link.target_doc).ok_or_else(|| {
-                format!("cannot rename: note '{}' does not exist", link.target_doc)
-            })?
-        };
+        let target_id = state
+            .link_target_doc(doc, link)
+            .ok_or_else(|| format!("cannot rename: note '{}' does not exist", link.target_doc))?;
         let target_doc = state
             .index
             .get_doc(target_id)
             .ok_or_else(|| format!("cannot rename: note '{}' does not exist", link.target_doc))?;
         let h = target_doc
-            .headings
-            .iter()
-            .find(|h| h.matches(target_heading))
+            .resolve_heading(target_heading)
+            .map(|i| &target_doc.headings[i])
             .ok_or_else(|| {
                 format!(
                     "cannot rename: heading '{}' not found in '{}'",
@@ -174,8 +169,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
         return Ok(None);
     }
     let target_id = state
-        .index
-        .resolve_link(&link.target_doc)
+        .link_target_doc(doc, link)
         .ok_or_else(|| format!("cannot rename: note '{}' does not exist", link.target_doc))?;
     let target_doc = state
         .index
@@ -215,7 +209,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
             // Only links that name the FILE stop working; one that reaches the note through its
             // title or an alias keeps resolving and is not touched.
             if !l.target_doc.is_empty()
-                && state.index.resolve_link(&l.target_doc) == Some(target_id)
+                && state.link_target_doc(src_doc, l) == Some(target_id)
                 && names_file(&l.target_doc, &target_doc.path)
                 && let Some(new_link_text) = rewritten_link(
                     src_doc.line_index.source(),
@@ -317,11 +311,7 @@ fn rename_heading(
         };
 
         for l in &src_doc.links {
-            let matches_doc = if l.target_doc.is_empty() {
-                src_doc.id == *target_id
-            } else {
-                state.index.resolve_link(&l.target_doc) == Some(target_id)
-            };
+            let matches_doc = state.link_target_doc(src_doc, l) == Some(target_id);
             // A reference belongs to the FIRST heading that matches it; a later duplicate owns none.
             let matches_heading = l.target_heading.as_deref().is_some_and(|th| {
                 target_doc
@@ -1483,5 +1473,89 @@ mod tests {
         let after_outer = v.text_after("a.md", 0, 30, "Other");
         assert!(after_outer.contains("[[inner#Head]]"), "{after_outer}");
         assert!(after_outer.contains("Other"), "{after_outer}");
+    }
+
+    // ---- links are resolved from their own note: the same file name in two folders ----
+
+    const TWO_BS: [(&str, &str); 4] = [
+        ("b.md", "# root b\n"),
+        ("sub/b.md", "# sub b\n"),
+        ("sub/a.md", "[t](b.md) and [t2](../b.md)\n"),
+        ("c.md", "[[b]]\n"),
+    ];
+
+    #[test]
+    fn renaming_the_root_note_leaves_links_to_the_same_named_note_in_a_folder_alone() {
+        let v = vault(&TWO_BS);
+        let applied = v.rename("c.md", 0, 3, "z").unwrap();
+        assert_eq!(applied.texts["c.md"], "[[z]]\n");
+        // `[t](b.md)` reaches sub/b.md; only `../b.md` reaches the renamed root note.
+        assert_eq!(applied.texts["sub/a.md"], "[t](b.md) and [t2](../z.md)\n");
+        assert_eq!(applied.texts["sub/b.md"], "# sub b\n");
+        assert_eq!(applied.texts["b.md"], "# root b\n");
+        assert_eq!(applied.renames.len(), 1);
+        assert_eq!(
+            (&applied.renames[0].0[..], &applied.renames[0].1[..]),
+            ("b.md", "z.md")
+        );
+    }
+
+    #[test]
+    fn renaming_the_note_in_the_folder_leaves_the_root_notes_links_alone() {
+        let v = vault(&TWO_BS);
+        let applied = v.rename("sub/a.md", 0, 2, "z").unwrap();
+        assert_eq!(applied.texts["sub/a.md"], "[t](z.md) and [t2](../b.md)\n");
+        assert_eq!(applied.texts["c.md"], "[[b]]\n");
+        assert_eq!(applied.renames.len(), 1);
+        assert_eq!(
+            (&applied.renames[0].0[..], &applied.renames[0].1[..]),
+            ("sub/b.md", "sub/z.md")
+        );
+    }
+
+    #[test]
+    fn heading_renames_follow_the_note_the_link_really_reaches() {
+        let v = vault(&[
+            ("b.md", "# Head\n"),
+            ("sub/b.md", "# Head\n"),
+            ("sub/a.md", "[t](b.md#Head) [u](../b.md#Head)\n"),
+            ("c.md", "[[b#Head]]\n"),
+        ]);
+        let applied = v.rename("sub/a.md", 0, 4, "New").unwrap();
+        assert_eq!(applied.texts["sub/b.md"], "# New\n");
+        assert_eq!(
+            applied.texts["sub/a.md"],
+            "[t](b.md#New) [u](../b.md#Head)\n"
+        );
+        assert_eq!(applied.texts["b.md"], "# Head\n");
+        assert_eq!(applied.texts["c.md"], "[[b#Head]]\n");
+    }
+
+    #[test]
+    fn a_link_that_leaves_the_vault_cannot_be_renamed_and_is_never_rewritten() {
+        let v = vault(&[
+            ("out.md", "# out\n"),
+            ("sub/a.md", "[t](../../out.md)\n"),
+            ("c.md", "[[out]]\n"),
+        ]);
+        // Cursor on the escaping link: broken, so there is nothing to rename.
+        assert!(v.rename("sub/a.md", 0, 3, "z").is_err());
+        // Renaming the real note from a good link does not touch the escaping one.
+        let applied = v.rename("c.md", 0, 3, "z").unwrap();
+        assert_eq!(applied.texts["c.md"], "[[z]]\n");
+        assert_eq!(applied.texts["sub/a.md"], "[t](../../out.md)\n");
+    }
+
+    #[test]
+    fn a_daily_alias_link_is_not_rewritten_when_the_daily_note_is_renamed() {
+        let mut v = vault(&[
+            ("a.md", "[[today]] and [[today-note]]\n"),
+            ("daily/today-note.md", "# the daily note\n"),
+        ]);
+        v.state.config.daily_note.folder = "daily".into();
+        v.state.config.daily_note.format = "today-note".into();
+        let applied = v.rename("a.md", 0, 20, "z").unwrap();
+        // The alias keeps working (it names no file); the link that names the file follows it.
+        assert_eq!(applied.texts["a.md"], "[[today]] and [[z]]\n");
     }
 }

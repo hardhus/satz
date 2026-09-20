@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use satz_core::{DocId, Document, Index, fold_key, slugify};
+use satz_core::{DocId, Document, fold_key, slugify};
 use tower_lsp_server::ls_types::{Location, ReferenceParams, Uri};
 
 use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz, path_to_uri};
@@ -23,14 +23,11 @@ enum CursorTarget {
     Doc(DocId),
 }
 
-fn cursor_target(doc: &Document, off: usize, index: &Index) -> Option<CursorTarget> {
+fn cursor_target(doc: &Document, off: usize, state: &SatzState) -> Option<CursorTarget> {
+    let index = &state.index;
     // Priority order: link > block > heading > tag > document
     if let Some(l) = doc.link_at(off) {
-        let target = if l.target_doc.is_empty() {
-            doc.id.clone()
-        } else {
-            index.resolve_link(&l.target_doc)?.clone()
-        };
+        let target = state.link_target_doc(doc, l)?.clone();
         return Some(match (&l.target_block, &l.target_heading) {
             (Some(b), _) => CursorTarget::Block {
                 doc: target,
@@ -87,7 +84,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
     let satz_pos = lsp_pos_to_satz(pos);
     let byte_offset = doc.line_index.position_to_byte(satz_pos);
 
-    let target = cursor_target(doc, byte_offset, &state.index)?;
+    let target = cursor_target(doc, byte_offset, state)?;
     let mut locations = Vec::new();
     // Where the target is declared (the heading, the block, the note's start), if it has a place.
     let mut declaration: Option<Location> = None;
@@ -134,11 +131,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                     };
 
                     for link in &src_doc.links {
-                        let resolves_to_target = if link.target_doc.is_empty() {
-                            src_id == doc
-                        } else {
-                            state.index.resolve_link(&link.target_doc) == Some(doc)
-                        };
+                        let resolves_to_target = state.link_target_doc(src_doc, link) == Some(doc);
 
                         if resolves_to_target
                             && link
@@ -185,11 +178,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                     };
 
                     for link in &src_doc.links {
-                        let resolves_to_target = if link.target_doc.is_empty() {
-                            src_id == doc
-                        } else {
-                            state.index.resolve_link(&link.target_doc) == Some(doc)
-                        };
+                        let resolves_to_target = state.link_target_doc(src_doc, link) == Some(doc);
 
                         // A reference belongs to the first heading it matches; a later
                         // duplicate owns none. (An unresolved heading falls back to the slug.)
@@ -238,11 +227,8 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                     };
 
                     for link in &src_doc.links {
-                        let resolves_to_target = if link.target_doc.is_empty() {
-                            src_id == target_doc_id
-                        } else {
-                            state.index.resolve_link(&link.target_doc) == Some(target_doc_id)
-                        };
+                        let resolves_to_target =
+                            state.link_target_doc(src_doc, link) == Some(target_doc_id);
 
                         if resolves_to_target {
                             locations.push(Location::new(
@@ -584,5 +570,51 @@ mod tests {
         let mut back = refs(&files, "a.md", (0, 7), true);
         back.sort();
         assert_eq!(back, vec![("a.md".to_string(), 0), ("b.md".to_string(), 0)]);
+    }
+
+    #[test]
+    fn references_tell_the_same_file_name_in_two_folders_apart() {
+        let files = [
+            ("b.md", "# root b\n"),
+            ("sub/b.md", "# sub b\n"),
+            ("sub/a.md", "[t](b.md)\n[u](../b.md)\n"),
+            ("c.md", "[[b]]\n"),
+        ];
+        let mut root_refs = refs(&files, "c.md", (0, 3), false);
+        root_refs.sort();
+        assert_eq!(
+            root_refs,
+            vec![("c.md".to_string(), 0), ("sub/a.md".to_string(), 1)]
+        );
+        let folder_refs = refs(&files, "sub/a.md", (0, 2), false);
+        assert_eq!(folder_refs, vec![("sub/a.md".to_string(), 0)]);
+    }
+
+    #[test]
+    fn references_from_a_link_that_leaves_the_vault_find_nothing() {
+        let files = [
+            ("out.md", "# out\n"),
+            ("sub/a.md", "[t](../../out.md)\n"),
+            ("c.md", "[[out]]\n"),
+        ];
+        assert!(refs(&files, "sub/a.md", (0, 3), true).is_empty());
+        // The escaping link is not a reference to `out.md` either.
+        assert_eq!(
+            refs(&files, "c.md", (0, 3), false),
+            vec![("c.md".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn heading_references_follow_the_note_the_link_really_reaches() {
+        let files = [
+            ("b.md", "# Head\n"),
+            ("sub/b.md", "# Head\n"),
+            ("sub/a.md", "[t](b.md#Head)\n[u](../b.md#Head)\n"),
+        ];
+        let found = refs(&files, "sub/a.md", (0, 6), false);
+        assert_eq!(found, vec![("sub/a.md".to_string(), 0)]);
+        let root = refs(&files, "sub/a.md", (1, 6), false);
+        assert_eq!(root, vec![("sub/a.md".to_string(), 1)]);
     }
 }
