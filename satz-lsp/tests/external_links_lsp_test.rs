@@ -1,3 +1,4 @@
+// Test states are built field by field so each test shows exactly what it sets up.
 #![allow(clippy::field_reassign_with_default)]
 //! `mailto:`/`tel:`/`obsidian:` links are external: no "missing note" diagnostics, no inlay
 //! hints, no semantic-token colouring as a note link, and the document link opens the URL.

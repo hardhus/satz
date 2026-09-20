@@ -104,7 +104,7 @@ pub(crate) fn layout(source: &str, config: &FormatterConfig) -> String {
                 }
                 // Don't add blank lines if previous was frontmatter closing or empty doc
                 let after_fm = result_lines.last().map(|(s, _)| s.as_str()) == Some("---");
-                let target_blanks = if after_fm { 1 } else { needed_before.max(1) };
+                let target_blanks = if after_fm { 1 } else { needed_before };
                 for _ in 0..target_blanks {
                     result_lines.push((String::new(), false));
                 }
@@ -516,5 +516,75 @@ mod tests {
         assert_eq!(fmt_wrap("a  \nb\n", 80), "a  \nb\n");
         // A single trailing space is only whitespace and reflows.
         assert_eq!(fmt_wrap("a \nb\n", 80), "a b\n");
+    }
+
+    // ---- blank_lines_around_headings: the configured number is used, including 0 ----
+
+    fn with_blanks(src: &str, blanks: u8) -> String {
+        let cfg = FormatterConfig {
+            blank_lines_around_headings: blanks,
+            ..FormatterConfig::default()
+        };
+        crate::formatter::format_document(src, &cfg)
+    }
+
+    fn html(md: &str) -> String {
+        let mut out = String::new();
+        pulldown_cmark::html::push_html(&mut out, pulldown_cmark::Parser::new(md));
+        out
+    }
+
+    #[test]
+    fn zero_blank_lines_before_a_heading_means_none() {
+        assert_eq!(
+            with_blanks("text\n\n\n## H\n\nmore\n", 0),
+            "text\n## H\n\nmore\n"
+        );
+        assert_eq!(with_blanks("# A\n\n## B\n", 0), "# A\n## B\n");
+        assert_eq!(with_blanks("- a\n\n# H\n", 0), "- a\n# H\n");
+    }
+
+    #[test]
+    fn other_counts_are_used_as_configured() {
+        assert_eq!(with_blanks("a\n# H\nb\n", 1), "a\n\n# H\nb\n");
+        assert_eq!(with_blanks("a\n# H\nb\n", 2), "a\n\n\n# H\nb\n");
+        assert_eq!(with_blanks("a\n\n\n\n\n# H\nb\n", 3), "a\n\n\n\n# H\nb\n");
+        assert_eq!(with_blanks("# A\n## B\n", 1), "# A\n\n## B\n");
+        let many = with_blanks("a\n# H\n", 255);
+        assert_eq!(many, format!("a\n{}# H\n", "\n".repeat(255)));
+    }
+
+    #[test]
+    fn a_heading_right_after_frontmatter_always_gets_exactly_one_blank_line() {
+        for blanks in [0, 1, 3] {
+            assert_eq!(
+                with_blanks("---\ntitle: x\n---\n# H\ntext\n", blanks),
+                "---\ntitle: x\n---\n\n# H\ntext\n",
+                "blanks = {blanks}"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_lines_inside_protected_regions_are_left_alone_at_every_setting() {
+        let src = "text\n\n```\n# not a heading\n\n\n## nor this\n```\n\n    # indented code\n";
+        for blanks in [0, 1, 2] {
+            let out = with_blanks(src, blanks);
+            assert!(
+                out.contains("```\n# not a heading\n\n\n## nor this\n```"),
+                "{blanks}: {out:?}"
+            );
+            assert!(out.contains("    # indented code"), "{blanks}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn every_setting_is_idempotent_and_keeps_the_rendered_document() {
+        let src = "intro\n\n# A\ntext\n## B\n\n\nmore text\n\n- item\n\n### C\n> quote\n#### D\n";
+        for blanks in [0, 1, 2, 5] {
+            let once = with_blanks(src, blanks);
+            assert_eq!(with_blanks(&once, blanks), once, "blanks = {blanks}");
+            assert_eq!(html(&once), html(src), "blanks = {blanks}: {once:?}");
+        }
     }
 }

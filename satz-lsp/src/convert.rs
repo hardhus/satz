@@ -12,7 +12,6 @@ pub fn satz_pos_to_lsp(pos: SatzPosition) -> lsp::Position {
 }
 
 /// Converts an `lsp_types::Position` to a `satz_core::Position`.
-#[allow(dead_code)]
 #[inline]
 pub fn lsp_pos_to_satz(pos: lsp::Position) -> SatzPosition {
     SatzPosition::new(pos.line, pos.character)
@@ -56,7 +55,6 @@ fn normalize_windows_drive_root(path: PathBuf) -> PathBuf {
 }
 
 /// Converts a filesystem `Path` into an `lsp::Uri`.
-#[allow(dead_code)]
 pub fn path_to_uri(path: &Path) -> Option<lsp::Uri> {
     lsp::Uri::from_file_path(path)
 }

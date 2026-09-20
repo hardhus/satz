@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command,
     CreateFile, CreateFileOptions, DocumentChangeOperation, DocumentChanges, OneOf,
@@ -74,63 +72,116 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
         }
     });
 
-    if let Some(link) = link_opt {
-        if matches!(
+    if let Some(link) = link_opt
+        && matches!(
             link.kind,
             LinkKind::WikiLink | LinkKind::Embed | LinkKind::Markdown
-        ) && !satz_core::model::link::is_external_target(&link.target_doc)
-        {
-            match state.resolve(link, doc) {
-                satz_core::LinkResolution::DocMissing if !link.target_doc.is_empty() => {
-                    let components = note_components(&link.target_doc);
-                    let target_path = components.as_ref().map(|parts| {
-                        let mut path = match &state.vault_root {
-                            Some(root) => root.clone(),
-                            None => std::path::PathBuf::new(),
-                        };
-                        path.extend(parts);
-                        path
-                    });
+        )
+        && !satz_core::model::link::is_external_target(&link.target_doc)
+    {
+        match state.resolve(link, doc) {
+            satz_core::LinkResolution::DocMissing if !link.target_doc.is_empty() => {
+                let components = note_components(&link.target_doc);
+                let target_path = components.as_ref().map(|parts| {
+                    let mut path = match &state.vault_root {
+                        Some(root) => root.clone(),
+                        None => std::path::PathBuf::new(),
+                    };
+                    path.extend(parts);
+                    path
+                });
 
-                    if let (Some(parts), Some(target_path)) = (components, target_path)
-                        && let Some(target_uri) = path_to_uri(&target_path)
-                    {
-                        let clean_name = parts.join("/");
-                        let clean_name = clean_name.trim_end_matches(".md");
-                        let title = parts
-                            .last()
-                            .map_or(clean_name, |last| last.strip_suffix(".md").unwrap_or(last));
-                        let initial_content = satz_core::generate_document_template(title, None);
+                if let (Some(parts), Some(target_path)) = (components, target_path)
+                    && let Some(target_uri) = path_to_uri(&target_path)
+                {
+                    let clean_name = parts.join("/");
+                    let clean_name = clean_name.trim_end_matches(".md");
+                    let title = parts
+                        .last()
+                        .map_or(clean_name, |last| last.strip_suffix(".md").unwrap_or(last));
+                    let initial_content = satz_core::generate_document_template(title, None);
 
-                        let ops = vec![
-                            DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
-                                uri: target_uri.clone(),
-                                // A file that exists but is not indexed yet must not fail the whole
-                                // edit, and must never be overwritten.
-                                options: Some(CreateFileOptions {
-                                    overwrite: Some(false),
-                                    ignore_if_exists: Some(true),
-                                }),
-                                annotation_id: None,
-                            })),
-                            DocumentChangeOperation::Edit(TextDocumentEdit {
-                                text_document: OptionalVersionedTextDocumentIdentifier {
-                                    uri: target_uri,
-                                    version: None,
-                                },
-                                edits: vec![OneOf::Left(TextEdit {
-                                    range: Range::default(),
-                                    new_text: initial_content,
-                                })],
+                    let ops = vec![
+                        DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                            uri: target_uri.clone(),
+                            // A file that exists but is not indexed yet must not fail the whole
+                            // edit, and must never be overwritten.
+                            options: Some(CreateFileOptions {
+                                overwrite: Some(false),
+                                ignore_if_exists: Some(true),
                             }),
-                        ];
+                            annotation_id: None,
+                        })),
+                        DocumentChangeOperation::Edit(TextDocumentEdit {
+                            text_document: OptionalVersionedTextDocumentIdentifier {
+                                uri: target_uri,
+                                version: None,
+                            },
+                            edits: vec![OneOf::Left(TextEdit {
+                                range: Range::default(),
+                                new_text: initial_content,
+                            })],
+                        }),
+                    ];
+
+                    let action = CodeAction {
+                        title: format!("Create note: \"{}\"", clean_name),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit {
+                            document_changes: Some(DocumentChanges::Operations(ops)),
+                            ..Default::default()
+                        }),
+                        is_preferred: Some(true),
+                        disabled: None,
+                        command: None,
+                        data: None,
+                    };
+
+                    actions.push(CodeActionOrCommand::CodeAction(action));
+                }
+            }
+            satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
+                if let Some(heading_name) = &link.target_heading {
+                    let target_path = match &state.vault_root {
+                        Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
+                        _ => target_doc.path.clone(),
+                    };
+                    if let Some(target_uri) = path_to_uri(&target_path) {
+                        let source = target_doc.line_index.source();
+                        let end_pos = target_doc.line_index.byte_to_position(source.len());
+                        let insert_text = if source.ends_with('\n') {
+                            format!("\n## {}\n", heading_name)
+                        } else {
+                            format!("\n\n## {}\n", heading_name)
+                        };
+
+                        let edit = TextEdit {
+                            range: Range::new(
+                                tower_lsp_server::ls_types::Position::new(
+                                    end_pos.line,
+                                    end_pos.character,
+                                ),
+                                tower_lsp_server::ls_types::Position::new(
+                                    end_pos.line,
+                                    end_pos.character,
+                                ),
+                            ),
+                            new_text: insert_text,
+                        };
+
+                        let mut changes = std::collections::HashMap::new();
+                        changes.insert(target_uri, vec![edit]);
 
                         let action = CodeAction {
-                            title: format!("Create note: \"{}\"", clean_name),
+                            title: format!(
+                                "Add heading '## {}' to \"{}\"",
+                                heading_name, target_doc.title
+                            ),
                             kind: Some(CodeActionKind::QUICKFIX),
                             diagnostics: None,
                             edit: Some(WorkspaceEdit {
-                                document_changes: Some(DocumentChanges::Operations(ops)),
+                                changes: Some(changes),
                                 ..Default::default()
                             }),
                             is_preferred: Some(true),
@@ -142,63 +193,8 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
                         actions.push(CodeActionOrCommand::CodeAction(action));
                     }
                 }
-                satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
-                    if let Some(heading_name) = &link.target_heading {
-                        let target_path = match &state.vault_root {
-                            Some(root) if !target_doc.path.is_absolute() => {
-                                root.join(&target_doc.path)
-                            }
-                            _ => target_doc.path.clone(),
-                        };
-                        if let Some(target_uri) = path_to_uri(&target_path) {
-                            let source = target_doc.line_index.source();
-                            let end_pos = target_doc.line_index.byte_to_position(source.len());
-                            let insert_text = if source.ends_with('\n') {
-                                format!("\n## {}\n", heading_name)
-                            } else {
-                                format!("\n\n## {}\n", heading_name)
-                            };
-
-                            let edit = TextEdit {
-                                range: Range::new(
-                                    tower_lsp_server::ls_types::Position::new(
-                                        end_pos.line,
-                                        end_pos.character,
-                                    ),
-                                    tower_lsp_server::ls_types::Position::new(
-                                        end_pos.line,
-                                        end_pos.character,
-                                    ),
-                                ),
-                                new_text: insert_text,
-                            };
-
-                            let mut changes = std::collections::HashMap::new();
-                            changes.insert(target_uri, vec![edit]);
-
-                            let action = CodeAction {
-                                title: format!(
-                                    "Add heading '## {}' to \"{}\"",
-                                    heading_name, target_doc.title
-                                ),
-                                kind: Some(CodeActionKind::QUICKFIX),
-                                diagnostics: None,
-                                edit: Some(WorkspaceEdit {
-                                    changes: Some(changes),
-                                    ..Default::default()
-                                }),
-                                is_preferred: Some(true),
-                                disabled: None,
-                                command: None,
-                                data: None,
-                            };
-
-                            actions.push(CodeActionOrCommand::CodeAction(action));
-                        }
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     }
 
@@ -272,7 +268,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;

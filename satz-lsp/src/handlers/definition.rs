@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz, path_to_uri};
 use crate::state::SatzState;
 use satz_core::LinkKind;
@@ -102,7 +100,7 @@ pub fn goto_definition(
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
@@ -118,11 +116,6 @@ mod tests {
             Path::new("C:\\doc-a.md")
         } else {
             Path::new("/doc-a.md")
-        };
-        let abs_b = if cfg!(windows) {
-            Path::new("C:\\doc-b.md")
-        } else {
-            Path::new("/doc-b.md")
         };
 
         // Use relative paths for parse_document, just like `walk.rs` does

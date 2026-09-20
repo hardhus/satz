@@ -48,6 +48,7 @@ pub fn document_symbol(
             text => text.to_string(),
         };
 
+        // The LSP type marks this field `#[deprecated]` but the protocol still requires it.
         #[allow(deprecated)]
         let symbol = DocumentSymbol {
             name,
@@ -100,6 +101,7 @@ pub fn document_symbol(
 }
 
 #[cfg(test)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;

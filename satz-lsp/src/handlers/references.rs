@@ -263,7 +263,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use std::path::Path;
@@ -281,11 +281,6 @@ mod tests {
             Path::new("C:\\doc-a.md")
         } else {
             Path::new("/doc-a.md")
-        };
-        let abs_b = if cfg!(windows) {
-            Path::new("C:\\doc-b.md")
-        } else {
-            Path::new("/doc-b.md")
         };
 
         let rel_a = Path::new("doc-a.md");
@@ -342,11 +337,6 @@ mod tests {
 
     #[test]
     fn test_find_block_references() {
-        let abs_lsp = if cfg!(windows) {
-            Path::new("C:\\LSP.md")
-        } else {
-            Path::new("/LSP.md")
-        };
         let abs_daily = if cfg!(windows) {
             Path::new("C:\\daily.md")
         } else {

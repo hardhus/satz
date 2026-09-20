@@ -107,6 +107,20 @@ fn collect_atomic_spans(
         spans.push((*span, source[span.start..span.end].chars().count()));
     }
 
+    // An image is one piece: its alt text and title contain spaces the wrapper must not break at.
+    for span in &structure.image_spans {
+        let raw = &source[span.start..span.end];
+        let width = if display_mode {
+            // The alt text is what a rendered viewer shows: `![alt](...)` -> `alt`.
+            raw.strip_prefix("![")
+                .and_then(|rest| rest.split_once(']'))
+                .map_or_else(|| raw.chars().count(), |(alt, _)| alt.chars().count())
+        } else {
+            raw.chars().count()
+        };
+        spans.push((*span, width));
+    }
+
     for link in &structure.std_links {
         let raw = &source[link.range.start..link.range.end];
         let width = if display_mode {
@@ -556,5 +570,77 @@ mod tests {
         let pass1 = wrapped(input, &config);
         let pass2 = wrapped(&pass1, &config);
         assert_eq!(pass1, pass2);
+    }
+
+    // ---- images are atomic: their alt text and title are never split across lines ----
+
+    fn html_of(md: &str) -> String {
+        let mut out = String::new();
+        pulldown_cmark::html::push_html(&mut out, pulldown_cmark::Parser::new(md));
+        // A soft line break renders as a newline, a space renders as a space: same text.
+        out.replace('\n', " ")
+    }
+
+    #[test]
+    fn an_image_with_spaces_in_alt_and_title_is_never_split() {
+        let image = "![two words alt](img.png \"a long title\")";
+        let input = format!("first words here {image} then some more words after it\n");
+        for width in [10, 20, 30, 45] {
+            let out = wrapped(&input, &enabled_config(width));
+            assert!(out.contains(image), "width {width}: {out:?}");
+            assert_eq!(html_of(&out), html_of(&input), "width {width}");
+        }
+    }
+
+    #[test]
+    fn a_nested_image_link_stays_in_one_piece() {
+        let nested = "[![alt text here](i.png \"the title\")](note.md)";
+        let input = format!("before {nested} after and then plenty of extra words to wrap\n");
+        let out = wrapped(&input, &enabled_config(24));
+        assert!(out.contains(nested), "{out:?}");
+        assert_eq!(html_of(&out), html_of(&input));
+    }
+
+    #[test]
+    fn images_next_to_punctuation_start_or_end_of_a_paragraph_and_reference_style() {
+        for input in [
+            "![a b c](x.png), then more words that need wrapping around here\n",
+            "words that need wrapping around here and then an image ![a b c](x.png).\n",
+            "![a b c](x.png) ![d e f](y.png) and a few more words to wrap over lines\n",
+            "some words ![alt two][ref] more words to wrap them properly here\n\n[ref]: img.png\n",
+        ] {
+            let out = wrapped(input, &enabled_config(18));
+            for image in ["![a b c](x.png)", "![d e f](y.png)", "![alt two][ref]"] {
+                if input.contains(image) {
+                    assert!(out.contains(image), "{image} in {out:?}");
+                }
+            }
+            assert_eq!(html_of(&out), html_of(input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn a_very_long_image_overflows_the_line_instead_of_being_broken() {
+        let image = "![a really long alternative text with many words](some/long/path/to/an/image.png \"and a title\")";
+        let input = format!("short {image} tail\n");
+        let out = wrapped(&input, &enabled_config(20));
+        assert!(out.contains(image), "{out:?}");
+        assert_eq!(out.lines().filter(|l| l.contains("![")).count(), 1);
+    }
+
+    #[test]
+    fn both_width_modes_keep_images_whole_and_wrapping_is_idempotent() {
+        let input = "one two three ![alt with words](pic.png \"t t\") four five six seven eight nine ten eleven\n";
+        for mode in ["raw", "display"] {
+            let mut config = enabled_config(28);
+            config.wrap.link_width_mode = mode.to_string();
+            let once = wrapped(input, &config);
+            assert!(
+                once.contains("![alt with words](pic.png \"t t\")"),
+                "{mode}: {once:?}"
+            );
+            assert_eq!(wrapped(&once, &config), once, "{mode}");
+            assert_eq!(html_of(&once), html_of(input), "{mode}");
+        }
     }
 }

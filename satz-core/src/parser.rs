@@ -13,37 +13,105 @@ use crate::model::range::ByteRange;
 use crate::model::tag::Tag;
 use crate::text::LineIndex;
 
-fn locate_fm_tag(source: &str, fm: ByteRange, name: &str, from: usize) -> Option<ByteRange> {
-    let hay = &source[fm.start..fm.end];
-    let key_at = hay
-        .find("\ntags:")
-        .or_else(|| hay.find("\ntag:"))
-        .map(|i| i + 1)
-        .or_else(|| {
-            if hay.starts_with("tags:") || hay.starts_with("tag:") {
-                Some(0)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-    let mut at = from.max(key_at);
-    while let Some(idx) = hay[at..].find(name) {
-        let s = at + idx;
-        let e = s + name.len();
-        let prev_ok = s == 0
-            || !hay[..s]
+/// Where the values of the frontmatter's `tags:` / `tag:` keys are written, so each tag can be found
+/// inside its own key's value and nowhere else.
+struct TagKeyRegion {
+    /// The whole key line (what a tag points at when its spelling cannot be found).
+    key_line: ByteRange,
+    /// End of the region: the next top-level key or the closing fence, absolute.
+    end: usize,
+    /// Where the next search in this region starts, absolute.
+    cursor: usize,
+}
+
+/// A line that starts a top-level YAML key (`name:` at column 0), as opposed to an indented
+/// continuation, a `- item`, a comment or a fence.
+fn is_top_level_key(line: &str) -> bool {
+    let Some(first) = line.chars().next() else {
+        return false;
+    };
+    if first.is_whitespace()
+        || first == '#'
+        || first == '-' && (line.len() == 1 || line[1..].starts_with([' ', '\t']))
+    {
+        return false;
+    }
+    line.find(':').is_some_and(|i| {
+        let after = &line[i + 1..];
+        after.is_empty() || after.starts_with([' ', '\t'])
+    })
+}
+
+fn tag_key_regions(source: &str, fm: ByteRange) -> Vec<TagKeyRegion> {
+    let block = &source[fm.start..fm.end];
+    // (absolute start, line without its line ending) for every line of the block.
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0;
+    for raw in block.split_inclusive('\n') {
+        lines.push((fm.start + offset, raw.trim_end_matches(['\n', '\r'])));
+        offset += raw.len();
+    }
+    // The opening and closing `---` fences are not part of any value.
+    let content_end = match lines.last() {
+        Some((start, text)) if lines.len() > 1 && text.trim() == "---" => *start,
+        _ => fm.end,
+    };
+    let mut regions = Vec::new();
+    for (i, (start, text)) in lines.iter().enumerate() {
+        if *start >= content_end || !is_top_level_key(text) {
+            continue;
+        }
+        let key = text.split(':').next().unwrap_or("");
+        if key != "tags" && key != "tag" {
+            continue;
+        }
+        let end = lines[i + 1..]
+            .iter()
+            .find(|(s, t)| *s >= content_end || is_top_level_key(t))
+            .map_or(content_end, |(s, _)| *s)
+            .min(content_end);
+        let value_start = start + key.len() + 1;
+        regions.push(TagKeyRegion {
+            key_line: ByteRange::new(*start, start + text.len()),
+            end,
+            cursor: value_start,
+        });
+    }
+    regions
+}
+
+/// The byte range of `name` written in one of the tag keys' values: never in the key itself, in a
+/// comment or in another key, and in order (a repeated tag gets its next occurrence).
+fn locate_fm_tag(source: &str, regions: &mut [TagKeyRegion], name: &str) -> Option<ByteRange> {
+    if name.is_empty() {
+        return None;
+    }
+    for region in regions.iter_mut() {
+        let mut at = region.cursor;
+        while at < region.end {
+            let Some(idx) = source[at..region.end].find(name) else {
+                break;
+            };
+            let s = at + idx;
+            let e = s + name.len();
+            // A `# comment` line inside the value is not a tag list.
+            let line_start = source[..s].rfind('\n').map_or(0, |i| i + 1);
+            let in_comment = source[line_start..s].trim_start().starts_with('#')
+                || source[line_start..s].contains(" #");
+            let prev_ok = !source[..s]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '/');
-        let next_ok = hay[e..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '/');
-        if prev_ok && next_ok {
-            return Some(ByteRange::new(fm.start + s, fm.start + e));
+            let next_ok = source[e..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '/');
+            if prev_ok && next_ok && !in_comment {
+                region.cursor = e;
+                return Some(ByteRange::new(s, e));
+            }
+            at = e;
         }
-        at = e;
     }
     None
 }
@@ -87,18 +155,25 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
     // Frontmatter tags + body tags
     let mut tags: Vec<Tag> = Vec::new();
     if let Some(fm_range) = structure.frontmatter_range {
-        let mut fm_cursor = 0usize;
+        let mut regions = tag_key_regions(source, fm_range);
+        // A tag whose spelling cannot be found (an escaped or otherwise normalised value) points at
+        // its key's line, never at an empty range.
+        let fallback = regions.first().map_or_else(
+            || {
+                let end = source[fm_range.start..fm_range.end]
+                    .find('\n')
+                    .map_or(fm_range.end, |n| fm_range.start + n);
+                ByteRange::new(
+                    fm_range.start,
+                    end.max(fm_range.start + 1).min(fm_range.end),
+                )
+            },
+            |r| r.key_line,
+        );
         for t in &frontmatter.tags {
             let clean_name = t.trim_start_matches('#');
-            if let Some(range) = locate_fm_tag(source, fm_range, clean_name, fm_cursor) {
-                fm_cursor = range.end.saturating_sub(fm_range.start);
-                tags.push(Tag::new(t.clone(), range));
-            } else {
-                tags.push(Tag::new(
-                    t.clone(),
-                    ByteRange::new(fm_range.start, fm_range.start),
-                ));
-            }
+            let range = locate_fm_tag(source, &mut regions, clean_name).unwrap_or(fallback);
+            tags.push(Tag::new(t.clone(), range));
         }
     }
     // `[x](#anchor)` and `<a href="#x">` contain anchors, not tags.

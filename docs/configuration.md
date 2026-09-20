@@ -166,7 +166,7 @@ The formatter changes how a document is *written*, never how it *renders*. Guara
 |---|---|---|---|
 | `enabled` | bool | `true` | Master switch for the entire formatter. When `false`, `satz fmt` reports nothing to do and `textDocument/formatting` returns no edits. |
 | `line_width` | integer | `80` | Target column width for paragraph reflow. Only takes effect when `[formatter.wrap] enable = true` — see below; otherwise unused. |
-| `blank_lines_around_headings` | integer (0–255) | `1` | Number of blank lines forced before each heading (headings immediately after frontmatter always get exactly one). |
+| `blank_lines_around_headings` | integer (0–255) | `1` | Number of blank lines forced BEFORE each heading; `0` means none (the space after a heading is not managed). A heading immediately after frontmatter always gets exactly one blank line. |
 | `final_newline` | bool | `true` | Whether the formatted document must end with exactly one trailing newline. |
 | `normalize_links` | bool | `true` | Whether `[[  target  \|  display  ]]`-style wikilinks get their whitespace trimmed down to `[[target\|display]]` on format. Wikilinks inside code (inline code, fenced or indented blocks) and inside frontmatter are literal text and are never touched. |
 
@@ -228,6 +228,8 @@ Wrapping never changes what a paragraph *is*:
   followed by a newline (which would turn it into a hard break).
 - A trailing-two-spaces hard break (`text␠␠` + newline) is kept exactly as written, both by wrapping and by the trailing-whitespace trim.
 - Footnote definitions are not reflowed.
+- An image (`![alt text](img.png "title")`) is never split across lines, like a link.
+- Math is never touched by any formatting stage: `$…$` and `$$…$$` (inline, or a display block that starts with `$$` on its own line) keep every character, line and blank line. `$5 and $10` is money, not math (a `$` closes a formula only when no space precedes it and no digit follows). A display block inside a blockquote (`> $$`) is not recognised as a block. If a formatting stage ever changed a formula, the whole document is left unformatted instead.
 - As a final check, a paragraph is only rewritten if re-parsing the wrapped text still gives
   exactly one paragraph with the same words; otherwise it is left as you wrote it.
 

@@ -3,6 +3,7 @@ pub mod emphasis;
 pub mod line_pass;
 pub mod links;
 pub mod list;
+mod math;
 pub mod misc;
 pub mod table;
 pub mod wrap;
@@ -67,8 +68,22 @@ fn uses_crlf(source: &str) -> bool {
     crlf > lf
 }
 
-/// The formatting pipeline proper; expects `\n` line endings only.
+/// Formats LF text with math protected: formulas are masked before the stages run and put back
+/// afterwards (see `math`). If the masks cannot be put back intact the document is returned as it
+/// was -- not formatting is safer than damaging a formula.
 fn format_lf(source: &str, config: &FormatterConfig) -> String {
+    match math::mask(source) {
+        None => format_stages(source, config),
+        Some((masked, mask)) => {
+            let formatted = format_stages(&masked, config);
+            mask.restore(&formatted)
+                .unwrap_or_else(|| source.to_string())
+        }
+    }
+}
+
+/// The formatting pipeline proper; expects `\n` line endings only.
+fn format_stages(source: &str, config: &FormatterConfig) -> String {
     // Stage 0: wikilink whitespace. Done first so tables and wrapping measure the final link text.
     let source = links::normalize(source, config);
     let source = source.as_str();

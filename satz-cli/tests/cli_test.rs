@@ -322,6 +322,7 @@ mod support {
                         unlock(&p);
                     } else if let Ok(meta) = std::fs::metadata(&p) {
                         let mut perms = meta.permissions();
+                        // Clearing the read-only flag is the point: it lets the test clean up its files.
                         #[allow(clippy::permissions_set_readonly_false)]
                         perms.set_readonly(false);
                         let _ = std::fs::set_permissions(&p, perms);

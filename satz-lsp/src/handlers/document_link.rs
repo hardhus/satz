@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams, Uri};
 
 use crate::convert::{byte_range_to_lsp, path_to_uri};
@@ -61,7 +59,7 @@ pub fn document_link(params: DocumentLinkParams, state: &SatzState) -> Option<Ve
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
@@ -75,11 +73,6 @@ mod tests {
             Path::new("C:\\doc-a.md")
         } else {
             Path::new("/doc-a.md")
-        };
-        let abs_b = if cfg!(windows) {
-            Path::new("C:\\doc-b.md")
-        } else {
-            Path::new("/doc-b.md")
         };
 
         let rel_a = Path::new("doc-a.md");

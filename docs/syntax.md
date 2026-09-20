@@ -57,7 +57,7 @@ Standard Markdown footnote syntax. References and definitions are matched by lab
 
 - Inline tags: a `#` immediately followed by at least one letter, optionally continuing with letters/digits/`_`/`-`/`/`. Must be preceded by whitespace, an opening bracket/quote, or be at the start of the text — `word#notatag` is not a tag. A `#` inside a link destination (`[jump](#heading)`, `[x](doc.md#h)`) or inside raw HTML (`<a href="#x">`) is an anchor, not a tag; in plain text `(#fff)` is still a tag, as in Obsidian.
 - Hierarchical tags use `/` as a separator. Querying a parent tag (`felsefe`) also matches everything nested under it (`felsefe/mantık`) via prefix matching — both in `satz list --tag` and in the LSP's tag references/highlighting.
-- Frontmatter tags: `tags: [a, b]` or `tags: a` (a comma-separated string also works) or the singular `tag:` key. A leading `#` in a frontmatter tag value is stripped automatically.
+- Frontmatter tags: `tags: [a, b]` or `tags: a` (a comma-separated string also works) or the singular `tag:` key. A leading `#` in a frontmatter tag value is stripped automatically. Each frontmatter tag knows where it is written in the frontmatter (inside its own `tags:`/`tag:` value, never in another key or a comment), so references and highlights land on it.
 - Tag matching is Unicode-fold-insensitive (`#Rust` and `#rust` are the same tag).
 
 ## Block anchors

@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 use tower_lsp_server::ls_types::{
     Location, Position, Range, SymbolInformation, SymbolKind, WorkspaceSymbolParams,
     WorkspaceSymbolResponse,
@@ -62,6 +60,7 @@ pub fn workspace_symbol(
         };
 
         if let Some(score) = ranker.score(&title_name) {
+            // The LSP type marks this field `#[deprecated]` but the protocol still requires it.
             #[allow(deprecated)]
             scored_symbols.push((
                 score,
@@ -79,6 +78,7 @@ pub fn workspace_symbol(
         // 2. Match Doc Aliases
         for alias in &doc.frontmatter.aliases {
             if let Some(score) = ranker.score(alias) {
+                // The LSP type marks this field `#[deprecated]` but the protocol still requires it.
                 #[allow(deprecated)]
                 scored_symbols.push((
                     score,
@@ -103,6 +103,7 @@ pub fn workspace_symbol(
             }
             if let Some(score) = ranker.score(heading_text) {
                 let range = byte_range_to_lsp(heading.range, &doc.line_index);
+                // The LSP type marks this field `#[deprecated]` but the protocol still requires it.
                 #[allow(deprecated)]
                 scored_symbols.push((
                     score,
@@ -132,7 +133,7 @@ pub fn workspace_symbol(
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;

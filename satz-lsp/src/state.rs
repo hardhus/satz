@@ -485,6 +485,7 @@ impl SatzState {
 }
 
 #[cfg(test)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;

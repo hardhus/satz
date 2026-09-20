@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
@@ -337,37 +335,37 @@ fn tag_spellings(state: &SatzState) -> std::collections::HashMap<String, String>
 }
 
 pub fn completion_resolve(mut item: CompletionItem, state: &SatzState) -> CompletionItem {
-    if let Some(Value::Object(map)) = &item.data {
-        if let Some(Value::String(doc_id_str)) = map.get("doc_id") {
-            let doc_id = satz_core::DocId::new(doc_id_str);
-            if let Some(target_doc) = state.index.get_doc(&doc_id) {
-                let mut value = format!("# {}\n\n", target_doc.title);
+    if let Some(Value::Object(map)) = &item.data
+        && let Some(Value::String(doc_id_str)) = map.get("doc_id")
+    {
+        let doc_id = satz_core::DocId::new(doc_id_str);
+        if let Some(target_doc) = state.index.get_doc(&doc_id) {
+            let mut value = format!("# {}\n\n", target_doc.title);
 
-                if !target_doc.tags.is_empty() {
-                    let tags_str: Vec<String> =
-                        target_doc.tags.iter().map(|t| t.name.clone()).collect();
-                    value.push_str(&format!("**Tags:** {}\n\n", tags_str.join(", ")));
-                }
-
-                let source = target_doc.line_index.source();
-                let preview_lines: Vec<&str> = source
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .take(5)
-                    .collect();
-
-                value.push_str("```markdown\n");
-                value.push_str(&preview_lines.join("\n"));
-                if source.lines().count() > 5 {
-                    value.push_str("\n...");
-                }
-                value.push_str("\n```");
-
-                item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }));
+            if !target_doc.tags.is_empty() {
+                let tags_str: Vec<String> =
+                    target_doc.tags.iter().map(|t| t.name.clone()).collect();
+                value.push_str(&format!("**Tags:** {}\n\n", tags_str.join(", ")));
             }
+
+            let source = target_doc.line_index.source();
+            let preview_lines: Vec<&str> = source
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(5)
+                .collect();
+
+            value.push_str("```markdown\n");
+            value.push_str(&preview_lines.join("\n"));
+            if source.lines().count() > 5 {
+                value.push_str("\n...");
+            }
+            value.push_str("\n```");
+
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }));
         }
     }
 
@@ -375,7 +373,7 @@ pub fn completion_resolve(mut item: CompletionItem, state: &SatzState) -> Comple
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;

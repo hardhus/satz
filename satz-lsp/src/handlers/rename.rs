@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{
     DocumentChangeOperation, DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier,
@@ -542,7 +540,7 @@ fn format_wikilink_doc(
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
@@ -621,11 +619,6 @@ mod tests {
 
     #[test]
     fn test_rename_document_updates_backlinks() {
-        let abs_a = if cfg!(windows) {
-            Path::new("C:\\doc-a.md")
-        } else {
-            Path::new("/doc-a.md")
-        };
         let abs_b = if cfg!(windows) {
             Path::new("C:\\doc-b.md")
         } else {

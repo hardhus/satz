@@ -91,6 +91,8 @@ pub struct StructureOutput {
     /// Regions that look like text to a raw scan but are markup: an inline link's or image's
     /// `(destination)` and raw HTML. A `#anchor` in there is not a tag.
     pub non_text_spans: Vec<ByteRange>,
+    /// Every image, whole: `![alt](url "title")` or `![alt][ref]`.
+    pub image_spans: Vec<ByteRange>,
     /// Every hard line break: `text` + two or more spaces + newline, or `text` + newline. The
     /// trailing spaces of the first form are content, not whitespace to trim.
     pub hard_break_spans: Vec<ByteRange>,
@@ -380,6 +382,9 @@ pub fn parse_structure(source: &str) -> StructureOutput {
 
             // --- Images: the `(dest)` part is not text either ---
             Event::End(TagEnd::Image) => {
+                output
+                    .image_spans
+                    .push(ByteRange::new(range.start, range.end));
                 if let Some(span) = destination_span(source, range) {
                     output.non_text_spans.push(span);
                 }

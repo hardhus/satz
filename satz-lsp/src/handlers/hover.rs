@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 use crate::convert::lsp_pos_to_satz;
 use crate::state::SatzState;
 use satz_core::model::document::Document;
@@ -23,19 +21,19 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
     let link = doc.link_at(byte_offset)?;
 
     if link.kind == LinkKind::Footnote {
-        if let Some(label) = &link.display {
-            if let Some(def) = doc.footnotes.find_def(label) {
-                let source = doc.line_index.source();
-                let def_text = &source[def.range.start..def.range.end];
-                let value = format!("```markdown\n{}\n```", def_text.trim());
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                });
-            }
+        if let Some(label) = &link.display
+            && let Some(def) = doc.footnotes.find_def(label)
+        {
+            let source = doc.line_index.source();
+            let def_text = &source[def.range.start..def.range.end];
+            let value = format!("```markdown\n{}\n```", def_text.trim());
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            });
         }
         return None;
     }
@@ -210,10 +208,9 @@ fn get_default_preview<'a>(target_doc: &Document, source: &'a str) -> &'a str {
         .headings
         .iter()
         .find(|h| h.level == 1 && h.range.start >= start)
+        && source[start..h1.range.start].trim().is_empty()
     {
-        if source[start..h1.range.start].trim().is_empty() {
-            start = h1.range.end;
-        }
+        start = h1.range.end;
     }
 
     if start < source.len() {
@@ -224,7 +221,7 @@ fn get_default_preview<'a>(target_doc: &Document, source: &'a str) -> &'a str {
 }
 
 #[cfg(test)]
-#[allow(unused_variables)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;

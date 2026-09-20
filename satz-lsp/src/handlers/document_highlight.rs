@@ -304,6 +304,7 @@ mod tests {
 }
 
 #[cfg(test)]
+// Test states are built field by field so each test shows exactly what it sets up.
 #[allow(clippy::field_reassign_with_default)]
 mod behavior_tests {
     use super::*;
@@ -490,6 +491,26 @@ mod behavior_tests {
         );
         assert_eq!(one(text, (0, 2)), Some(vec![(0, 0, 25, false)]));
         assert_eq!(one(text, (0, 20)), Some(vec![(0, 0, 25, false)]));
+    }
+
+    #[test]
+    fn a_frontmatter_tag_is_highlighted_where_it_is_written() {
+        let text = "---
+title: rust notes
+tags: [rust]
+---
+body #rust
+";
+        // From the body tag: the tag in the frontmatter list (not the `title`) and the body tag.
+        assert_eq!(
+            one(text, (4, 7)),
+            Some(vec![(2, 7, 11, false), (4, 5, 10, false)])
+        );
+        // From the frontmatter tag itself: the same two.
+        assert_eq!(
+            one(text, (2, 8)),
+            Some(vec![(2, 7, 11, false), (4, 5, 10, false)])
+        );
     }
 
     #[test]

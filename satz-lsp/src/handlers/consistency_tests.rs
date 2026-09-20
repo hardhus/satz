@@ -1,6 +1,7 @@
 //! The same link must be judged the same way by every handler: diagnostics, document links,
 //! inlay hints and highlights all resolve links through one path (folder-relative Markdown
 //! paths, relative daily aliases from the config, anchor checks).
+// Test states are built field by field so each test shows exactly what it sets up.
 #![allow(clippy::field_reassign_with_default)]
 
 use crate::handlers::{

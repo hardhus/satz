@@ -1,3 +1,4 @@
+// Test states are built field by field so each test shows exactly what it sets up.
 #![allow(clippy::field_reassign_with_default)]
 use satz_core::{Index, parse_document};
 use satz_lsp::handlers::definition::goto_definition;

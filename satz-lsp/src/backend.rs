@@ -165,6 +165,7 @@ impl LanguageServer for Backend {
             .and_then(|folders| folders.first())
             .and_then(|f| uri_to_path(f.uri.as_str()))
             .or_else(|| {
+                // The LSP type marks this field `#[deprecated]` but the protocol still requires it.
                 #[allow(deprecated)]
                 params
                     .root_uri
