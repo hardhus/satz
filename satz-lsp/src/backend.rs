@@ -249,15 +249,18 @@ impl Backend {
     /// open document is stale it is reparsed here first, under a short write lock. With nothing
     /// stale (the usual case) this is just a read lock.
     pub(crate) async fn read_fresh(&self) -> tokio::sync::RwLockReadGuard<'_, SatzState> {
+        let today = chrono::Local::now().date_naive();
         {
             let state = self.state.read().await;
-            if !state.has_stale_open_documents() {
+            if !state.has_stale_open_documents() && !state.daily_is_stale(today) {
                 return state;
             }
         }
         {
             let mut state = self.state.write().await;
             state.refresh_stale_open_documents();
+            // Midnight passed (or the daily settings changed): `[[bugün]]` means another note now.
+            state.sync_daily(today);
         }
         self.state.read().await
     }
@@ -1468,5 +1471,20 @@ mod tests {
             })
             .await;
         assert!(!backend.state.read().await.has_stale_open_documents());
+    }
+
+    #[tokio::test]
+    async fn a_request_after_midnight_moves_the_daily_alias_to_the_new_day() {
+        let (backend, _service) = shared_backend().await;
+        let today = chrono::Local::now().date_naive();
+        {
+            let mut state = backend.state.write().await;
+            let config = state.config.daily_note.clone();
+            state.index.set_daily(Some((config, today.pred_opt().unwrap())));
+            assert!(state.daily_is_stale(today));
+        }
+        let read = backend.read_fresh().await;
+        assert_eq!(read.index.daily().map(|(_, d)| *d), Some(today));
+        assert!(!read.daily_is_stale(today));
     }
 }

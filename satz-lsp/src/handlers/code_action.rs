@@ -1,11 +1,12 @@
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command,
-    CreateFile, CreateFileOptions, DocumentChangeOperation, DocumentChanges, OneOf,
-    OptionalVersionedTextDocumentIdentifier, Range, ResourceOp, TextDocumentEdit, TextEdit,
-    WorkspaceEdit,
+    CodeAction, CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionResponse, Command, CreateFile, CreateFileOptions, Diagnostic,
+    DocumentChangeOperation, DocumentChanges, NumberOrString, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, Range, ResourceOp, TextDocumentEdit,
+    TextEdit, WorkspaceEdit,
 };
 
-use crate::convert::{lsp_pos_to_satz, path_to_uri};
+use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz, path_to_uri};
 use crate::state::SatzState;
 use satz_core::model::LinkKind;
 
@@ -47,6 +48,29 @@ fn note_components(target: &str) -> Option<Vec<String>> {
     let last = parts.last_mut()?;
     last.push_str(".md");
     Some(parts)
+}
+
+/// The diagnostics from the request's context that a fix for `link` answers: one of `codes`, on
+/// the link's own range. `None` when there is none, so a client never ties a fix to the wrong squiggle.
+fn diagnostics_fixed_by(
+    context: &CodeActionContext,
+    doc: &satz_core::Document,
+    link: &satz_core::Link,
+    codes: &[&str],
+) -> Option<Vec<Diagnostic>> {
+    let range = byte_range_to_lsp(link.range, &doc.line_index);
+    let ends_before = |a: Position, b: Position| (a.line, a.character) < (b.line, b.character);
+    let found: Vec<Diagnostic> = context
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(&d.code, Some(NumberOrString::String(c)) if codes.contains(&c.as_str()))
+                && !ends_before(d.range.end, range.start)
+                && !ends_before(range.end, d.range.start)
+        })
+        .cloned()
+        .collect();
+    (!found.is_empty()).then_some(found)
 }
 
 pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeActionResponse> {
@@ -127,7 +151,12 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
                     let action = CodeAction {
                         title: format!("Create note: \"{}\"", clean_name),
                         kind: Some(CodeActionKind::QUICKFIX),
-                        diagnostics: None,
+                        diagnostics: diagnostics_fixed_by(
+                            &params.context,
+                            doc,
+                            link,
+                            &["broken-link", "broken-embed"],
+                        ),
                         edit: Some(WorkspaceEdit {
                             document_changes: Some(DocumentChanges::Operations(ops)),
                             ..Default::default()
@@ -189,7 +218,12 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
                                 heading_name, target_doc.title
                             ),
                             kind: Some(CodeActionKind::QUICKFIX),
-                            diagnostics: None,
+                            diagnostics: diagnostics_fixed_by(
+                                &params.context,
+                                doc,
+                                link,
+                                &["broken-heading"],
+                            ),
                             edit: Some(WorkspaceEdit {
                                 document_changes: Some(DocumentChanges::Edits(vec![document_edit])),
                                 ..Default::default()
@@ -210,9 +244,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
 
     // 2. Check for missing frontmatter -> "Insert frontmatter template" quickfix
     let source = doc.line_index.source();
-    if !source.trim_start().starts_with("---")
-        || (params.range.start.line == 0 && !source.starts_with("---"))
-    {
+    if doc.frontmatter_range.is_none() && !source.starts_with("---") {
         let title = doc
             .path
             .file_stem()
@@ -287,6 +319,7 @@ mod tests {
     use tower_lsp_server::ls_types::{
         CodeActionContext, CreateFileOptions, Position, TextDocumentIdentifier,
     };
+    use tower_lsp_server::ls_types::{Diagnostic, NumberOrString};
 
     #[test]
     fn test_code_action_create_missing_note() {
@@ -890,5 +923,129 @@ no trailing newline
         // No quickfix applies here, so with the formatter disabled there should be nothing
         // offered at all.
         assert!(code_action(params, &state).is_none());
+    }
+
+    // ---- quickfixes name the diagnostic they fix; the frontmatter offer follows the document ----
+
+    fn diagnostic(code: &str, line: u32, start: u32, end: u32) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(line, start), Position::new(line, end)),
+            code: Some(NumberOrString::String(code.to_string())),
+            message: code.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn actions_for(text: &str, cursor: Position, diagnostics: Vec<Diagnostic>) -> Vec<CodeAction> {
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![parse_document(text, Path::new("a.md"))]);
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        state.vault_root = Some(Path::new(root).to_path_buf());
+        let uri = if cfg!(windows) {
+            "file:///C:/a.md"
+        } else {
+            "file:///a.md"
+        };
+        state.open_document(uri, text, &Path::new(root).join("a.md"), 1);
+        code_action(
+            CodeActionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                range: Range::new(cursor, cursor),
+                context: CodeActionContext {
+                    diagnostics,
+                    ..Default::default()
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+            &state,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => Some(ca),
+            _ => None,
+        })
+        .collect()
+    }
+
+    const WITH_FM: &str = "---
+title: A
+---
+
+[[missing]] and [[b]]
+";
+
+    #[test]
+    fn the_create_note_fix_names_the_broken_link_diagnostic_under_it() {
+        let broken = diagnostic("broken-link", 4, 0, 11);
+        let other_line = diagnostic("broken-link", 0, 0, 3);
+        let orphan = diagnostic("orphan-note", 4, 0, 11);
+        let actions = actions_for(
+            WITH_FM,
+            Position::new(4, 3),
+            vec![broken.clone(), other_line, orphan],
+        );
+        let create = actions
+            .iter()
+            .find(|a| a.title.starts_with("Create note"))
+            .unwrap();
+        assert_eq!(create.diagnostics, Some(vec![broken]));
+    }
+
+    #[test]
+    fn a_fix_without_a_matching_diagnostic_carries_none() {
+        let actions = actions_for(WITH_FM, Position::new(4, 3), vec![]);
+        let create = actions
+            .iter()
+            .find(|a| a.title.starts_with("Create note"))
+            .unwrap();
+        assert_eq!(create.diagnostics, None);
+    }
+
+    #[test]
+    fn a_note_that_has_frontmatter_is_not_offered_a_template_at_any_cursor_position() {
+        for line in 0..5 {
+            let actions = actions_for(WITH_FM, Position::new(line, 0), vec![]);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| a.title == "Insert frontmatter template"),
+                "line {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_note_without_frontmatter_is_offered_one_and_an_unclosed_block_is_left_alone() {
+        let plain = actions_for(
+            "# A
+
+text
+",
+            Position::new(2, 0),
+            vec![],
+        );
+        assert!(
+            plain
+                .iter()
+                .any(|a| a.title == "Insert frontmatter template")
+        );
+        let unclosed = actions_for(
+            "---
+title: A
+
+text
+",
+            Position::new(3, 0),
+            vec![],
+        );
+        assert!(
+            !unclosed
+                .iter()
+                .any(|a| a.title == "Insert frontmatter template")
+        );
     }
 }

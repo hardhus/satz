@@ -167,7 +167,10 @@ async fn process_file_event(
                 .await
                 .unwrap_or(PreparedChange::Skip);
         let mut s = state.write().await;
-        apply_prepared(&mut s, path, prepared);
+        let change = apply_prepared(&mut s, path, prepared);
+        if !fs_change_needs_refresh(&change) {
+            return false;
+        }
     }
 
     let (supports_pull, uris) = {
@@ -186,6 +189,12 @@ async fn process_file_event(
         }
     }
     false
+}
+
+/// Whether the open documents' diagnostics can differ after this change: nothing happened to the
+/// index for a skipped or deferred one, so nothing is recomputed or republished for it.
+pub(crate) fn fs_change_needs_refresh(change: &FsChange) -> bool {
+    matches!(change, FsChange::Reindexed | FsChange::Removed)
 }
 
 /// What an on-disk change did to the index.
@@ -384,6 +393,7 @@ pub fn reload_config(state: &mut SatzState, vault_root: &Path) -> ReloadOutcome 
             state.config = config;
             state.config_error = None;
             state.config_revision += 1;
+            state.sync_daily(chrono::Local::now().date_naive());
             if existed {
                 ReloadOutcome::Reloaded
             } else {
@@ -1132,5 +1142,38 @@ mod tests {
             d.take_ready(t0 + Duration::from_millis(500), window),
             vec![PathBuf::from("a.md")]
         );
+    }
+
+    #[test]
+    fn reloading_the_config_applies_the_daily_aliases_to_the_index() {
+        let v = TempVault::new("reload-daily");
+        let mut state = SatzState::default();
+        v.write(
+            "[daily_note.aliases]
+today = [\"heute\"]
+",
+        );
+        assert_eq!(reload_config(&mut state, &v.0), ReloadOutcome::Reloaded);
+        let (config, _) = state.index.daily().expect("daily set after a reload");
+        assert_eq!(config.aliases.today, vec!["heute".to_string()]);
+    }
+
+    #[test]
+    fn only_changes_that_touched_the_index_refresh_diagnostics() {
+        assert!(fs_change_needs_refresh(&FsChange::Reindexed));
+        assert!(fs_change_needs_refresh(&FsChange::Removed));
+        assert!(!fs_change_needs_refresh(&FsChange::Skipped));
+        assert!(!fs_change_needs_refresh(&FsChange::Deferred));
+    }
+
+    #[test]
+    fn a_skipped_change_leaves_the_index_revision_alone() {
+        // The premise of the rule above: a skipped change really does not touch the index.
+        let mut state = SatzState::default();
+        state.indexing_complete = true;
+        let before = state.index.revision();
+        let change = apply_prepared(&mut state, Path::new("/v/x.txt"), PreparedChange::Skip);
+        assert_eq!(change, FsChange::Skipped);
+        assert_eq!(state.index.revision(), before);
     }
 }

@@ -1,4 +1,5 @@
-set shell := ["nu", "-c"]
+set shell := ["sh", "-cu"]
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
 default: fmt clippy test check build
 

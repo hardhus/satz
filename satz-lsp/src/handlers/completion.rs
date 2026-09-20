@@ -389,16 +389,18 @@ pub fn completion_resolve(mut item: CompletionItem, state: &SatzState) -> Comple
                 value.push_str(&format!("**Tags:** {}\n\n", tags_str.join(", ")));
             }
 
+            // The note itself, not its frontmatter (which would fill the preview of most notes).
             let source = target_doc.line_index.source();
-            let preview_lines: Vec<&str> = source
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(5)
-                .collect();
+            let body = target_doc
+                .frontmatter_range
+                .map_or(source, |range| &source[range.end.min(source.len())..]);
+            let mut lines = body.lines().filter(|l| !l.trim().is_empty());
+            let preview_lines: Vec<&str> = lines.by_ref().take(5).collect();
+            let more = lines.next().is_some();
 
             value.push_str("```markdown\n");
             value.push_str(&preview_lines.join("\n"));
-            if source.lines().take(6).count() > 5 {
+            if more {
                 value.push_str("\n...");
             }
             value.push_str("\n```");
@@ -1176,5 +1178,151 @@ mod tests {
         assert_eq!(items.len(), 200);
         assert!(incomplete);
         assert_eq!(items[0].0, "#tag000");
+    }
+
+    // ---- the preview shows the note, not its frontmatter ----
+
+    /// The text between the code fences of the resolved item's preview.
+    fn preview_of(text: &str) -> String {
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![parse_document(text, Path::new("n.md"))]);
+        let item = CompletionItem {
+            label: "n".to_string(),
+            data: Some(serde_json::json!({ "doc_id": "n.md" })),
+            ..Default::default()
+        };
+        let Some(Documentation::MarkupContent(m)) = completion_resolve(item, &state).documentation
+        else {
+            panic!("a preview expected");
+        };
+        let start = m
+            .value
+            .find(
+                "```markdown
+",
+            )
+            .expect("fence")
+            + "```markdown
+"
+            .len();
+        let end = m
+            .value
+            .rfind(
+                "
+```",
+            )
+            .expect("closing fence");
+        m.value[start..end.max(start)].to_string()
+    }
+
+    #[test]
+    fn the_preview_skips_the_frontmatter() {
+        let text = "---
+title: T
+date: 2026-01-01
+aliases: []
+tags: []
+author: me
+---
+
+# Body
+line
+";
+        assert_eq!(
+            preview_of(text),
+            "# Body
+line"
+        );
+    }
+
+    #[test]
+    fn a_long_body_is_cut_after_five_lines_with_an_ellipsis() {
+        let body: String = (1..=9)
+            .map(|i| {
+                format!(
+                    "l{i}
+"
+                )
+            })
+            .collect();
+        let text = format!(
+            "---
+title: T
+---
+{body}"
+        );
+        assert_eq!(
+            preview_of(&text),
+            "l1
+l2
+l3
+l4
+l5
+..."
+        );
+    }
+
+    #[test]
+    fn exactly_five_body_lines_get_no_ellipsis() {
+        let text = "---
+title: T
+---
+a
+b
+c
+d
+e
+";
+        assert_eq!(
+            preview_of(text),
+            "a
+b
+c
+d
+e"
+        );
+    }
+
+    #[test]
+    fn a_note_that_is_only_frontmatter_has_an_empty_preview() {
+        assert_eq!(
+            preview_of(
+                "---
+title: T
+---
+"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_preview_skips_crlf_frontmatter_too() {
+        assert_eq!(
+            preview_of(
+                "---
+title: T
+---
+
+body
+"
+            ),
+            "body"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_frontmatter_fence_is_shown_as_the_text_it_is() {
+        assert_eq!(
+            preview_of(
+                "---
+title: T
+body
+"
+            ),
+            "---
+title: T
+body"
+        );
     }
 }

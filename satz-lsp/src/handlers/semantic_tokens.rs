@@ -572,4 +572,42 @@ mod tests {
             assert!(tokens.iter().all(|t| t.2 > 0), "{text:?}");
         }
     }
+
+    #[test]
+    fn external_links_are_not_painted_as_broken_links() {
+        assert_eq!(
+            decoded(
+                "[m](mailto:a@b.c) [w](https://example.com/x) <https://e.org>
+"
+            ),
+            vec![],
+            "a link that leaves the vault is neither resolved nor unresolved"
+        );
+        // Next to real links they change nothing about those.
+        assert_eq!(
+            decoded(
+                "[m](mailto:a@b.c) [[doc-b]] [[nope]]
+"
+            ),
+            vec![(0, 18, 9, 0), (0, 28, 8, 1)]
+        );
+    }
+
+    #[test]
+    fn columns_after_a_tag_on_a_crlf_line_match_the_lf_line() {
+        let lf = decoded(
+            "#tag [[doc-b]] [[nope]]
+
+[[doc-b]]
+",
+        );
+        let crlf = decoded(
+            "#tag [[doc-b]] [[nope]]
+
+[[doc-b]]
+",
+        );
+        assert_eq!(lf, crlf);
+        assert_eq!(lf.len(), 4);
+    }
 }

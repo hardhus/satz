@@ -607,4 +607,42 @@ mod tests {
         let root = refs(&files, "sub/a.md", (1, 6), false);
         assert_eq!(root, vec![("sub/a.md".to_string(), 1)]);
     }
+
+    // ---- a tag inside a block is the tag, not the block ----
+
+    const TAG_IN_BLOCK: [(&str, &str); 3] = [
+        (
+            "a.md",
+            "# A
+
+first #topic ^blk
+",
+        ),
+        (
+            "b.md",
+            "#topic here
+
+see [[a#^blk]]
+",
+        ),
+        (
+            "c.md",
+            "only #topic
+",
+        ),
+    ];
+
+    #[test]
+    fn a_tag_in_a_block_line_finds_the_tag_uses() {
+        let mut found = refs(&TAG_IN_BLOCK, "a.md", (2, 8), true);
+        found.sort();
+        assert_eq!(found, vec![at("a.md", 2), at("b.md", 0), at("c.md", 0)]);
+    }
+
+    #[test]
+    fn the_block_id_of_the_same_line_still_finds_the_block_uses() {
+        let mut found = refs(&TAG_IN_BLOCK, "a.md", (2, 16), true);
+        found.sort();
+        assert_eq!(found, vec![at("a.md", 2), at("b.md", 2)]);
+    }
 }

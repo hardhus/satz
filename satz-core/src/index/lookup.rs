@@ -44,9 +44,32 @@ pub struct Index {
     pub(crate) tags: HashMap<String, HashSet<DocId>>,
     /// Counts the changes made to this index: it names the state something was computed from.
     pub(crate) revision: u64,
+    /// The relative daily-note aliases (`[[bugün]]`) and the date "today" means; `None`: not known.
+    pub(crate) daily: Option<(crate::config::DailyNoteConfig, chrono::NaiveDate)>,
 }
 
 impl Index {
+    /// Tells the index which relative daily-note aliases (`[[bugün]]`) exist and which date
+    /// "today" is. Links written with an alias then count as links to that day's note (backlinks,
+    /// orphans), the way go-to-definition and diagnostics already read them. The date is the
+    /// caller's, not the clock's; when the day changes the caller sets it again. Setting what is
+    /// already set does nothing.
+    pub fn set_daily(
+        &mut self,
+        daily: Option<(crate::config::DailyNoteConfig, chrono::NaiveDate)>,
+    ) {
+        if self.daily == daily {
+            return;
+        }
+        self.daily = daily;
+        self.rebuild_derived(false);
+    }
+
+    /// The daily-note aliases and the date "today" means, as last set by `set_daily`.
+    pub fn daily(&self) -> Option<&(crate::config::DailyNoteConfig, chrono::NaiveDate)> {
+        self.daily.as_ref()
+    }
+
     /// A number that changes whenever the index changes (a note added, edited or removed) and only
     /// then. Anything computed from the index -- diagnostics above all, which depend on every
     /// note -- can be tagged with it, and "has anything changed?" is a comparison.
@@ -187,41 +210,42 @@ impl Index {
         raw_target: &str,
         config: &crate::config::DailyNoteConfig,
     ) -> Option<&DocId> {
-        let clean = fold_key(raw_target);
-        let today_match = config.aliases.today.iter().any(|a| fold_key(a) == clean);
-        let yesterday_match = config
-            .aliases
-            .yesterday
-            .iter()
-            .any(|a| fold_key(a) == clean);
-        let tomorrow_match = config.aliases.tomorrow.iter().any(|a| fold_key(a) == clean);
+        self.resolve_relative_daily_on(raw_target, config, chrono::Local::now().date_naive())
+    }
 
-        let target_date = if today_match {
-            Some(chrono::Local::now().date_naive())
-        } else if yesterday_match {
-            Some((chrono::Local::now() - chrono::Duration::days(1)).date_naive())
-        } else if tomorrow_match {
-            Some((chrono::Local::now() + chrono::Duration::days(1)).date_naive())
+    /// `resolve_relative_daily` for a given "today".
+    pub fn resolve_relative_daily_on(
+        &self,
+        raw_target: &str,
+        config: &crate::config::DailyNoteConfig,
+        today: chrono::NaiveDate,
+    ) -> Option<&DocId> {
+        let clean = fold_key(raw_target);
+        let names = |aliases: &[String]| aliases.iter().any(|a| fold_key(a) == clean);
+
+        let target_date = if names(&config.aliases.today) {
+            Some(today)
+        } else if names(&config.aliases.yesterday) {
+            today.pred_opt()
+        } else if names(&config.aliases.tomorrow) {
+            today.succ_opt()
         } else {
             None
         };
 
-        if let Some(date) = target_date {
-            let formatted_date = date.format(&config.format).to_string();
-            // Try resolving formatted date directly
-            if let Some(doc_id) = self.resolve_link(&formatted_date) {
-                return Some(doc_id);
-            }
-            // Try folder/formatted_date
-            let full_path = if config.folder.is_empty() {
-                formatted_date
-            } else {
-                format!("{}/{}", config.folder.trim_matches('/'), formatted_date)
-            };
-            return self.resolve_link(&full_path);
+        let date = target_date?;
+        let formatted_date = date.format(&config.format).to_string();
+        // Try resolving formatted date directly
+        if let Some(doc_id) = self.resolve_link(&formatted_date) {
+            return Some(doc_id);
         }
-
-        None
+        // Try folder/formatted_date
+        let full_path = if config.folder.is_empty() {
+            formatted_date
+        } else {
+            format!("{}/{}", config.folder.trim_matches('/'), formatted_date)
+        };
+        self.resolve_link(&full_path)
     }
 
     /// Fully resolves a `Link` against the index, checking both document existence and heading/block anchors,
@@ -447,7 +471,14 @@ impl Index {
                 } else if link.target_doc.is_empty() {
                     Some(src.id.clone())
                 } else {
-                    self.resolve_link(&link.target_doc).cloned()
+                    // A note with that name wins; otherwise a daily alias (`[[bugün]]`) means
+                    // that day's note -- the same order full link resolution uses.
+                    self.resolve_link(&link.target_doc)
+                        .or_else(|| {
+                            let (config, today) = self.daily.as_ref()?;
+                            self.resolve_relative_daily_on(&link.target_doc, config, *today)
+                        })
+                        .cloned()
                 }
             }
             LinkKind::Markdown => {

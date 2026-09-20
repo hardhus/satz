@@ -3,11 +3,18 @@ members = ["satz-core", "satz-cli", "satz-lsp"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.31"
+version = "0.1.32"
 edition = "2024"
+# let-chains (`if let .. && ..`, used throughout) are stable from 1.88 in edition 2024.
+rust-version = "1.88"
 authors = ["hardhus"]
 license-file = "LICENSE"
 publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
 
 [workspace.dependencies]
 anyhow = "1.0"

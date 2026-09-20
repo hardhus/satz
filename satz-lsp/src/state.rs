@@ -312,6 +312,7 @@ impl SatzState {
                 .replace_doc(satz_core::parse_document(&content, &rel_path));
         }
         *self = new_state;
+        self.sync_daily(chrono::Local::now().date_naive());
         outcome
     }
 
@@ -526,6 +527,29 @@ impl SatzState {
         );
 
         self.index.replace_doc(new_doc);
+    }
+
+    /// The daily-note setting the index should have: the configured aliases and `today`.
+    fn wanted_daily(&self, today: chrono::NaiveDate) -> (satz_core::config::DailyNoteConfig, chrono::NaiveDate) {
+        (self.config.daily_note.clone(), today)
+    }
+
+    /// Whether the index was built for another daily-note configuration or another day than
+    /// `today` -- `[[bugün]]` links would then point at the wrong note.
+    pub fn daily_is_stale(&self, today: chrono::NaiveDate) -> bool {
+        self.index.daily() != Some(&self.wanted_daily(today))
+    }
+
+    /// Brings the index's daily-note aliases up to the configuration and `today`. Returns whether
+    /// anything changed; the open documents' diagnostics (orphan notes) may then differ.
+    pub fn sync_daily(&mut self, today: chrono::NaiveDate) -> bool {
+        if !self.daily_is_stale(today) {
+            return false;
+        }
+        let wanted = self.wanted_daily(today);
+        self.index.set_daily(Some(wanted));
+        self.peers_dirty = true;
+        true
     }
 
     /// Whether any open document's buffer is ahead of the index: the debounced reparse after the last
@@ -1673,5 +1697,75 @@ mod tests {
         assert_eq!(state.refresh_stale_open_documents(), 0);
         assert!(start.elapsed() < first.max(std::time::Duration::from_millis(50)));
         assert!(links_of_a(&state).len() >= 80_000);
+    }
+
+    // ---- daily-note aliases follow the config and the calendar ----
+
+    fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn daily_vault() -> SatzState {
+        let mut state = SatzState::default();
+        state.vault_root = Some(PathBuf::from("/vault"));
+        state.index = satz_core::Index::build(vec![
+            satz_core::parse_document("# Log
+
+[[bugün]]
+", Path::new("log.md")),
+            satz_core::parse_document("# 14
+", Path::new("daily/2026-03-14.md")),
+            satz_core::parse_document("# 15
+", Path::new("daily/2026-03-15.md")),
+        ]);
+        state
+    }
+
+    fn backlinks_to(state: &SatzState, path: &str) -> usize {
+        state
+            .index
+            .backlinks_of(&satz_core::DocId::new(path))
+            .count()
+    }
+
+    #[test]
+    fn syncing_the_daily_date_gives_the_alias_link_its_backlink() {
+        let mut state = daily_vault();
+        assert!(state.daily_is_stale(day(2026, 3, 14)), "nothing set yet");
+        assert!(state.sync_daily(day(2026, 3, 14)));
+        assert_eq!(backlinks_to(&state, "daily/2026-03-14.md"), 1);
+        assert!(!state.daily_is_stale(day(2026, 3, 14)));
+        assert!(!state.sync_daily(day(2026, 3, 14)), "nothing changed the second time");
+    }
+
+    #[test]
+    fn a_new_day_makes_the_daily_setting_stale_and_moves_the_backlink() {
+        let mut state = daily_vault();
+        state.sync_daily(day(2026, 3, 14));
+        assert!(state.daily_is_stale(day(2026, 3, 15)), "midnight passed");
+        assert!(state.sync_daily(day(2026, 3, 15)));
+        assert_eq!(backlinks_to(&state, "daily/2026-03-14.md"), 0);
+        assert_eq!(backlinks_to(&state, "daily/2026-03-15.md"), 1);
+    }
+
+    #[test]
+    fn a_changed_daily_config_is_stale_even_on_the_same_day() {
+        let mut state = daily_vault();
+        state.sync_daily(day(2026, 3, 14));
+        state.config.daily_note.aliases.today = vec!["heute".to_string()];
+        assert!(state.daily_is_stale(day(2026, 3, 14)));
+        assert!(state.sync_daily(day(2026, 3, 14)));
+        assert_eq!(backlinks_to(&state, "daily/2026-03-14.md"), 0, "`bugün` is no longer an alias");
+    }
+
+    #[test]
+    fn syncing_the_daily_date_asks_for_the_peers_to_be_refreshed_only_when_something_changed() {
+        let mut state = daily_vault();
+        state.peers_dirty = false;
+        state.sync_daily(day(2026, 3, 14));
+        assert!(state.peers_dirty, "orphan status of the daily note changed");
+        state.peers_dirty = false;
+        state.sync_daily(day(2026, 3, 14));
+        assert!(!state.peers_dirty);
     }
 }
