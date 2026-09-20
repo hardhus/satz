@@ -105,6 +105,44 @@ fn configs() -> Vec<(&'static str, FormatterConfig)> {
     c.misc.blockquote_single_space = false;
     list.push(("no-blockquote-spacing", c));
 
+    for blank in [0u8, 2] {
+        let c = FormatterConfig {
+            blank_lines_around_headings: blank,
+            ..Default::default()
+        };
+        list.push((
+            if blank == 0 {
+                "no-blank-lines-at-headings"
+            } else {
+                "two-blank-lines-at-headings"
+            },
+            c,
+        ));
+    }
+
+    let mut c = FormatterConfig::default();
+    c.tables.enable = false;
+    c.lists.enable = false;
+    list.push(("tables-and-lists-off", c));
+
+    let mut c = FormatterConfig::default();
+    c.tables.cell_padding = 2;
+    c.tables.min_column_width = 5;
+    list.push(("wide-table-padding", c));
+
+    let c = FormatterConfig {
+        final_newline: false,
+        normalize_links: false,
+        ..Default::default()
+    };
+    list.push(("no-final-newline-no-link-normalizing", c));
+
+    let mut c = FormatterConfig::default();
+    c.wrap.enable = true;
+    c.wrap.link_width_mode = "display".to_string();
+    c.line_width = 30;
+    list.push(("wrap-30-display-links", c));
+
     for width in [20usize, 40, 80] {
         let mut c = FormatterConfig::default();
         c.wrap.enable = true;

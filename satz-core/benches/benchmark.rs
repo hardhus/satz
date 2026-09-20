@@ -1,3 +1,4 @@
+use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -18,7 +19,7 @@ fn main() {
             (i + 3) % 1000
         );
         let path = PathBuf::from(format!("folder_{}/note_{i}.md", i % 10));
-        let doc = parse_document(&content, &path);
+        let doc = black_box(parse_document(black_box(&content), &path));
         docs.push(doc);
     }
     let parse_time = t0.elapsed();
@@ -26,7 +27,7 @@ fn main() {
 
     // 2. Build Index
     let t1 = Instant::now();
-    let index = Index::build(docs);
+    let index = black_box(Index::build(black_box(docs)));
     let build_time = t1.elapsed();
     println!("2. Built Index from 1,000 documents: {:?}", build_time);
 
@@ -35,7 +36,7 @@ fn main() {
     let mut resolved_count = 0;
     for i in 0..10000 {
         let target = format!("note_{}", i % 1000);
-        if index.resolve_link(&target).is_some() {
+        if black_box(index.resolve_link(black_box(&target))).is_some() {
             resolved_count += 1;
         }
     }
@@ -52,7 +53,7 @@ fn main() {
     let mut total_backlinks = 0;
     for i in 0..1000 {
         let id = DocId::new(format!("folder_{}/note_{i}.md", i % 10));
-        total_backlinks += index.backlinks_of(&id).count();
+        total_backlinks += black_box(index.backlinks_of(black_box(&id)).count());
     }
     let backlink_time = t3.elapsed();
     println!(
@@ -66,7 +67,10 @@ fn main() {
     let mut changed = 0;
     for doc in index.documents() {
         let source = doc.line_index.source();
-        let formatted = satz_core::formatter::format_document(source, &config.formatter);
+        let formatted = black_box(satz_core::formatter::format_document(
+            black_box(source),
+            &config.formatter,
+        ));
         if formatted != source {
             changed += 1;
         }
@@ -86,26 +90,34 @@ fn main() {
             satz_core::formatter::format_document(doc.line_index.source(), &config.formatter)
         });
     }
+    // What the server does on a hit: look the hash up and hand back a copy of the cached text.
     let t5 = Instant::now();
     let mut cache_hits = 0;
     for doc in index.documents() {
-        if cache.contains_key(&doc.content_hash) {
+        if let Some(text) = black_box(cache.get(&black_box(doc.content_hash)).cloned()) {
             cache_hits += 1;
+            black_box(text);
         }
     }
     let warm_format_time = t5.elapsed();
     let speedup = cold_format_time.as_secs_f64() / warm_format_time.as_secs_f64().max(1e-12);
     println!(
-        "6. Re-scanned 1,000 documents via warm content-hash cache: {:?} ({} cache hits, ~{:.0}x faster than cold)",
+        "6. Served 1,000 documents from the warm content-hash cache (lookup + copy): {:?} ({} cache hits, ~{:.0}x faster than cold)",
         warm_format_time, cache_hits, speedup
     );
 
     // 7. Minimal-diff edit size vs. a whole-document replace, for a document with several
     //    scattered single-line changes (trailing whitespace sprinkled through a longer note).
     let messy = "# Heading\n\n".to_string()
-        + &"Line with content.   \nAnother line.\nYet another.\nMore text here.\n".repeat(50);
-    let formatted_messy = satz_core::formatter::format_document(&messy, &config.formatter);
-    let line_edits = satz_core::formatter::diff::line_diff(&messy, &formatted_messy);
+        + &"Line with content. \nAnother line.\nYet another.\nMore text here.\n".repeat(50);
+    let formatted_messy = black_box(satz_core::formatter::format_document(
+        black_box(&messy),
+        &config.formatter,
+    ));
+    let line_edits = black_box(satz_core::formatter::diff::line_diff(
+        black_box(&messy),
+        &formatted_messy,
+    ));
     let minimal_bytes: usize = line_edits
         .iter()
         .map(|e| e.new_lines.iter().map(|l| l.len()).sum::<usize>())

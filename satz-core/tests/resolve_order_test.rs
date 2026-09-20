@@ -109,3 +109,53 @@ fn an_exact_path_beats_a_folded_or_stem_match() {
     assert_eq!(resolve(&index, "Notes.md"), Some("Notes.md".into()));
     assert_eq!(resolve(&index, "notes.md"), Some("notes.md".into()));
 }
+
+// ---- the short-path rule and dotted targets (documented in docs/lsp.md) ----
+
+#[test]
+fn a_wrong_folder_still_finds_the_note_by_its_file_name() {
+    // The Obsidian "shortest path" habit: the folder part is a hint, the file name decides.
+    let index = index_of(&[(
+        "other/note.md",
+        "# N
+",
+    )]);
+    assert_eq!(
+        resolve(&index, "wrong/note").as_deref(),
+        Some("other/note.md")
+    );
+    assert_eq!(
+        resolve(&index, "wrong/deeper/note.md").as_deref(),
+        Some("other/note.md")
+    );
+    assert_eq!(resolve(&index, "wrong/other-name"), None);
+}
+
+#[test]
+fn a_title_with_dots_and_spaces_is_found_by_that_title() {
+    let index = index_of(&[(
+        "plans/p1.md",
+        "---
+title: v1.2 plan
+---
+# P
+",
+    )]);
+    assert_eq!(resolve(&index, "v1.2 plan").as_deref(), Some("plans/p1.md"));
+    assert_eq!(resolve(&index, "V1.2 PLAN").as_deref(), Some("plans/p1.md"));
+    assert_eq!(resolve(&index, "v1.2"), None, "a title is matched whole");
+}
+
+#[test]
+fn a_title_that_looks_like_a_path_is_still_only_a_title() {
+    let index = index_of(&[(
+        "x.md",
+        "---
+title: a/b.c
+---
+# X
+",
+    )]);
+    assert_eq!(resolve(&index, "a/b.c").as_deref(), Some("x.md"));
+    assert_eq!(resolve(&index, "b.c"), None);
+}

@@ -3,7 +3,7 @@ use tower_lsp_server::ls_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
 };
 
-use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz};
+use crate::convert::byte_range_to_lsp;
 use crate::state::SatzState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,8 +145,7 @@ pub fn document_highlight(
 
     let (_, doc) = state.doc_for_uri(uri)?;
 
-    let satz_pos = lsp_pos_to_satz(pos);
-    let byte_offset = doc.line_index.position_to_byte(satz_pos);
+    let byte_offset = crate::convert::lsp_pos_to_byte(&doc.line_index, pos);
 
     let target = cursor_target(doc, byte_offset, state)?;
     let mut highlights = Vec::new();

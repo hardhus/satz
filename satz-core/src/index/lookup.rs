@@ -41,7 +41,8 @@ pub struct Index {
     /// Lets backlinks be removed exactly as they were added, instead of re-resolving the links
     /// against an index that may have changed since.
     pub(crate) outgoing: HashMap<DocId, HashSet<DocId>>,
-    pub(crate) tags: HashMap<String, HashSet<DocId>>,
+    /// Folded tag -> notes carrying it. Ordered, so a tag and its sub-tags are one key range.
+    pub(crate) tags: std::collections::BTreeMap<String, HashSet<DocId>>,
     /// Counts the changes made to this index: it names the state something was computed from.
     pub(crate) revision: u64,
     /// The relative daily-note aliases (`[[bugün]]`) and the date "today" means; `None`: not known.
@@ -384,18 +385,25 @@ impl Index {
         })
     }
 
-    /// Returns an iterator over documents tagged with the specified tag name (case-insensitive and hierarchical prefix matching).
+    /// Returns the documents tagged with the specified tag name (case-insensitive; a tag also
+    /// matches its sub-tags: `rust` -> `rust/async`, not `rustic`), in the order of their ids.
     pub fn docs_with_tag<'a>(&'a self, tag: &str) -> impl Iterator<Item = &'a Document> + 'a {
         let clean = fold_key(tag.trim_start_matches('#'));
         let prefix = format!("{}/", clean);
-        let mut matched_ids = std::collections::HashSet::new();
+        let mut matched_ids = std::collections::BTreeSet::new();
 
-        for (k, ids) in &self.tags {
-            if k == &clean || k.starts_with(&prefix) {
-                for id in ids {
-                    matched_ids.insert(id);
-                }
-            }
+        if let Some(ids) = self.tags.get(&clean) {
+            matched_ids.extend(ids);
+        }
+        for (_, ids) in self
+            .tags
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(k, _)| k.starts_with(&prefix))
+        {
+            matched_ids.extend(ids);
         }
 
         matched_ids.into_iter().filter_map(|id| self.docs.get(id))
@@ -403,9 +411,7 @@ impl Index {
 
     /// Returns a sorted list of all unique tag names in the vault.
     pub fn all_tags(&self) -> Vec<&str> {
-        let mut tags: Vec<&str> = self.tags.keys().map(|s| s.as_str()).collect();
-        tags.sort_unstable();
-        tags
+        self.tags.keys().map(|s| s.as_str()).collect()
     }
 
     /// Returns an iterator of documents containing broken internal links, along with the broken link items and resolution status.
@@ -685,16 +691,16 @@ impl Index {
 
     /// Generates summary statistics of the indexed vault.
     pub fn stats(&self) -> IndexStats {
-        let total_headings = self.docs.values().map(|d| d.headings.len()).sum();
-        let total_words = self
-            .docs
-            .values()
-            .map(|d| d.line_index.source().split_whitespace().count())
-            .sum();
+        let (mut total_headings, mut total_words, mut total_links) = (0, 0, 0);
+        for doc in self.docs.values() {
+            total_headings += doc.headings.len();
+            total_links += doc.links.len();
+            total_words += doc.line_index.source().split_whitespace().count();
+        }
 
         IndexStats {
             doc_count: self.doc_count(),
-            total_links: self.total_links(),
+            total_links,
             broken_links: self.broken_link_count(),
             unique_tags: self.tags.len(),
             orphan_docs: self.orphan_docs().count(),

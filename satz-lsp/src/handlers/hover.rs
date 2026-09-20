@@ -1,4 +1,3 @@
-use crate::convert::lsp_pos_to_satz;
 use crate::state::SatzState;
 use satz_core::model::document::Document;
 use satz_core::model::link::{Link, LinkKind};
@@ -15,8 +14,7 @@ pub fn hover(params: HoverParams, state: &SatzState) -> Option<Hover> {
 
     let (_, doc) = state.doc_for_uri(uri)?;
 
-    let satz_pos = lsp_pos_to_satz(pos);
-    let byte_offset = doc.line_index.position_to_byte(satz_pos);
+    let byte_offset = crate::convert::lsp_pos_to_byte(&doc.line_index, pos);
 
     let link = doc.link_at(byte_offset)?;
 

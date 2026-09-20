@@ -1487,4 +1487,124 @@ mod tests {
         assert_eq!(read.index.daily().map(|(_, d)| *d), Some(today));
         assert!(!read.daily_is_stale(today));
     }
+
+    // ---- the document lifecycle through the real handlers ----
+
+    fn open_params(uri: &str, version: i32, text: &str) -> DidOpenTextDocumentParams {
+        DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.parse().unwrap(),
+                language_id: "markdown".to_string(),
+                version,
+                text: text.to_string(),
+            },
+        }
+    }
+
+    fn close_params(uri: &str) -> DidCloseTextDocumentParams {
+        DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.parse().unwrap(),
+            },
+        }
+    }
+
+    fn range_change(
+        uri: &str,
+        version: i32,
+        range: Range,
+        text: &str,
+    ) -> DidChangeTextDocumentParams {
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.parse().unwrap(),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(range),
+                range_length: None,
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_a_note_indexes_its_buffer_and_closing_it_forgets_a_note_without_a_file() {
+        let (backend, _service) = shared_backend().await;
+        backend
+            .did_open(open_params("file:///new-note.md", 1, "# New\n\n[[a]]\n"))
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert!(state.open_docs.contains_key("file:///new-note.md"));
+            assert!(state.index.get_doc(&satz_core::DocId::new("new-note.md")).is_some());
+            assert_eq!(state.index.backlinks_of(&satz_core::DocId::new("a.md")).count(), 1);
+        }
+        backend.did_close(close_params("file:///new-note.md")).await;
+        let state = backend.state.read().await;
+        assert!(!state.open_docs.contains_key("file:///new-note.md"));
+        assert!(
+            state.index.get_doc(&satz_core::DocId::new("new-note.md")).is_none(),
+            "no file on disk: the unsaved note is gone with its buffer"
+        );
+        assert_eq!(state.index.backlinks_of(&satz_core::DocId::new("a.md")).count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_buffer_that_is_not_a_local_file_is_ignored() {
+        let (backend, _service) = shared_backend().await;
+        let before = backend.state.read().await.open_docs.len();
+        backend.did_open(open_params("untitled:Untitled-1", 1, "# X\n")).await;
+        backend.did_open(open_params("https://example.com/x.md", 1, "# X\n")).await;
+        assert_eq!(backend.state.read().await.open_docs.len(), before);
+    }
+
+    #[tokio::test]
+    async fn crlf_text_is_kept_and_ranged_edits_address_its_lines() {
+        let (backend, _service) = shared_backend().await;
+        backend
+            .did_open(open_params("file:///c.md", 1, "one\r\ntwo\r\nthree\r\n"))
+            .await;
+        // Replace "two" (line 1, columns 0-3) and then insert at the start of line 2.
+        backend
+            .did_change(range_change(
+                "file:///c.md",
+                2,
+                Range::new(Position::new(1, 0), Position::new(1, 3)),
+                "2",
+            ))
+            .await;
+        backend
+            .did_change(range_change(
+                "file:///c.md",
+                3,
+                Range::new(Position::new(2, 0), Position::new(2, 0)),
+                ">",
+            ))
+            .await;
+        // A range that spans the line break itself.
+        backend
+            .did_change(range_change(
+                "file:///c.md",
+                4,
+                Range::new(Position::new(0, 3), Position::new(1, 0)),
+                " ",
+            ))
+            .await;
+        let state = backend.state.read().await;
+        let open = &state.open_docs["file:///c.md"];
+        assert_eq!(open.rope.to_string(), "one 2\r\n>three\r\n");
+        assert_eq!(open.version, 4);
+    }
+
+    #[tokio::test]
+    async fn a_change_for_a_note_that_was_never_opened_is_ignored() {
+        let (backend, _service) = shared_backend().await;
+        backend
+            .did_change(change_params("file:///never-opened.md", 2, "# X\n"))
+            .await;
+        let state = backend.state.read().await;
+        assert!(!state.open_docs.contains_key("file:///never-opened.md"));
+        assert!(state.index.get_doc(&satz_core::DocId::new("never-opened.md")).is_none());
+    }
 }

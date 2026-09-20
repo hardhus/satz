@@ -1,4 +1,4 @@
-use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz, path_to_uri};
+use crate::convert::{byte_range_to_lsp, path_to_uri};
 use crate::state::SatzState;
 use satz_core::LinkKind;
 use tower_lsp_server::ls_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range};
@@ -19,8 +19,7 @@ pub fn goto_definition(
     let (_, doc) = state.doc_for_uri(uri)?;
 
     // Convert position to byte offset
-    let satz_pos = lsp_pos_to_satz(pos);
-    let byte_offset = doc.line_index.position_to_byte(satz_pos);
+    let byte_offset = crate::convert::lsp_pos_to_byte(&doc.line_index, pos);
 
     // Find the link under the cursor
     let link = doc.link_at(byte_offset)?;

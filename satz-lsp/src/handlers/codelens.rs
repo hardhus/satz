@@ -192,4 +192,48 @@ mod tests {
             "1 backlink"
         );
     }
+
+    #[test]
+    fn a_note_that_links_later_is_counted_by_the_next_request() {
+        let mut config = VaultConfig::default();
+        config.lsp.codelens.enable = true;
+        let uri = "file:///doc-a.md";
+        let mut state = SatzState {
+            index: Index::build(vec![
+                parse_document("# A\n", Path::new("doc-a.md")),
+                parse_document("# B\n", Path::new("doc-b.md")),
+            ]),
+            vault_root: Some(Path::new("").to_path_buf()),
+            config,
+            ..Default::default()
+        };
+        state.open_docs.insert(
+            uri.to_string(),
+            crate::state::OpenDocument::new(uri, Path::new("doc-a.md").to_path_buf(), "# A\n", 1),
+        );
+        let title = |state: &SatzState| {
+            let params = CodeLensParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            code_lens(params, state).unwrap()[0]
+                .command
+                .as_ref()
+                .unwrap()
+                .title
+                .clone()
+        };
+        assert_eq!(title(&state), "0 backlinks");
+        state
+            .index
+            .replace_doc(parse_document("# B\n\n[[doc-a]]\n", Path::new("doc-b.md")));
+        assert_eq!(title(&state), "1 backlink");
+        state
+            .index
+            .replace_doc(parse_document("# B\n", Path::new("doc-b.md")));
+        assert_eq!(title(&state), "0 backlinks");
+    }
 }

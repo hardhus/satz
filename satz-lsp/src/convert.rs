@@ -17,6 +17,11 @@ pub fn lsp_pos_to_satz(pos: lsp::Position) -> SatzPosition {
     SatzPosition::new(pos.line, pos.character)
 }
 
+/// The byte offset of a client position (line, UTF-16 column) in the document `line_index` reads.
+pub fn lsp_pos_to_byte(line_index: &LineIndex, pos: lsp::Position) -> usize {
+    line_index.position_to_byte(lsp_pos_to_satz(pos))
+}
+
 /// Converts a `ByteRange` into an `lsp_types::Range` using the document's UTF-16 safe `LineIndex`.
 pub fn byte_range_to_lsp(range: ByteRange, line_index: &LineIndex) -> lsp::Range {
     let (start, end) = line_index.byte_range_to_positions(range);
@@ -393,5 +398,25 @@ mod tests {
             uri.as_str()
         );
         assert_eq!(uri_to_path(uri.as_str()).unwrap(), unc);
+    }
+
+    #[test]
+    fn a_client_position_becomes_the_byte_offset_the_line_index_reads() {
+        let index = LineIndex::new("ab\nİ🦀x\r\nlast");
+        let at = |l, c| lsp_pos_to_byte(&index, lsp::Position::new(l, c));
+        assert_eq!(at(0, 0), 0);
+        assert_eq!(at(0, 2), 2);
+        assert_eq!(at(1, 0), 3);
+        assert_eq!(at(1, 1), 5, "İ is two bytes, one UTF-16 unit");
+        assert_eq!(at(1, 3), 9, "the crab is four bytes, two UTF-16 units");
+        assert_eq!(at(1, 4), 10);
+        assert_eq!(at(2, 4), 16);
+        // Past the end of a line or of the document: clamped, never a panic.
+        assert!(at(0, 99) <= 3);
+        assert_eq!(at(99, 0), "ab\nİ🦀x\r\nlast".len());
+        assert_eq!(
+            lsp_pos_to_byte(&LineIndex::new(""), lsp::Position::new(3, 3)),
+            0
+        );
     }
 }

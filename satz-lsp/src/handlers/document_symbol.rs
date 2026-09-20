@@ -236,4 +236,21 @@ mod tests {
         assert!(symbols("just text\n\nmore\n").is_none());
         assert!(symbols("").is_none());
     }
+
+    #[test]
+    fn equal_headings_are_separate_symbols_with_their_own_ranges() {
+        let symbols = symbols("# A\n\n## Same\n\ntext\n\n## Same\n\nmore\n").unwrap();
+        assert_eq!(symbols.len(), 1);
+        let children = symbols[0].children.as_ref().unwrap();
+        let named: Vec<(&str, u32)> = children
+            .iter()
+            .map(|c| (c.name.as_str(), c.range.start.line))
+            .collect();
+        assert_eq!(named, vec![("Same", 2), ("Same", 6)]);
+        assert_eq!(
+            lines(&children[0]),
+            (2, 4),
+            "the section ends at its last content line"
+        );
+    }
 }

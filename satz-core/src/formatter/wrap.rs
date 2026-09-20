@@ -89,22 +89,22 @@ fn collect_atomic_spans(
         let width = if display_mode {
             link.display
                 .as_ref()
-                .map(|d| d.chars().count())
+                .map(|d| display_width(d))
                 .unwrap_or_else(|| {
-                    let mut w = link.target_doc.chars().count();
+                    let mut w = display_width(&link.target_doc);
                     if let Some(h) = &link.target_heading {
-                        w += 1 + h.chars().count();
+                        w += 1 + display_width(h);
                     }
                     w
                 })
         } else {
-            raw.chars().count()
+            display_width(raw)
         };
         spans.push((link.range, width));
     }
 
     for span in &structure.code_spans {
-        spans.push((*span, source[span.start..span.end].chars().count()));
+        spans.push((*span, display_width(&source[span.start..span.end])));
     }
 
     // An image is one piece: its alt text and title contain spaces the wrapper must not break at.
@@ -114,9 +114,9 @@ fn collect_atomic_spans(
             // The alt text is what a rendered viewer shows: `![alt](...)` -> `alt`.
             raw.strip_prefix("![")
                 .and_then(|rest| rest.split_once(']'))
-                .map_or_else(|| raw.chars().count(), |(alt, _)| alt.chars().count())
+                .map_or_else(|| display_width(raw), |(alt, _)| display_width(alt))
         } else {
-            raw.chars().count()
+            display_width(raw)
         };
         spans.push((*span, width));
     }
@@ -126,10 +126,10 @@ fn collect_atomic_spans(
         let width = if display_mode {
             link.display
                 .as_ref()
-                .map(|d| d.chars().count())
-                .unwrap_or_else(|| link.target_doc.chars().count())
+                .map(|d| display_width(d))
+                .unwrap_or_else(|| display_width(&link.target_doc))
         } else {
-            raw.chars().count()
+            display_width(raw)
         };
         spans.push((link.range, width));
     }
@@ -143,6 +143,12 @@ fn collect_atomic_spans(
 /// span's ENTIRE range as one unit (even across the span's own internal whitespace, e.g. a
 /// `[[path#Two Words|alias]]` wikilink) and glues any immediately-adjacent non-whitespace
 /// characters (e.g. trailing punctuation right after the closing `]]`) into the same token.
+/// How many terminal columns `text` takes: wide (CJK, emoji) characters count two and combining
+/// marks none -- the measure table alignment uses too.
+fn display_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
 /// Returns each token's byte range plus its precomputed visual width.
 fn tokenize_with_width(
     source: &str,
@@ -182,7 +188,7 @@ fn tokenize_with_width(
             if token_start.is_none() {
                 token_start = Some(pos);
             }
-            token_width += 1;
+            token_width += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
         }
         pos += c.len_utf8();
     }
@@ -642,5 +648,63 @@ mod tests {
             assert_eq!(wrapped(&once, &config), once, "{mode}");
             assert_eq!(html_of(&once), html_of(input), "{mode}");
         }
+    }
+
+    // ---- width is measured in display columns, like table alignment ----
+
+    fn columns(line: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(line)
+    }
+
+    #[test]
+    fn wide_characters_count_two_columns_each() {
+        let out = wrapped("日本語 日本語 日本語 日本語\n", &enabled_config(14));
+        assert_eq!(out, "日本語 日本語\n日本語 日本語\n");
+        assert!(out.lines().all(|l| columns(l) <= 14));
+    }
+
+    #[test]
+    fn emoji_count_two_columns_each() {
+        let out = wrapped("🦀 🦀 🦀 🦀 🦀 🦀 🦀\n", &enabled_config(8));
+        assert_eq!(out, "🦀 🦀 🦀\n🦀 🦀 🦀\n🦀\n");
+    }
+
+    #[test]
+    fn combining_marks_take_no_column() {
+        // "e" + U+0301 is one column: seven of them and six spaces fit in 13 columns.
+        let word = "e\u{301}";
+        let input = format!("{}\n", [word; 7].join(" "));
+        let out = wrapped(&input, &enabled_config(13));
+        assert_eq!(out, input);
+        let out = wrapped(&input, &enabled_config(11));
+        assert_eq!(out.lines().count(), 2, "{out:?}");
+        assert!(out.lines().all(|l| columns(l) <= 11));
+    }
+
+    #[test]
+    fn latin_and_turkish_text_wraps_exactly_as_before() {
+        let input = "İstanbul çok güzel bir şehir ve öğrenciler için ışıl ışıl parlıyor\n";
+        let out = wrapped(input, &enabled_config(24));
+        assert_eq!(
+            out,
+            "İstanbul çok güzel bir\nşehir ve öğrenciler için\nışıl ışıl parlıyor\n"
+        );
+    }
+
+    #[test]
+    fn a_wide_word_longer_than_the_line_stays_whole_on_its_own_line() {
+        let out = wrapped("a 日本語日本語日本語 b\n", &enabled_config(6));
+        assert_eq!(out, "a\n日本語日本語日本語\nb\n");
+    }
+
+    #[test]
+    fn a_link_with_wide_display_text_counts_its_columns_in_display_mode() {
+        let mut config = enabled_config(12);
+        config.wrap.link_width_mode = "display".to_string();
+        let out = wrapped("aa [[note|日本語日本]] bb cc\n", &config);
+        // The link counts as its display text: 10 columns. "aa" + space + 10 = 13 > 12, so it
+        // starts a line of its own; "bb" then fits behind it (10 + 1 + 2 = 13 > 12: no!), so it
+        // does not, and "cc" follows "bb".
+        assert_eq!(out, "aa\n[[note|日本語日本]]\nbb cc\n");
     }
 }

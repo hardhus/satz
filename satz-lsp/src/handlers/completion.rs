@@ -158,9 +158,13 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 } else {
                     // Heading completion: `[[doc#...`
                     let range = range_at(heading_or_block_start, word_end);
+                    // A link to a heading that appears twice reaches the first one, so the later
+                    // copy is not a different target and is not offered.
+                    let mut seen_slugs = std::collections::HashSet::new();
                     let mut items: Vec<CompletionItem> = target_doc
                         .headings
                         .iter()
+                        .filter(|h| seen_slugs.insert(h.slug.as_str()))
                         .map(|h| {
                             let new_text = format!("{}{}", h.text.trim(), close_suffix);
                             CompletionItem {
@@ -1324,5 +1328,40 @@ body
 title: T
 body"
         );
+    }
+
+    #[test]
+    fn equal_headings_of_the_target_are_offered_once_in_document_order() {
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document("# A\n\n[[b#", Path::new("a.md")),
+            parse_document("# B\n\n## Same\n\n## Other\n\n## Same\n", Path::new("b.md")),
+        ]);
+        state.vault_root = Some(Path::new("").to_path_buf());
+        state.open_docs.insert(
+            "file:///a.md".to_string(),
+            crate::state::OpenDocument::new(
+                "file:///a.md",
+                Path::new("a.md").to_path_buf(),
+                "# A\n\n[[b#",
+                1,
+            ),
+        );
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: "file:///a.md".parse().unwrap(),
+                },
+                position: Position::new(2, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let Some(CompletionResponse::Array(items)) = completion(params, &state) else {
+            panic!("an answer expected");
+        };
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["B", "Same", "Other"]);
     }
 }
