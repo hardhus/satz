@@ -235,18 +235,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
 
     // Text edits first (stable order): they address the files by their current URIs, which stop
     // existing once the rename has been applied.
-    let mut document_changes: Vec<DocumentChangeOperation> = ordered_edits(changes)
-        .into_iter()
-        .map(|(url, edits)| {
-            DocumentChangeOperation::Edit(TextDocumentEdit {
-                text_document: OptionalVersionedTextDocumentIdentifier {
-                    uri: url,
-                    version: None,
-                },
-                edits: edits.into_iter().map(OneOf::Left).collect(),
-            })
-        })
-        .collect();
+    let mut document_changes = versioned_edits(state, ordered_edits(changes));
     document_changes.push(DocumentChangeOperation::Op(ResourceOp::Rename(
         RenameFile {
             old_uri,
@@ -334,9 +323,32 @@ fn rename_heading(
     }
 
     Some(WorkspaceEdit {
-        changes: Some(ordered_edits(changes).into_iter().collect()),
+        document_changes: Some(DocumentChanges::Operations(versioned_edits(
+            state,
+            ordered_edits(changes),
+        ))),
         ..Default::default()
     })
+}
+
+/// The edits as document edits. A file that is open names the buffer version the edits were
+/// computed for (the index was refreshed against that buffer before the request ran), so the client
+/// refuses them if the user has typed since; a file on disk carries no version.
+fn versioned_edits(
+    state: &SatzState,
+    files: Vec<(Uri, Vec<TextEdit>)>,
+) -> Vec<DocumentChangeOperation> {
+    files
+        .into_iter()
+        .map(|(url, edits)| {
+            let version = crate::convert::uri_to_path(url.as_str())
+                .and_then(|path| state.open_doc_for_path(&path).map(|(_, open)| open.version));
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier { uri: url, version },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            })
+        })
+        .collect()
 }
 
 /// A heading name is written into `[[note#name]]` links, so it may not contain what would end
@@ -550,6 +562,28 @@ mod tests {
         Position, Range, TextDocumentIdentifier, TextDocumentPositionParams,
     };
 
+    /// The text edits of a rename result, per file (the rename now answers with document edits).
+    fn edits_by_uri(edit: WorkspaceEdit) -> HashMap<Uri, Vec<TextEdit>> {
+        let Some(DocumentChanges::Operations(ops)) = edit.document_changes else {
+            panic!("document edits expected");
+        };
+        ops.into_iter()
+            .filter_map(|op| match op {
+                DocumentChangeOperation::Edit(e) => Some((
+                    e.text_document.uri,
+                    e.edits
+                        .into_iter()
+                        .filter_map(|o| match o {
+                            OneOf::Left(t) => Some(t),
+                            OneOf::Right(_) => None,
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn test_rename_heading_and_backlinks() {
         let abs_a = if cfg!(windows) {
@@ -607,7 +641,7 @@ mod tests {
         let edit = rename(params, &state)
             .unwrap()
             .expect("WorkspaceEdit expected");
-        let changes = edit.changes.expect("Changes map expected");
+        let changes = edits_by_uri(edit);
         let uri_a = path_to_uri(abs_a).unwrap();
         let uri_b = path_to_uri(abs_b).unwrap();
         let edits_a = &changes[&uri_a];
@@ -740,7 +774,7 @@ mod tests {
         let edit = rename(params, &state)
             .unwrap()
             .expect("WorkspaceEdit expected");
-        let changes = edit.changes.expect("Changes map expected");
+        let changes = edits_by_uri(edit);
         let uri_b = path_to_uri(abs_b).unwrap();
         let edits_b = &changes[&uri_b];
         assert_eq!(edits_b[0].new_text, "[[doc-a#Haftanın Özeti]]");

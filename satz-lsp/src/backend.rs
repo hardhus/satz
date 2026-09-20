@@ -28,6 +28,56 @@ pub fn client_supports_document_changes(capabilities: &ClientCapabilities) -> bo
         .unwrap_or(false)
 }
 
+/// Whether the client answers `workspace/diagnostic/refresh` (LSP 3.17 `workspace.diagnostics.refreshSupport`).
+pub fn client_supports_diagnostic_refresh(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.diagnostics.as_ref())
+        .and_then(|d| d.refresh_support)
+        .unwrap_or(false)
+}
+
+/// Whether the client answers `workspace/semanticTokens/refresh`.
+pub fn client_supports_semantic_tokens_refresh(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.semantic_tokens.as_ref())
+        .and_then(|s| s.refresh_support)
+        .unwrap_or(false)
+}
+
+/// Logs a failed refresh request (a client that said it supports it should answer) and says whether
+/// it succeeded. Nothing is retried: the client refetches on its own schedule anyway.
+pub(crate) fn refresh_succeeded<T, E: std::fmt::Display>(what: &str, result: &Result<T, E>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(request = what, %error, "the client did not accept a refresh request");
+            false
+        }
+    }
+}
+
+/// Asks a pull-diagnostics client to fetch again -- only if it declared that it understands the
+/// request.
+pub(crate) async fn refresh_diagnostics(client: &Client, state: &Arc<RwLock<SatzState>>) {
+    if state.read().await.client_supports_diagnostic_refresh {
+        let result = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
+        refresh_succeeded("workspace/diagnostic/refresh", &result);
+    }
+}
+
+/// Asks the client to fetch semantic tokens again -- only if it declared that it understands the
+/// request.
+pub(crate) async fn refresh_semantic_tokens(client: &Client, state: &Arc<RwLock<SatzState>>) {
+    if state.read().await.client_supports_semantic_tokens_refresh {
+        let result = client.send_request::<SemanticTokensRefresh>(()).await;
+        refresh_succeeded("workspace/semanticTokens/refresh", &result);
+    }
+}
+
 /// What the server offers the client (the `capabilities` of the `initialize` response).
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
@@ -137,7 +187,7 @@ async fn run_reparse(
 
     let plan = refresh_after_reparse(peers_dirty, supports_pull);
     if plan.pull_diagnostics {
-        let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
+        refresh_diagnostics(&client, &state_arc).await;
     }
     if plan.push_peers {
         for other_uri in other_uris {
@@ -145,7 +195,7 @@ async fn run_reparse(
         }
     }
     if plan.semantic_tokens {
-        let _ = client.send_request::<SemanticTokensRefresh>(()).await;
+        refresh_semantic_tokens(&client, &state_arc).await;
     }
 }
 
@@ -192,6 +242,26 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
 }
 
 impl Backend {
+    /// Read access to a state whose index reflects every open buffer.
+    ///
+    /// The debounced reparse trails typing by a few hundred milliseconds; a request that maps the
+    /// client's (live) positions through the index would then land on the wrong text. So when an
+    /// open document is stale it is reparsed here first, under a short write lock. With nothing
+    /// stale (the usual case) this is just a read lock.
+    pub(crate) async fn read_fresh(&self) -> tokio::sync::RwLockReadGuard<'_, SatzState> {
+        {
+            let state = self.state.read().await;
+            if !state.has_stale_open_documents() {
+                return state;
+            }
+        }
+        {
+            let mut state = self.state.write().await;
+            state.refresh_stale_open_documents();
+        }
+        self.state.read().await
+    }
+
     pub fn new(client: Client, log_reload_handle: LogReloadHandle) -> Self {
         Self {
             client,
@@ -259,6 +329,10 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             state.client_supports_pull_diagnostics = supports_pull;
             state.client_supports_document_changes = supports_document_changes;
+            state.client_supports_diagnostic_refresh =
+                client_supports_diagnostic_refresh(&params.capabilities);
+            state.client_supports_semantic_tokens_refresh =
+                client_supports_semantic_tokens_refresh(&params.capabilities);
         }
 
         tracing::debug!(?vault_root, "initialize: resolved vault root");
@@ -323,7 +397,7 @@ impl LanguageServer for Backend {
                 };
 
                 if supports_pull {
-                    let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
+                    refresh_diagnostics(&client, &state_arc).await;
                 } else {
                     for uri in uris {
                         publish_for(&client, &state_arc, &uri).await;
@@ -335,7 +409,7 @@ impl LanguageServer for Backend {
                 // tokens may be stale/wrong now that the full index is in place. Unconditional
                 // (unlike the diagnostics push above, which branches on pull-vs-push support) --
                 // this is a separate capability a client simply ignores if it never declared support.
-                let _ = client.send_request::<SemanticTokensRefresh>(()).await;
+                refresh_semantic_tokens(&client, &state_arc).await;
             });
         } else {
             // No workspace root at all: there is no vault to walk, so there is nothing for
@@ -394,10 +468,7 @@ impl LanguageServer for Backend {
 
         if peers_dirty {
             if supports_pull {
-                let _ = self
-                    .client
-                    .send_request::<WorkspaceDiagnosticRefresh>(())
-                    .await;
+                refresh_diagnostics(&self.client, &self.state).await;
             } else {
                 for other_uri in other_uris {
                     publish_for(&self.client, &self.state, &other_uri).await;
@@ -473,10 +544,7 @@ impl LanguageServer for Backend {
 
         if peers_dirty {
             if supports_pull {
-                let _ = self
-                    .client
-                    .send_request::<WorkspaceDiagnosticRefresh>(())
-                    .await;
+                refresh_diagnostics(&self.client, &self.state).await;
             } else {
                 for other_uri in other_uris {
                     publish_for(&self.client, &self.state, &other_uri).await;
@@ -505,10 +573,7 @@ impl LanguageServer for Backend {
         // Discarded unsaved edits change what the remaining documents' diagnostics should say.
         if peers_dirty {
             if supports_pull {
-                let _ = self
-                    .client
-                    .send_request::<WorkspaceDiagnosticRefresh>(())
-                    .await;
+                refresh_diagnostics(&self.client, &self.state).await;
             } else {
                 for other_uri in other_uris {
                     publish_for(&self.client, &self.state, &other_uri).await;
@@ -521,17 +586,17 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::definition::goto_definition(params, &state))
     }
 
     async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::references::find_references(params, &state))
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::hover::hover(params, &state))
     }
 
@@ -539,7 +604,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> jsonrpc::Result<Option<DocumentSymbolResponse>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::document_symbol::document_symbol(
             params, &state,
         ))
@@ -549,12 +614,12 @@ impl LanguageServer for Backend {
         &self,
         params: CompletionParams,
     ) -> jsonrpc::Result<Option<CompletionResponse>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::completion::completion(params, &state))
     }
 
     async fn completion_resolve(&self, params: CompletionItem) -> jsonrpc::Result<CompletionItem> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::completion::completion_resolve(
             params, &state,
         ))
@@ -564,7 +629,7 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> jsonrpc::Result<Option<WorkspaceSymbolResponse>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::workspace_symbol::workspace_symbol(
             params, &state,
         ))
@@ -574,12 +639,12 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> jsonrpc::Result<Option<PrepareRenameResponse>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::rename::prepare_rename(params, &state))
     }
 
     async fn rename(&self, params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         crate::handlers::rename::rename(params, &state).map_err(jsonrpc::Error::invalid_params)
     }
 
@@ -587,7 +652,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentHighlightParams,
     ) -> jsonrpc::Result<Option<Vec<DocumentHighlight>>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::document_highlight::document_highlight(
             params, &state,
         ))
@@ -597,7 +662,7 @@ impl LanguageServer for Backend {
         &self,
         params: CodeActionParams,
     ) -> jsonrpc::Result<Option<CodeActionResponse>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::code_action::code_action(params, &state))
     }
 
@@ -605,7 +670,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentLinkParams,
     ) -> jsonrpc::Result<Option<Vec<DocumentLink>>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::document_link::document_link(
             params, &state,
         ))
@@ -615,19 +680,19 @@ impl LanguageServer for Backend {
         &self,
         params: FoldingRangeParams,
     ) -> jsonrpc::Result<Option<Vec<FoldingRange>>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::folding_range::folding_range(
             params, &state,
         ))
     }
 
     async fn code_lens(&self, params: CodeLensParams) -> jsonrpc::Result<Option<Vec<CodeLens>>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::codelens::code_lens(params, &state))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> jsonrpc::Result<Option<Vec<InlayHint>>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::inlay_hint::inlay_hint(params, &state))
     }
 
@@ -635,7 +700,7 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::semantic_tokens::semantic_tokens_full(
             params, &state,
         ))
@@ -645,7 +710,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentFormattingParams,
     ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
-        let state = self.state.read().await;
+        let state = self.read_fresh().await;
         Ok(crate::handlers::formatting::formatting(params, &state))
     }
 
@@ -740,28 +805,48 @@ impl LanguageServer for Backend {
         params: DocumentDiagnosticParams,
     ) -> jsonrpc::Result<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri.to_string();
-        let diagnostics = {
-            let state = self.state.read().await;
-            crate::handlers::diagnostics::pull_document_diagnostics(&uri, &state)
+        let report = {
+            let state = self.read_fresh().await;
+            crate::handlers::diagnostics::pull_document_report(
+                &uri,
+                params.previous_result_id.as_deref(),
+                &state,
+            )
         };
 
-        Ok(DocumentDiagnosticReportResult::Report(
-            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
-                related_documents: None,
-                full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                    result_id: None,
-                    items: diagnostics,
-                },
-            }),
-        ))
+        use crate::handlers::diagnostics::DocumentPull;
+        Ok(DocumentDiagnosticReportResult::Report(match report {
+            DocumentPull::Full { items, result_id } => {
+                DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                    related_documents: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id,
+                        items,
+                    },
+                })
+            }
+            DocumentPull::Unchanged { result_id } => {
+                DocumentDiagnosticReport::Unchanged(RelatedUnchangedDocumentDiagnosticReport {
+                    related_documents: None,
+                    unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                        result_id,
+                    },
+                })
+            }
+        }))
     }
 
     async fn workspace_diagnostic(
         &self,
-        _params: WorkspaceDiagnosticParams,
+        params: WorkspaceDiagnosticParams,
     ) -> jsonrpc::Result<WorkspaceDiagnosticReportResult> {
-        let state = self.state.read().await;
-        let items = crate::handlers::diagnostics::pull_workspace_diagnostics(&state);
+        let previous: std::collections::HashMap<String, String> = params
+            .previous_result_ids
+            .into_iter()
+            .map(|p| (p.uri.as_str().to_string(), p.value))
+            .collect();
+        let state = self.read_fresh().await;
+        let items = crate::handlers::diagnostics::pull_workspace_report(&previous, &state);
 
         Ok(WorkspaceDiagnosticReportResult::Report(
             WorkspaceDiagnosticReport { items },
@@ -788,10 +873,21 @@ pub(crate) struct RefreshPlan {
 /// affected), and semantic tokens are refreshed too. A push client already gets its own
 /// document's diagnostics published; other documents only when what they depend on changed.
 pub(crate) fn refresh_after_reparse(peers_dirty: bool, supports_pull: bool) -> RefreshPlan {
+    plan_refresh(peers_dirty, supports_pull, true, true)
+}
+
+/// Like `refresh_after_reparse`, for a client that may not understand the refresh requests: they
+/// are only planned when it said it does (the client then fetches on its own schedule).
+pub(crate) fn plan_refresh(
+    peers_dirty: bool,
+    supports_pull: bool,
+    refresh_diagnostics: bool,
+    refresh_semantic_tokens: bool,
+) -> RefreshPlan {
     RefreshPlan {
-        pull_diagnostics: supports_pull,
+        pull_diagnostics: supports_pull && refresh_diagnostics,
         push_peers: peers_dirty && !supports_pull,
-        semantic_tokens: true,
+        semantic_tokens: refresh_semantic_tokens,
     }
 }
 
@@ -1091,5 +1187,286 @@ mod tests {
             ..Default::default()
         });
         assert!(client_supports_document_changes(&caps));
+    }
+
+    // ---- refresh requests only go to clients that said they understand them ----
+
+    fn caps_with(
+        diagnostics: Option<Option<bool>>,
+        semantic_tokens: Option<Option<bool>>,
+    ) -> ClientCapabilities {
+        ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                diagnostics: diagnostics.map(|refresh_support| {
+                    DiagnosticWorkspaceClientCapabilities { refresh_support }
+                }),
+                semantic_tokens: semantic_tokens.map(|refresh_support| {
+                    SemanticTokensWorkspaceClientCapabilities { refresh_support }
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refresh_support_is_read_from_the_client_capabilities() {
+        let nothing = ClientCapabilities::default();
+        assert!(!client_supports_diagnostic_refresh(&nothing));
+        assert!(!client_supports_semantic_tokens_refresh(&nothing));
+        // A workspace section without the entries.
+        let empty = caps_with(None, None);
+        assert!(!client_supports_diagnostic_refresh(&empty));
+        assert!(!client_supports_semantic_tokens_refresh(&empty));
+        // The entries without the flag, and with it false.
+        for flag in [None, Some(false)] {
+            let caps = caps_with(Some(flag), Some(flag));
+            assert!(!client_supports_diagnostic_refresh(&caps), "{flag:?}");
+            assert!(!client_supports_semantic_tokens_refresh(&caps), "{flag:?}");
+        }
+        // Each one independently.
+        let only_diag = caps_with(Some(Some(true)), Some(Some(false)));
+        assert!(client_supports_diagnostic_refresh(&only_diag));
+        assert!(!client_supports_semantic_tokens_refresh(&only_diag));
+        let only_tokens = caps_with(None, Some(Some(true)));
+        assert!(!client_supports_diagnostic_refresh(&only_tokens));
+        assert!(client_supports_semantic_tokens_refresh(&only_tokens));
+    }
+
+    #[test]
+    fn a_refresh_is_planned_only_when_the_client_supports_it() {
+        for peers_dirty in [false, true] {
+            for supports_pull in [false, true] {
+                for refresh_diag in [false, true] {
+                    for refresh_tokens in [false, true] {
+                        let plan =
+                            plan_refresh(peers_dirty, supports_pull, refresh_diag, refresh_tokens);
+                        let label = format!(
+                            "dirty={peers_dirty} pull={supports_pull} diag={refresh_diag} tokens={refresh_tokens}"
+                        );
+                        assert_eq!(plan.pull_diagnostics, supports_pull && refresh_diag, "{label}");
+                        assert_eq!(plan.push_peers, peers_dirty && !supports_pull, "{label}");
+                        assert_eq!(plan.semantic_tokens, refresh_tokens, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_old_planning_function_assumes_a_client_that_supports_everything() {
+        for peers_dirty in [false, true] {
+            for supports_pull in [false, true] {
+                assert_eq!(
+                    refresh_after_reparse(peers_dirty, supports_pull),
+                    plan_refresh(peers_dirty, supports_pull, true, true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_refresh_request_is_reported_not_swallowed() {
+        let ok: Result<(), String> = Ok(());
+        assert!(refresh_succeeded("workspace/diagnostic/refresh", &ok));
+        let failed: Result<(), String> = Err("method not found".to_string());
+        assert!(!refresh_succeeded("workspace/diagnostic/refresh", &failed));
+    }
+
+    // ---- requests see the buffer, not the last debounced parse ----
+
+    fn type_full(state: &mut SatzState, uri: &str, version: i32, text: &str) {
+        let open = state.open_docs.get_mut(uri).unwrap();
+        assert!(open.apply_change_events(
+            version,
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        ));
+    }
+
+    fn position_params(uri: &str, line: u32, character: u32) -> TextDocumentPositionParams {
+        TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.parse().unwrap(),
+            },
+            position: Position::new(line, character),
+        }
+    }
+
+    /// `a.md` is open; its buffer already has a link to `b.md` that the index does not know yet.
+    async fn backend_with_an_unparsed_link() -> (Arc<Backend>, tower_lsp_server::LspService<Backend>) {
+        let (backend, service) = shared_backend().await;
+        {
+            let mut state = backend.state.write().await;
+            state
+                .index
+                .replace_doc(satz_core::parse_document("# B\n\nbody of b\n", std::path::Path::new("b.md")));
+            type_full(&mut state, "file:///a.md", 2, "# A\n\nsee [[b]] here\n");
+            assert!(state.has_stale_open_documents());
+        }
+        (backend, service)
+    }
+
+    #[tokio::test]
+    async fn go_to_definition_follows_a_link_typed_a_moment_ago() {
+        let (backend, _service) = backend_with_an_unparsed_link().await;
+        let found = backend
+            .goto_definition(GotoDefinitionParams {
+                text_document_position_params: position_params("file:///a.md", 2, 7),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        let Some(GotoDefinitionResponse::Scalar(location)) = found else {
+            panic!("the fresh link must resolve: {found:?}");
+        };
+        assert!(location.uri.as_str().ends_with("b.md"));
+    }
+
+    #[tokio::test]
+    async fn hover_shows_the_note_a_freshly_typed_link_points_at() {
+        let (backend, _service) = backend_with_an_unparsed_link().await;
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: position_params("file:///a.md", 2, 7),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("a hover for the fresh link");
+        let HoverContents::Markup(markup) = hover.contents else { panic!() };
+        assert!(markup.value.contains("body of b"), "{}", markup.value);
+    }
+
+    #[tokio::test]
+    async fn references_and_highlights_use_the_buffers_positions() {
+        let (backend, _service) = backend_with_an_unparsed_link().await;
+        let highlights = backend
+            .document_highlight(DocumentHighlightParams {
+                text_document_position_params: position_params("file:///a.md", 2, 7),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("the link is highlighted");
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0].range.start, Position::new(2, 4));
+        assert_eq!(highlights[0].range.end, Position::new(2, 9));
+    }
+
+    #[tokio::test]
+    async fn folding_uses_the_lines_of_the_buffer() {
+        let (backend, _service) = shared_backend().await;
+        {
+            let mut state = backend.state.write().await;
+            type_full(&mut state, "file:///a.md", 2, "# A\n\ntext\n\n## Sub\n\nmore\n");
+        }
+        let folds = backend
+            .folding_range(FoldingRangeParams {
+                text_document: TextDocumentIdentifier {
+                    uri: "file:///a.md".parse().unwrap(),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            folds.iter().map(|f| (f.start_line, f.end_line)).collect::<Vec<_>>(),
+            vec![(0, 6), (4, 6)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_lands_on_the_right_lines_after_the_buffer_moved() {
+        let (backend, _service) = shared_backend().await;
+        let old = "# Old\n\n[[a#Old]]\n";
+        let typed = "\n\n# Old\n\n[[a#Old]]\n"; // two lines added above; not reparsed yet
+        {
+            let mut state = backend.state.write().await;
+            state.open_document("file:///a.md", old, &root().join("a.md"), 1);
+            type_full(&mut state, "file:///a.md", 2, typed);
+        }
+        let edit = backend
+            .rename(RenameParams {
+                text_document_position: position_params("file:///a.md", 2, 3),
+                new_name: "New".to_string(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("an edit");
+        let Some(DocumentChanges::Operations(ops)) = edit.document_changes else {
+            panic!("versioned edits expected: {edit:?}");
+        };
+        let mut result = typed.to_string();
+        let mut seen_version = None;
+        for op in ops {
+            let DocumentChangeOperation::Edit(doc_edit) = op else { continue };
+            seen_version = doc_edit.text_document.version;
+            let edits: Vec<TextEdit> = doc_edit
+                .edits
+                .into_iter()
+                .map(|e| match e {
+                    OneOf::Left(t) => t,
+                    OneOf::Right(a) => a.text_edit,
+                })
+                .collect();
+            result = crate::convert::apply_text_edits(&result, &edits);
+        }
+        assert_eq!(result, "\n\n# New\n\n[[a#New]]\n");
+        assert_eq!(seen_version, Some(2), "the edit names the buffer version it was computed for");
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_stale_buffer_do_not_take_the_write_lock() {
+        let (backend, _service) = shared_backend().await;
+        let read = backend.read_fresh().await;
+        // Fast path: with a read guard held, nobody could have refreshed under a write lock.
+        assert!(backend.state.try_write().is_err());
+        assert!(!read.has_stale_open_documents());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_requests_and_edits_stay_consistent() {
+        let (backend, _service) = shared_backend().await;
+        let mut jobs = Vec::new();
+        for i in 0..24 {
+            let backend = backend.clone();
+            jobs.push(tokio::spawn(async move {
+                if i % 3 == 0 {
+                    backend
+                        .did_change(change_params("file:///a.md", 2 + i, &format!("# A\n\n[[n{i}]]\n")))
+                        .await;
+                } else {
+                    let _ = backend
+                        .hover(HoverParams {
+                            text_document_position_params: position_params("file:///a.md", 2, 3),
+                            work_done_progress_params: Default::default(),
+                        })
+                        .await;
+                }
+            }));
+        }
+        for job in jobs {
+            tokio::time::timeout(std::time::Duration::from_secs(10), job)
+                .await
+                .expect("no deadlock")
+                .unwrap();
+        }
+        // A last request leaves the index in step with the buffer.
+        let _ = backend
+            .hover(HoverParams {
+                text_document_position_params: position_params("file:///a.md", 2, 3),
+                work_done_progress_params: Default::default(),
+            })
+            .await;
+        assert!(!backend.state.read().await.has_stale_open_documents());
     }
 }

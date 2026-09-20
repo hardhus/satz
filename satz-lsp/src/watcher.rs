@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{RwLock, mpsc};
 use tower_lsp_server::Client;
-use tower_lsp_server::ls_types::request::WorkspaceDiagnosticRefresh;
 
 use crate::state::SatzState;
 
@@ -180,7 +179,7 @@ async fn process_file_event(
     };
 
     if supports_pull {
-        let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
+        crate::backend::refresh_diagnostics(client, state).await;
     } else {
         for uri in uris {
             crate::backend::publish_for(client, state, &uri).await;
@@ -384,6 +383,7 @@ pub fn reload_config(state: &mut SatzState, vault_root: &Path) -> ReloadOutcome 
             state.format_cache = crate::state::FormatCache::new(config.lsp.format_cache_capacity);
             state.config = config;
             state.config_error = None;
+            state.config_revision += 1;
             if existed {
                 ReloadOutcome::Reloaded
             } else {
@@ -393,6 +393,7 @@ pub fn reload_config(state: &mut SatzState, vault_root: &Path) -> ReloadOutcome 
         Err(e) => {
             let message = e.to_string();
             state.config_error = Some(message.clone());
+            state.config_revision += 1;
             ReloadOutcome::Failed(message)
         }
     }

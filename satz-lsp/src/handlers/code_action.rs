@@ -170,8 +170,18 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
                             new_text: insert_text,
                         };
 
-                        let mut changes = std::collections::HashMap::new();
-                        changes.insert(target_uri, vec![edit]);
+                        // The index was refreshed against every open buffer before this request,
+                        // so `source` is the target's live text; an open target names its version.
+                        let version = state
+                            .open_doc_for_path(&target_path)
+                            .map(|(_, open)| open.version);
+                        let document_edit = TextDocumentEdit {
+                            text_document: OptionalVersionedTextDocumentIdentifier {
+                                uri: target_uri,
+                                version,
+                            },
+                            edits: vec![OneOf::Left(edit)],
+                        };
 
                         let action = CodeAction {
                             title: format!(
@@ -181,7 +191,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
                             kind: Some(CodeActionKind::QUICKFIX),
                             diagnostics: None,
                             edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
+                                document_changes: Some(DocumentChanges::Edits(vec![document_edit])),
                                 ..Default::default()
                             }),
                             is_preferred: Some(true),
@@ -644,6 +654,118 @@ mod tests {
         );
         assert!(quickfix.edit.is_some());
         assert_source_action_present(&response);
+    }
+
+    /// `a.md` (open, links to `b#Missing`) and `b.md`, optionally open at `b_version`.
+    fn heading_fix_edit(b_text: &str, b_open_version: Option<i32>) -> DocumentChanges {
+        let text_a = "# A
+
+[[b#Missing]]
+";
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document(text_a, Path::new("a.md")),
+            parse_document(b_text, Path::new("b.md")),
+        ]);
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        state.vault_root = Some(Path::new(root).to_path_buf());
+        let uri_a = if cfg!(windows) {
+            "file:///C:/a.md"
+        } else {
+            "file:///a.md"
+        };
+        let uri_b = if cfg!(windows) {
+            "file:///C:/b.md"
+        } else {
+            "file:///b.md"
+        };
+        state.open_document(uri_a, text_a, &Path::new(root).join("a.md"), 1);
+        if let Some(version) = b_open_version {
+            state.open_document(uri_b, b_text, &Path::new(root).join("b.md"), version);
+        }
+        let response = code_action(
+            CodeActionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri_a.parse().unwrap(),
+                },
+                range: Range::new(Position::new(2, 4), Position::new(2, 4)),
+                context: CodeActionContext::default(),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+            &state,
+        )
+        .expect("actions");
+        response
+            .into_iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) if ca.title.starts_with("Add heading") => {
+                    ca.edit.and_then(|e| e.document_changes)
+                }
+                _ => None,
+            })
+            .expect("an add-heading fix with document edits")
+    }
+
+    fn only_edit(changes: DocumentChanges) -> TextDocumentEdit {
+        let DocumentChanges::Edits(mut edits) = changes else {
+            panic!("plain document edits expected");
+        };
+        assert_eq!(edits.len(), 1);
+        edits.remove(0)
+    }
+
+    #[test]
+    fn the_added_heading_names_the_open_targets_version_and_lands_at_its_end() {
+        let b = "# B
+
+body
+";
+        let edit = only_edit(heading_fix_edit(b, Some(7)));
+        assert_eq!(edit.text_document.version, Some(7));
+        let edits: Vec<TextEdit> = edit
+            .edits
+            .into_iter()
+            .map(|e| match e {
+                OneOf::Left(t) => t,
+                OneOf::Right(a) => a.text_edit,
+            })
+            .collect();
+        assert_eq!(
+            crate::convert::apply_text_edits(b, &edits),
+            "# B
+
+body
+
+## Missing
+"
+        );
+    }
+
+    #[test]
+    fn the_added_heading_of_a_closed_target_carries_no_version() {
+        let b = "# B
+
+no trailing newline";
+        let edit = only_edit(heading_fix_edit(b, None));
+        assert_eq!(edit.text_document.version, None);
+        let edits: Vec<TextEdit> = edit
+            .edits
+            .into_iter()
+            .map(|e| match e {
+                OneOf::Left(t) => t,
+                OneOf::Right(a) => a.text_edit,
+            })
+            .collect();
+        assert_eq!(
+            crate::convert::apply_text_edits(b, &edits),
+            "# B
+
+no trailing newline
+
+## Missing
+"
+        );
     }
 
     fn assert_source_action_present(response: &[CodeActionOrCommand]) {

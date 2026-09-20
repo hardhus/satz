@@ -42,6 +42,7 @@ required_fields = []
 reparse_debounce_ms = 200
 reparse_max_wait_ms = 500
 format_cache_capacity = 2000
+completion_limit = 200
 
 [lsp.codelens]
 enable = false
@@ -130,6 +131,7 @@ This is exactly the built-in default configuration, spelled out (a test keeps it
 | `codelens.enable` | bool | `false` | Turns on the "N backlinks" CodeLens shown above each document. Off by default because satz is terminal/CLI-first. |
 | `inlay_hints.enable` | bool | `true` | Turns on inline hints after links showing the target note's tags (or title, or a "⚠ not found" marker for broken links). |
 | `format_cache_capacity` | integer | `2000` | Maximum number of (content hash → formatted text) entries the `satz.formatWorkspace` command caches, so a repeat call against an unchanged vault does no reformatting work. Not an LRU: once at capacity, new distinct hashes just aren't cached — existing entries keep serving hits. See [`docs/lsp.md`](lsp.md#format-the-whole-workspace). |
+| `completion_limit` | integer | `200` | Most items one completion answer carries; a longer answer is cut, marked incomplete (`isIncomplete`), and the client asks again as you type. Candidates are sorted by label, so the same request always gives the same list. `0` = no limit. |
 
 #### `[lsp.semantic_tokens]`
 

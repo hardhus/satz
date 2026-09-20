@@ -1,11 +1,30 @@
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
-    Documentation, MarkupContent, MarkupKind, Range, TextEdit,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
+    CompletionTextEdit, Documentation, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
 
-use crate::convert::{byte_range_to_lsp, lsp_pos_to_satz};
 use crate::state::SatzState;
+
+/// The answer for a candidate list: sorted (by folded label, then detail) so the same request always
+/// gives the same list whatever order the index iterates in, and cut at `limit` (0 = no limit). A cut
+/// answer is a list marked incomplete, so the client asks again as the user types.
+fn respond(mut items: Vec<CompletionItem>, limit: usize) -> CompletionResponse {
+    items.sort_by(|a, b| {
+        satz_core::fold_key(&a.label)
+            .cmp(&satz_core::fold_key(&b.label))
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+    if limit > 0 && items.len() > limit {
+        items.truncate(limit);
+        return CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items,
+        });
+    }
+    CompletionResponse::Array(items)
+}
 
 /// Builds an explicit replace-range `text_edit` covering `[query_start, cursor)` instead of a
 /// bare `insert_text`. Without this, it's up to the client to guess how much of the
@@ -28,22 +47,59 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     // `[`/`#`/`^` keystroke, faster than that debounce can settle. Scanning stale text here
     // corrupts the line-prefix/closing-bracket checks below -- e.g. producing a duplicated
     // `]]` when a second wikilink is typed quickly on the same line right after a first one.
-    let live_line_index = satz_core::LineIndex::new(&open_doc.rope.to_string());
-    let satz_pos = lsp_pos_to_satz(pos);
-    let byte_offset = live_line_index.position_to_byte(satz_pos);
-    let source = live_line_index.source();
+    // Only the line the cursor is on is needed (copied once), not the whole document: every
+    // decision below looks at that line.
+    let line_number = (pos.line as usize).min(open_doc.rope.len_lines().saturating_sub(1));
+    let line_text = open_doc.rope.line(line_number).to_string();
+    let source: &str = line_text.trim_end_matches(['\r', '\n']);
+    let line_start_offset = 0usize;
+    // The column is in UTF-16 units; a column past the end means the end of the line, and one in the
+    // middle of a surrogate pair stays before that character.
+    let mut byte_offset = 0usize;
+    let mut units = 0u32;
+    for c in source.chars() {
+        if units + c.len_utf16() as u32 > pos.character {
+            break;
+        }
+        units += c.len_utf16() as u32;
+        byte_offset += c.len_utf8();
+    }
+    let line_no = line_number as u32;
+    let col16 = |byte: usize| source[..byte].encode_utf16().count() as u32;
+    let range_at = |start: usize, end: usize| {
+        Range::new(
+            Position::new(line_no, col16(start)),
+            Position::new(line_no, col16(end)),
+        )
+    };
+    let limit = state.config.lsp.completion_limit;
 
     // Get prefix of the current line up to byte_offset
-    let line_start_offset = source[..byte_offset]
-        .rfind('\n')
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
     let line_prefix = &source[line_start_offset..byte_offset];
 
-    // Check if cursor is already followed by closing `]]` or `]`
-    let line_rest = &source[byte_offset..];
-    let has_closing_brackets = line_rest.starts_with("]]") || line_rest.starts_with(']');
-    let close_suffix = if !has_closing_brackets { "]]" } else { "" };
+    // The rest of the word the cursor is inside (`[[Ol|gu]]`) is part of what is being replaced,
+    // or the completion would leave it behind (`[[doc-bgu]]`). It ends at a bracket, `|`, `#` or `^`.
+    // A link that is not closed yet on this line has no such end: the word ends at a space then.
+    let tail = &source[byte_offset..];
+    let word_end = byte_offset
+        + tail
+            .find([']', '|', '#', '^'])
+            .or_else(|| tail.find(char::is_whitespace))
+            .unwrap_or(tail.len());
+    // Closing brackets after the word: none -> `]]`, one -> the missing `]`, both -> nothing.
+    // (The link may continue with `|display` or `#anchor` before its closing `]]`.)
+    let after_word = &source[word_end..];
+    let closed_later = after_word
+        .split("[[")
+        .next()
+        .is_some_and(|s| s.contains("]]"));
+    let close_suffix = if closed_later {
+        ""
+    } else if after_word.starts_with(']') {
+        "]"
+    } else {
+        "]]"
+    };
 
     // 1. Check for wikilink completion: `[[...`
     // A `[[` that a `]]` has already closed on this line is finished text, not a link being typed.
@@ -78,10 +134,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 if let Some(_block_prefix) = heading_or_block.strip_prefix('^') {
                     // Block anchor completion: `[[doc#^...`. The replaced range includes the
                     // typed `^` because every new text starts with its own.
-                    let range = byte_range_to_lsp(
-                        satz_core::ByteRange::new(heading_or_block_start, byte_offset),
-                        &live_line_index,
-                    );
+                    let range = range_at(heading_or_block_start, word_end);
                     let items: Vec<CompletionItem> = target_doc
                         .blocks
                         .iter()
@@ -104,10 +157,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                     return Some(CompletionResponse::Array(items));
                 } else {
                     // Heading completion: `[[doc#...`
-                    let range = byte_range_to_lsp(
-                        satz_core::ByteRange::new(heading_or_block_start, byte_offset),
-                        &live_line_index,
-                    );
+                    let range = range_at(heading_or_block_start, word_end);
                     let mut items: Vec<CompletionItem> = target_doc
                         .headings
                         .iter()
@@ -148,10 +198,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
         } else {
             // Document / Note completion
             let mut items = Vec::new();
-            let range = byte_range_to_lsp(
-                satz_core::ByteRange::new(inside_wikilink_start, byte_offset),
-                &live_line_index,
-            );
+            let range = range_at(inside_wikilink_start, word_end);
 
             for d in state.index.documents() {
                 // Title completion. `insert_text` is always the document's own vault-relative
@@ -231,7 +278,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 count = items.len(),
                 "completion: returning candidates (documents/headings/aliases)"
             );
-            return Some(CompletionResponse::Array(items));
+            return Some(respond(items, limit));
         }
     }
 
@@ -239,10 +286,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     if let Some(open_fn_idx) = line_prefix.rfind("[^") {
         let inside_fn = &line_prefix[open_fn_idx + 2..];
         if !inside_fn.contains(']') {
-            let range = byte_range_to_lsp(
-                satz_core::ByteRange::new(line_start_offset + open_fn_idx + 2, byte_offset),
-                &live_line_index,
-            );
+            let range = range_at(line_start_offset + open_fn_idx + 2, byte_offset);
             let items: Vec<CompletionItem> = doc
                 .footnotes
                 .definitions
@@ -276,10 +320,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
             .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'));
 
         if starts_a_tag && only_tag_characters {
-            let range = byte_range_to_lsp(
-                satz_core::ByteRange::new(line_start_offset + hash_idx + 1, byte_offset),
-                &live_line_index,
-            );
+            let range = range_at(line_start_offset + hash_idx + 1, byte_offset);
             let spellings = tag_spellings(state);
             let items: Vec<CompletionItem> = state
                 .index
@@ -301,7 +342,7 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
                 count = items.len(),
                 "completion: returning candidates (tags)"
             );
-            return Some(CompletionResponse::Array(items));
+            return Some(respond(items, limit));
         }
     }
 
@@ -357,7 +398,7 @@ pub fn completion_resolve(mut item: CompletionItem, state: &SatzState) -> Comple
 
             value.push_str("```markdown\n");
             value.push_str(&preview_lines.join("\n"));
-            if source.lines().count() > 5 {
+            if source.lines().take(6).count() > 5 {
                 value.push_str("\n...");
             }
             value.push_str("\n```");
@@ -907,5 +948,233 @@ mod tests {
             };
             assert_eq!(labels, vec!["#Foo".to_string()]);
         }
+    }
+
+    // ---- what a completion replaces, in what order, and how many ----
+
+    const MARK: char = '‸';
+
+    /// Completes at the `‸` in `open_text` (a note `open.md`) among `others`, and returns for every
+    /// item its label and the text of the note AFTER that item's edit is applied.
+    fn complete_marked(
+        others: &[(&str, &str)],
+        open_text: &str,
+        configure: impl FnOnce(&mut SatzState),
+    ) -> (Vec<(String, String)>, bool) {
+        let marked = open_text;
+        let (before, after) = marked.split_once(MARK).expect("a cursor marker");
+        let text = format!("{before}{after}");
+        let line = before.matches('\n').count() as u32;
+        let last_line = before.rsplit('\n').next().unwrap();
+        let character = last_line.encode_utf16().count() as u32;
+
+        let mut state = SatzState::default();
+        let mut docs: Vec<satz_core::Document> = others
+            .iter()
+            .map(|(p, t)| parse_document(t, Path::new(p)))
+            .collect();
+        docs.push(parse_document(&text, Path::new("open.md")));
+        state.index = Index::build(docs);
+        state.vault_root = Some(Path::new("").to_path_buf());
+        state.open_docs.insert(
+            "file:///open.md".to_string(),
+            crate::state::OpenDocument::new(
+                "file:///open.md",
+                Path::new("open.md").to_path_buf(),
+                text.clone(),
+                1,
+            ),
+        );
+        configure(&mut state);
+
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: "file:///open.md".parse().unwrap(),
+                },
+                position: Position::new(line, character),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let (items, incomplete) = match completion(params, &state) {
+            Some(CompletionResponse::Array(items)) => (items, false),
+            Some(CompletionResponse::List(list)) => (list.items, list.is_incomplete),
+            None => return (Vec::new(), false),
+        };
+        let applied = items
+            .iter()
+            .map(|item| {
+                let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+                    panic!("every item carries a text edit: {item:?}");
+                };
+                (
+                    item.label.clone(),
+                    crate::convert::apply_text_edits(&text, std::slice::from_ref(edit)),
+                )
+            })
+            .collect();
+        (applied, incomplete)
+    }
+
+    fn edited<'a>(items: &'a [(String, String)], label: &str) -> &'a str {
+        &items
+            .iter()
+            .find(|(l, _)| l == label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no item {label:?} in {:?}",
+                    items.iter().map(|i| &i.0).collect::<Vec<_>>()
+                )
+            })
+            .1
+    }
+
+    const TARGET: (&str, &str) = (
+        "doc-b.md",
+        "---\ntitle: Target\n---\n# Top\n\n## Head\n\ntext ^blk\n",
+    );
+
+    #[test]
+    fn the_rest_of_the_word_after_the_cursor_is_replaced_not_kept() {
+        let (items, _) = complete_marked(&[TARGET], "[[Ta‸rget]] tail", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b]] tail");
+        // Without closing brackets: they are added.
+        let (items, _) = complete_marked(&[TARGET], "[[Ta‸rget tail", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b]] tail");
+        // Cursor at the very end of the word, brackets already there: nothing doubled.
+        let (items, _) = complete_marked(&[TARGET], "[[Target‸]]", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b]]");
+    }
+
+    #[test]
+    fn a_single_closing_bracket_is_completed_to_two() {
+        let (items, _) = complete_marked(&[TARGET], "[[Tar‸]", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b]]");
+        let (items, _) = complete_marked(&[TARGET], "[[Tar‸]] and [x]", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b]] and [x]");
+    }
+
+    #[test]
+    fn an_alias_display_text_or_anchor_after_the_word_is_kept() {
+        let (items, _) = complete_marked(&[TARGET], "[[Ta‸rget|shown]]", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b|shown]]");
+        let (items, _) = complete_marked(&[TARGET], "[[Ta‸rget#Head]]", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b#Head]]");
+    }
+
+    #[test]
+    fn headings_and_blocks_replace_the_rest_of_their_word_too() {
+        let (items, _) = complete_marked(&[TARGET], "[[doc-b#He‸ad]] tail", |_| {});
+        assert_eq!(edited(&items, "Head"), "[[doc-b#Head]] tail");
+        let (items, _) = complete_marked(&[TARGET], "[[doc-b#^bl‸k]] tail", |_| {});
+        assert_eq!(edited(&items, "^blk"), "[[doc-b#^blk]] tail");
+        let (items, _) = complete_marked(&[TARGET], "[[doc-b#He‸ad|shown]]", |_| {});
+        assert_eq!(edited(&items, "Head"), "[[doc-b#Head|shown]]");
+    }
+
+    #[test]
+    fn positions_count_utf16_units_and_crlf_lines() {
+        let others = [("iş.md", "---\ntitle: İş\n---\n# Başlık\n")];
+        let (items, _) = complete_marked(&others, "🦀 çok [[İş‸x]] sonra", |_| {});
+        assert_eq!(edited(&items, "İş"), "🦀 çok [[iş]] sonra");
+        let (items, _) = complete_marked(&[TARGET], "first\r\nsecond [[Ta‸rget]]\r\nlast", |_| {});
+        assert_eq!(
+            edited(&items, "Target"),
+            "first\r\nsecond [[doc-b]]\r\nlast"
+        );
+        // A cursor past the end of a line means the end of that line.
+        let (items, _) = complete_marked(&[TARGET], "[[Tar‸", |_| {});
+        assert_eq!(edited(&items, "Target"), "[[doc-b]]");
+    }
+
+    #[test]
+    fn nothing_is_offered_outside_a_link_tag_or_footnote() {
+        let (items, incomplete) = complete_marked(&[TARGET], "plain words ‸ here", |_| {});
+        assert!(items.is_empty() && !incomplete);
+        let (items, _) = complete_marked(&[TARGET], "[[done]] and then ‸", |_| {});
+        assert!(items.is_empty());
+        let (items, _) = complete_marked(&[TARGET], "# Heading ‸", |_| {});
+        assert!(items.is_empty());
+    }
+
+    fn many_notes(count: usize) -> Vec<(String, String)> {
+        (0..count)
+            .map(|i| (format!("note-{i:04}.md"), format!("# Note {i:04}\n")))
+            .collect()
+    }
+
+    #[test]
+    fn candidates_come_in_a_fixed_order_whatever_the_index_iteration_order() {
+        let notes = many_notes(40);
+        let refs: Vec<(&str, &str)> = notes
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let (first, _) = complete_marked(&refs, "[[‸", |_| {});
+        let labels: Vec<&str> = first.iter().map(|(l, _)| l.as_str()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_by_key(|l| satz_core::fold_key(l));
+        assert_eq!(labels, sorted, "sorted by (folded) label");
+        for _ in 0..20 {
+            let (again, _) = complete_marked(&refs, "[[‸", |_| {});
+            assert_eq!(again, first);
+        }
+    }
+
+    #[test]
+    fn a_long_answer_is_cut_at_the_limit_and_marked_incomplete() {
+        let notes = many_notes(500);
+        let refs: Vec<(&str, &str)> = notes
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+
+        let (items, incomplete) = complete_marked(&refs, "[[‸", |_| {});
+        assert_eq!(items.len(), 200, "the default limit");
+        assert!(incomplete);
+        assert_eq!(
+            items[0].0, "Note 0000",
+            "the cut keeps the first ones in order"
+        );
+
+        let (items, incomplete) =
+            complete_marked(&refs, "[[‸", |s| s.config.lsp.completion_limit = 30);
+        assert_eq!((items.len(), incomplete), (30, true));
+
+        let (items, incomplete) =
+            complete_marked(&refs, "[[‸", |s| s.config.lsp.completion_limit = 0);
+        assert!(
+            items.len() >= 501,
+            "no limit: every note and heading, {}",
+            items.len()
+        );
+        assert!(!incomplete);
+
+        let (items, incomplete) =
+            complete_marked(&refs, "[[‸", |s| s.config.lsp.completion_limit = 10_000);
+        assert!(items.len() > 200 && !incomplete);
+    }
+
+    #[test]
+    fn a_short_answer_is_a_plain_array_as_before() {
+        let (items, incomplete) = complete_marked(&[TARGET], "[[‸", |_| {});
+        assert!(!items.is_empty() && !incomplete);
+    }
+
+    #[test]
+    fn tags_are_sorted_and_limited_like_notes() {
+        let tagged: Vec<(String, String)> = (0..300)
+            .map(|i| (format!("t{i}.md"), format!("# T\n\n#tag{i:03}\n")))
+            .collect();
+        let refs: Vec<(&str, &str)> = tagged
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let (items, incomplete) = complete_marked(&refs, "#‸", |_| {});
+        assert_eq!(items.len(), 200);
+        assert!(incomplete);
+        assert_eq!(items[0].0, "#tag000");
     }
 }

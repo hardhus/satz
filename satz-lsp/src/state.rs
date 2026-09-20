@@ -16,6 +16,9 @@ pub struct OpenDocument {
     pub version: i32,
     pub first_change_at: Option<Instant>,
     pub pending_task: Option<JoinHandle<()>>,
+    /// The buffer version the index was last parsed from. Different from `version` = the index is
+    /// behind the buffer (stale).
+    pub indexed_version: i32,
 }
 
 impl std::fmt::Debug for OpenDocument {
@@ -44,6 +47,7 @@ impl OpenDocument {
             version,
             first_change_at: None,
             pending_task: None,
+            indexed_version: version,
         }
     }
 
@@ -61,6 +65,10 @@ impl OpenDocument {
         }
         crate::sync::apply_changes_to_rope(&mut self.rope, changes);
         self.version = version;
+        if self.indexed_version == version {
+            // A client that reuses a version number still changed the text: the index is behind.
+            self.indexed_version = version.wrapping_sub(1);
+        }
         true
     }
 }
@@ -169,6 +177,15 @@ pub struct SatzState {
 
     /// Whether the client understands `WorkspaceEdit.documentChanges` (versioned edits).
     pub client_supports_document_changes: bool,
+
+    /// Counts configuration changes (reload, first load): part of every diagnostics result id.
+    pub config_revision: u64,
+
+    /// Whether the client answers `workspace/diagnostic/refresh`.
+    pub client_supports_diagnostic_refresh: bool,
+
+    /// Whether the client answers `workspace/semanticTokens/refresh`.
+    pub client_supports_semantic_tokens_refresh: bool,
 
     /// Flag indicating that open document identity keys changed and peers need diagnostic refresh
     pub peers_dirty: bool,
@@ -282,6 +299,10 @@ impl SatzState {
         };
         new_state.client_supports_pull_diagnostics = self.client_supports_pull_diagnostics;
         new_state.client_supports_document_changes = self.client_supports_document_changes;
+        new_state.config_revision = self.config_revision + 1;
+        new_state.client_supports_diagnostic_refresh = self.client_supports_diagnostic_refresh;
+        new_state.client_supports_semantic_tokens_refresh =
+            self.client_supports_semantic_tokens_refresh;
         new_state.open_docs = std::mem::take(&mut self.open_docs);
         for doc in new_state.open_docs.values() {
             let rel_path = Self::get_rel_path(&doc.path, new_state.vault_root.as_deref());
@@ -384,6 +405,9 @@ impl SatzState {
             config_error,
             client_supports_pull_diagnostics: false,
             client_supports_document_changes: false,
+            config_revision: 0,
+            client_supports_diagnostic_refresh: false,
+            client_supports_semantic_tokens_refresh: false,
             peers_dirty: false,
             format_cache,
             indexing_complete: true,
@@ -504,10 +528,37 @@ impl SatzState {
         self.index.replace_doc(new_doc);
     }
 
+    /// Whether any open document's buffer is ahead of the index: the debounced reparse after the last
+    /// edit has not run yet. O(number of open documents).
+    pub fn has_stale_open_documents(&self) -> bool {
+        self.open_docs
+            .values()
+            .any(|open| open.indexed_version != open.version)
+    }
+
+    /// Reparses the open documents whose buffer is ahead of the index, now, and returns how many.
+    /// Requests that turn a client position into an offset (or edit the text) call this first: the
+    /// position refers to the buffer, so the index they read must too.
+    pub fn refresh_stale_open_documents(&mut self) -> usize {
+        let stale: Vec<String> = self
+            .open_docs
+            .iter()
+            .filter(|(_, open)| open.indexed_version != open.version)
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        for uri in &stale {
+            self.reparse_open_document(uri);
+        }
+        stale.len()
+    }
+
     /// Takes what is needed to re-parse an open document: its text, path and version. Quick (a copy
     /// of the buffer); the parse itself can then run without any lock.
     pub fn prepare_reparse(&self, uri: &str) -> Option<ReparseJob> {
         let open_doc = self.open_docs.get(uri)?;
+        if open_doc.indexed_version == open_doc.version {
+            return None; // the index already holds this text
+        }
         let rel_path = Self::get_rel_path(&open_doc.path, self.vault_root.as_deref());
         Some(ReparseJob {
             rel_path,
@@ -528,6 +579,7 @@ impl SatzState {
             return false;
         }
         open_doc.first_change_at = None;
+        open_doc.indexed_version = version;
 
         let doc_id = new_doc.id.clone();
         tracing::trace!(%uri, ?doc_id, "apply_reparse");
@@ -1515,6 +1567,8 @@ mod tests {
     #[test]
     fn a_reparse_for_a_document_that_was_closed_meanwhile_is_dropped() {
         let mut state = open_state("# A\n");
+        // A reparse is only prepared for a buffer the index is behind (the user has typed).
+        type_into(&mut state, 2, "# A\n\ntyped\n");
         let job = state.prepare_reparse("file:///a.md").unwrap();
         let parsed = satz_core::parse_document(&job.content, &job.rel_path);
         state.close_document("file:///a.md");
@@ -1529,5 +1583,95 @@ mod tests {
         assert_eq!(links_of_a(&state), vec!["five".to_string()]);
         // Unknown documents are ignored.
         state.reparse_open_document("file:///nope.md");
+    }
+
+    // ---- an index that always reflects the open buffers ----
+
+    fn edit_buffer(state: &mut SatzState, version: i32, new_text: &str) {
+        let doc = state.open_docs.get_mut("file:///a.md").unwrap();
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: new_text.to_string(),
+        }];
+        assert!(doc.apply_change_events(version, changes));
+    }
+
+    #[test]
+    fn a_freshly_opened_document_is_not_stale_and_typing_makes_it_so() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        assert!(!state.has_stale_open_documents());
+        edit_buffer(&mut state, 2, "# A\n\n[[two]]\n");
+        assert!(state.has_stale_open_documents());
+        assert_eq!(links_of_a(&state), vec!["one".to_string()], "the index is one edit behind");
+    }
+
+    #[test]
+    fn refreshing_brings_the_index_up_to_the_buffers_once() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        edit_buffer(&mut state, 2, "# A\n\n[[two]]\n");
+        assert_eq!(state.refresh_stale_open_documents(), 1);
+        assert_eq!(links_of_a(&state), vec!["two".to_string()]);
+        assert!(!state.has_stale_open_documents());
+        assert_eq!(state.refresh_stale_open_documents(), 0, "nothing left to do");
+        // A reparse task that fires later finds nothing to do either.
+        assert!(state.prepare_reparse("file:///a.md").is_none());
+    }
+
+    #[test]
+    fn a_change_that_reuses_the_version_number_is_still_seen_as_stale() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        edit_buffer(&mut state, 1, "# A\n\n[[same-version]]\n");
+        assert!(state.has_stale_open_documents());
+        assert_eq!(state.refresh_stale_open_documents(), 1);
+        assert_eq!(links_of_a(&state), vec!["same-version".to_string()]);
+    }
+
+    #[test]
+    fn only_the_stale_documents_are_reparsed_and_closed_ones_do_not_count() {
+        let mut state = open_state("# A\n");
+        state.open_document("file:///b.md", "# B\n", Path::new("/vault/b.md"), 1);
+        state.open_document("file:///c.md", "# C\n", Path::new("/vault/c.md"), 1);
+        edit_buffer(&mut state, 2, "# A\n\nnew\n");
+        {
+            let c = state.open_docs.get_mut("file:///c.md").unwrap();
+            c.apply_change_events(
+                2,
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "# C\n\nnew\n".to_string(),
+                }],
+            );
+        }
+        assert_eq!(state.refresh_stale_open_documents(), 2);
+        state.close_document("file:///a.md");
+        assert!(!state.has_stale_open_documents());
+    }
+
+    #[test]
+    fn refreshing_marks_peers_only_when_what_they_depend_on_changed() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        state.peers_dirty = false;
+        edit_buffer(&mut state, 2, "# A\n\n[[one]] more words\n");
+        state.refresh_stale_open_documents();
+        assert!(!state.peers_dirty);
+        edit_buffer(&mut state, 3, "# A\n\n## New heading\n\n[[one]]\n");
+        state.refresh_stale_open_documents();
+        assert!(state.peers_dirty);
+    }
+
+    #[test]
+    fn a_big_buffer_is_parsed_once_and_then_answered_from_the_index() {
+        let mut state = open_state("# A\n");
+        let big = format!("# A\n\n{}", "some words [[x]] and more\n".repeat(80_000));
+        edit_buffer(&mut state, 2, &big);
+        let start = std::time::Instant::now();
+        assert_eq!(state.refresh_stale_open_documents(), 1);
+        let first = start.elapsed();
+        let start = std::time::Instant::now();
+        assert_eq!(state.refresh_stale_open_documents(), 0);
+        assert!(start.elapsed() < first.max(std::time::Duration::from_millis(50)));
+        assert!(links_of_a(&state).len() >= 80_000);
     }
 }

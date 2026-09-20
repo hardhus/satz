@@ -320,12 +320,24 @@ fn zettel_vault_rename_heading_and_doc() {
     let we = edit
         .expect("Heading rename should be accepted")
         .expect("Heading rename should produce WorkspaceEdit");
-    let changes = we.changes.expect("Changes should be present");
-    assert!(
-        changes
-            .values()
-            .any(|edits| edits.iter().any(|e| e.new_text.contains("Yeni Mimari")))
-    );
+    let Some(tower_lsp_server::ls_types::DocumentChanges::Operations(ops)) = we.document_changes
+    else {
+        panic!("document edits should be present");
+    };
+    assert!(ops.iter().any(|op| match op {
+        tower_lsp_server::ls_types::DocumentChangeOperation::Edit(e) =>
+            e.edits.iter().any(|edit| {
+                match edit {
+                    tower_lsp_server::ls_types::OneOf::Left(t) => {
+                        t.new_text.contains("Yeni Mimari")
+                    }
+                    tower_lsp_server::ls_types::OneOf::Right(a) => {
+                        a.text_edit.new_text.contains("Yeni Mimari")
+                    }
+                }
+            }),
+        _ => false,
+    }));
 }
 
 #[tokio::test]

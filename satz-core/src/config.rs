@@ -204,6 +204,11 @@ pub struct LspConfig {
     /// are simply not cached (existing entries keep serving hits) rather than evicting anything.
     /// Default: 2000.
     pub format_cache_capacity: usize,
+    /// Most items one completion answer carries. A bigger vault (thousands of notes, headings
+    /// and tags) would otherwise send every one of them on every keystroke; when the answer is cut
+    /// it is marked incomplete and the client asks again as the user types. `0` = no limit.
+    /// Default: 200.
+    pub completion_limit: usize,
 }
 
 impl Default for LspConfig {
@@ -215,6 +220,7 @@ impl Default for LspConfig {
             reparse_debounce_ms: 200,
             reparse_max_wait_ms: 500,
             format_cache_capacity: 2000,
+            completion_limit: 200,
         }
     }
 }
@@ -425,6 +431,7 @@ mod tests {
         assert_eq!(cfg.lsp.reparse_debounce_ms, 200);
         assert_eq!(cfg.lsp.reparse_max_wait_ms, 500);
         assert_eq!(cfg.lsp.format_cache_capacity, 2000);
+        assert_eq!(cfg.lsp.completion_limit, 200);
         assert_eq!(cfg.hover.preview_lines, 8);
         assert!(cfg.formatter.enabled);
         assert_eq!(cfg.formatter.line_width, 80);
@@ -464,6 +471,7 @@ required_fields = ["title", "date"]
 reparse_debounce_ms = 300
 reparse_max_wait_ms = 900
 format_cache_capacity = 500
+completion_limit = 50
 
 [lsp.codelens]
 enable = true
@@ -520,6 +528,7 @@ link_width_mode = "display"
         assert_eq!(cfg.lsp.reparse_debounce_ms, 300);
         assert_eq!(cfg.lsp.reparse_max_wait_ms, 900);
         assert_eq!(cfg.lsp.format_cache_capacity, 500);
+        assert_eq!(cfg.lsp.completion_limit, 50);
         assert_eq!(cfg.hover.preview_lines, 12);
         assert!(!cfg.formatter.enabled);
         assert_eq!(cfg.formatter.line_width, 100);

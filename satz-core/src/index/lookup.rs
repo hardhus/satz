@@ -42,9 +42,18 @@ pub struct Index {
     /// against an index that may have changed since.
     pub(crate) outgoing: HashMap<DocId, HashSet<DocId>>,
     pub(crate) tags: HashMap<String, HashSet<DocId>>,
+    /// Counts the changes made to this index: it names the state something was computed from.
+    pub(crate) revision: u64,
 }
 
 impl Index {
+    /// A number that changes whenever the index changes (a note added, edited or removed) and only
+    /// then. Anything computed from the index -- diagnostics above all, which depend on every
+    /// note -- can be tagged with it, and "has anything changed?" is a comparison.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Returns an iterator over all indexed documents.
     pub fn documents(&self) -> impl Iterator<Item = &Document> {
         self.docs.values()
@@ -570,6 +579,7 @@ impl Index {
         for id in &ids {
             self.add_doc_edges(id);
         }
+        self.revision += 1;
     }
 
     /// Replaces or inserts a document in the index, keeping every derived table consistent.
@@ -607,6 +617,7 @@ impl Index {
         }
         self.docs.insert(id.clone(), new_doc);
         self.add_doc_edges(&id);
+        self.revision += 1;
     }
 
     /// Removes several documents with ONE rebuild of the derived tables (removing them one by one

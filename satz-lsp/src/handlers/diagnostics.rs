@@ -12,27 +12,85 @@ use crate::state::SatzState;
 /// spuriously broken. The `workspace/diagnostic/refresh` push sent once indexing finishes makes
 /// the client re-pull the real results.
 pub fn pull_document_diagnostics(uri: &str, state: &SatzState) -> Vec<lsp::Diagnostic> {
-    if !state.indexing_complete {
-        tracing::debug!(uri, "pull_document_diagnostics: initial indexing not complete yet");
-        return Vec::new();
-    }
-
-    match state.doc_for_uri(uri) {
-        Some((_, doc)) => compute_diagnostics(doc, &state.index, &state.config),
-        None => Vec::new(),
+    match pull_document_report(uri, None, state) {
+        DocumentPull::Full { items, .. } => items,
+        DocumentPull::Unchanged { .. } => Vec::new(),
     }
 }
 
-/// Computes the pull-mode `workspace/diagnostic` report across every indexed document.
+/// What a `textDocument/diagnostic` pull answers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocumentPull {
+    /// The diagnostics, tagged with the id a later pull can send back (`None`: an incomplete answer
+    /// that must not be reused).
+    Full {
+        items: Vec<lsp::Diagnostic>,
+        result_id: Option<String>,
+    },
+    /// The client's `previous_result_id` is still current: nothing was computed.
+    Unchanged { result_id: String },
+}
+
+/// The id of the state diagnostics are computed from. A diagnostic depends on every note (a link is
+/// broken because another note is gone), so ANY change to the index or the configuration gives a new
+/// id -- coarse, but never wrong.
+pub fn diagnostics_result_id(state: &SatzState) -> String {
+    format!("{}.{}", state.index.revision(), state.config_revision)
+}
+
+/// Computes the pull-mode `textDocument/diagnostic` report for a single open document, or says it
+/// is unchanged when `previous_result_id` is still current.
 ///
-/// Same `indexing_complete` gating as [`pull_document_diagnostics`], for the same reason: a
-/// workspace-wide scan taken mid-`walk_vault` would only cover a fraction of the vault.
-pub fn pull_workspace_diagnostics(state: &SatzState) -> Vec<lsp::WorkspaceDocumentDiagnosticReport> {
+/// Empty (and without an id) while the vault's initial scan is still running
+/// (`!state.indexing_complete`): at that point the index may only contain whichever documents
+/// happened to already be open, so any link to a not-yet-indexed peer would be reported as
+/// spuriously broken. The `workspace/diagnostic/refresh` sent once indexing finishes makes the
+/// client re-pull the real results.
+pub fn pull_document_report(
+    uri: &str,
+    previous_result_id: Option<&str>,
+    state: &SatzState,
+) -> DocumentPull {
     if !state.indexing_complete {
-        tracing::debug!("pull_workspace_diagnostics: initial indexing not complete yet");
+        tracing::debug!(uri, "pull_document_report: initial indexing not complete yet");
+        return DocumentPull::Full {
+            items: Vec::new(),
+            result_id: None,
+        };
+    }
+    let result_id = diagnostics_result_id(state);
+    if previous_result_id == Some(result_id.as_str()) {
+        return DocumentPull::Unchanged { result_id };
+    }
+    let items = match state.doc_for_uri(uri) {
+        Some((_, doc)) => compute_diagnostics(doc, &state.index, &state.config),
+        None => Vec::new(),
+    };
+    DocumentPull::Full {
+        items,
+        result_id: Some(result_id),
+    }
+}
+
+/// The pull-mode `workspace/diagnostic` report across every indexed document (no previous ids).
+pub fn pull_workspace_diagnostics(state: &SatzState) -> Vec<lsp::WorkspaceDocumentDiagnosticReport> {
+    pull_workspace_report(&std::collections::HashMap::new(), state)
+}
+
+/// The `workspace/diagnostic` report: a note whose entry in `previous` (uri -> result id) is still
+/// current is `Unchanged` and costs nothing; every other note gets its full diagnostics and the id
+/// to send back next time. Same `indexing_complete` gating as [`pull_document_report`]: a
+/// workspace-wide scan taken mid-scan would only cover a fraction of the vault.
+pub fn pull_workspace_report(
+    previous: &std::collections::HashMap<String, String>,
+    state: &SatzState,
+) -> Vec<lsp::WorkspaceDocumentDiagnosticReport> {
+    if !state.indexing_complete {
+        tracing::debug!("pull_workspace_report: initial indexing not complete yet");
         return Vec::new();
     }
 
+    let result_id = diagnostics_result_id(state);
     let mut items = Vec::new();
     for doc in state.index.documents() {
         let doc_path = match &state.vault_root {
@@ -42,17 +100,29 @@ pub fn pull_workspace_diagnostics(state: &SatzState) -> Vec<lsp::WorkspaceDocume
         let Some(uri) = path_to_uri(&doc_path) else {
             continue;
         };
-        let diagnostics = compute_diagnostics(doc, &state.index, &state.config);
         let version = state
             .open_docs
             .get(uri.as_str())
             .map(|od| od.version as i64);
+        if previous.get(uri.as_str()) == Some(&result_id) {
+            items.push(lsp::WorkspaceDocumentDiagnosticReport::Unchanged(
+                lsp::WorkspaceUnchangedDocumentDiagnosticReport {
+                    uri,
+                    version,
+                    unchanged_document_diagnostic_report: lsp::UnchangedDocumentDiagnosticReport {
+                        result_id: result_id.clone(),
+                    },
+                },
+            ));
+            continue;
+        }
+        let diagnostics = compute_diagnostics(doc, &state.index, &state.config);
         items.push(lsp::WorkspaceDocumentDiagnosticReport::Full(
             lsp::WorkspaceFullDocumentDiagnosticReport {
                 uri,
                 version,
                 full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
-                    result_id: None,
+                    result_id: Some(result_id.clone()),
                     items: diagnostics,
                 },
             },
@@ -61,12 +131,26 @@ pub fn pull_workspace_diagnostics(state: &SatzState) -> Vec<lsp::WorkspaceDocume
     items
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times diagnostics were computed on this thread (tests assert that answering
+    /// "unchanged" computes nothing).
+    static COMPUTE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn compute_calls() -> usize {
+    COMPUTE_CALLS.with(|c| c.get())
+}
+
 /// Computes all language server diagnostics for a single document.
 pub fn compute_diagnostics(
     doc: &Document,
     index: &Index,
     config: &VaultConfig,
 ) -> Vec<lsp::Diagnostic> {
+    #[cfg(test)]
+    COMPUTE_CALLS.with(|c| c.set(c.get() + 1));
     tracing::trace!(doc_id = ?doc.id, "compute_diagnostics");
     let mut diagnostics = Vec::new();
 
@@ -567,5 +651,210 @@ mod tests {
 
         let diagnostics = compute_diagnostics(&doc_a, &index, &config);
         assert!(diagnostics.is_empty());
+    }
+
+    // ---- pull reports: result ids let an unchanged vault be answered without computing ----
+
+    use std::collections::HashMap;
+
+    fn ready_state(files: &[(&str, &str)]) -> SatzState {
+        let mut state = SatzState {
+            index: Index::build(
+                files
+                    .iter()
+                    .map(|(p, t)| parse_document(t, Path::new(p)))
+                    .collect(),
+            ),
+            vault_root: Some(if cfg!(windows) {
+                PathBuf::from("C:\\vault")
+            } else {
+                PathBuf::from("/vault")
+            }),
+            ..SatzState::default()
+        };
+        state.indexing_complete = true;
+        state
+    }
+
+    fn uri_of(state: &SatzState, rel: &str) -> String {
+        path_to_uri(&state.vault_root.clone().unwrap().join(rel))
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
+    fn full_id(report: &DocumentPull) -> String {
+        match report {
+            DocumentPull::Full { result_id, .. } => result_id.clone().expect("a full report has an id"),
+            DocumentPull::Unchanged { .. } => panic!("expected a full report"),
+        }
+    }
+
+    #[test]
+    fn the_result_id_changes_with_the_index_and_with_the_configuration() {
+        let mut state = ready_state(&[("a.md", "# A\n[[b]]\n"), ("b.md", "# B\n")]);
+        let first = diagnostics_result_id(&state);
+        assert_eq!(diagnostics_result_id(&state), first, "stable while nothing changes");
+
+        state
+            .index
+            .replace_doc(parse_document("# B\n\nnew text\n", Path::new("b.md")));
+        let after_edit = diagnostics_result_id(&state);
+        assert_ne!(after_edit, first);
+
+        state.config_revision += 1;
+        assert_ne!(diagnostics_result_id(&state), after_edit);
+    }
+
+    #[test]
+    fn a_document_pull_with_the_current_id_is_answered_without_computing() {
+        let state = ready_state(&[("a.md", "# A\n[[missing]]\n")]);
+        let uri = uri_of(&state, "a.md");
+        // The document must be open for a per-document pull.
+        let mut state = state;
+        state.open_document(&uri, "# A\n[[missing]]\n", &state.vault_root.clone().unwrap().join("a.md"), 1);
+
+        let first = pull_document_report(&uri, None, &state);
+        let id = full_id(&first);
+        let DocumentPull::Full { items, .. } = &first else { unreachable!() };
+        assert!(items.iter().any(|d| d.message.contains("missing")), "the broken link: {items:?}");
+
+        let computed_before = compute_calls();
+        let again = pull_document_report(&uri, Some(&id), &state);
+        assert_eq!(again, DocumentPull::Unchanged { result_id: id.clone() });
+        assert_eq!(compute_calls(), computed_before, "nothing was computed");
+
+        // A stale, foreign or garbled id gets the full report again.
+        for previous in ["", "0.0", "garbage", "999999.999999", &format!("{id}x")] {
+            let report = pull_document_report(&uri, Some(previous), &state);
+            assert!(matches!(report, DocumentPull::Full { .. }), "{previous:?}");
+        }
+    }
+
+    #[test]
+    fn a_change_anywhere_invalidates_every_result_id() {
+        let mut state = ready_state(&[("a.md", "# A\n[[b]]\n"), ("b.md", "# B\n")]);
+        let uri = uri_of(&state, "a.md");
+        state.open_document(&uri, "# A\n[[b]]\n", &state.vault_root.clone().unwrap().join("a.md"), 1);
+        let id = full_id(&pull_document_report(&uri, None, &state));
+
+        // Removing `b.md` breaks the link in a.md: its diagnostics change though a.md did not.
+        state.index.remove_doc(&satz_core::DocId::new("b.md"));
+        let report = pull_document_report(&uri, Some(&id), &state);
+        let DocumentPull::Full { items, result_id } = report else {
+            panic!("the old id must not be accepted")
+        };
+        assert!(items.iter().any(|d| d.message.contains("'b'")), "the newly broken link: {items:?}");
+        assert_ne!(result_id.unwrap(), id);
+    }
+
+    #[test]
+    fn before_the_first_index_is_complete_a_pull_is_empty_and_has_no_id() {
+        let mut state = ready_state(&[("a.md", "# A\n")]);
+        state.indexing_complete = false;
+        let uri = uri_of(&state, "a.md");
+        match pull_document_report(&uri, None, &state) {
+            DocumentPull::Full { items, result_id } => {
+                assert!(items.is_empty());
+                assert_eq!(result_id, None, "an incomplete answer must never be reused");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Even a matching-looking id is not accepted while indexing.
+        let id = diagnostics_result_id(&state);
+        assert!(matches!(
+            pull_document_report(&uri, Some(&id), &state),
+            DocumentPull::Full { .. }
+        ));
+        assert!(pull_workspace_report(&HashMap::new(), &state).is_empty());
+    }
+
+    #[test]
+    fn a_workspace_pull_skips_the_notes_whose_id_is_current() {
+        let state = ready_state(&[
+            ("a.md", "# A\n[[gone]]\n"),
+            ("b.md", "# B\n"),
+            ("c.md", "# C\n[[also-gone]]\n"),
+        ]);
+        let first = pull_workspace_report(&HashMap::new(), &state);
+        assert_eq!(first.len(), 3);
+        let ids: HashMap<String, String> = first
+            .iter()
+            .map(|r| match r {
+                lsp::WorkspaceDocumentDiagnosticReport::Full(f) => (
+                    f.uri.as_str().to_string(),
+                    f.full_document_diagnostic_report.result_id.clone().unwrap(),
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+
+        // Everything current: nothing is computed and every entry is `Unchanged`.
+        let before = compute_calls();
+        let second = pull_workspace_report(&ids, &state);
+        assert_eq!(second.len(), 3);
+        assert!(second
+            .iter()
+            .all(|r| matches!(r, lsp::WorkspaceDocumentDiagnosticReport::Unchanged(_))));
+        assert_eq!(compute_calls(), before);
+
+        // Only some ids known (and one wrong): those are `Unchanged`, the rest `Full`.
+        let mut partial = HashMap::new();
+        partial.insert(uri_of(&state, "a.md"), ids[&uri_of(&state, "a.md")].clone());
+        partial.insert(uri_of(&state, "b.md"), "stale".to_string());
+        let mixed = pull_workspace_report(&partial, &state);
+        let kind = |rel: &str| {
+            let uri = uri_of(&state, rel);
+            mixed
+                .iter()
+                .find_map(|r| match r {
+                    lsp::WorkspaceDocumentDiagnosticReport::Full(f) if f.uri.as_str() == uri => Some("full"),
+                    lsp::WorkspaceDocumentDiagnosticReport::Unchanged(u) if u.uri.as_str() == uri => Some("unchanged"),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(kind("a.md"), "unchanged");
+        assert_eq!(kind("b.md"), "full");
+        assert_eq!(kind("c.md"), "full");
+    }
+
+    #[test]
+    fn open_documents_keep_their_version_in_both_report_kinds() {
+        let mut state = ready_state(&[("a.md", "# A\n")]);
+        let path = state.vault_root.clone().unwrap().join("a.md");
+        let uri = uri_of(&state, "a.md");
+        state.open_document(&uri, "# A\n", &path, 7);
+        let full = pull_workspace_report(&HashMap::new(), &state);
+        let lsp::WorkspaceDocumentDiagnosticReport::Full(f) = &full[0] else { panic!() };
+        assert_eq!(f.version, Some(7));
+        let ids = HashMap::from([(uri.clone(), f.full_document_diagnostic_report.result_id.clone().unwrap())]);
+        let unchanged = pull_workspace_report(&ids, &state);
+        let lsp::WorkspaceDocumentDiagnosticReport::Unchanged(u) = &unchanged[0] else { panic!() };
+        assert_eq!(u.version, Some(7));
+    }
+
+    #[test]
+    fn a_big_idle_vault_is_answered_quickly_the_second_time() {
+        let files: Vec<(String, String)> = (0..2000)
+            .map(|i| (format!("n{i}.md"), format!("# N{i}\n[[n{}]] [[missing{i}]]\n", (i + 1) % 2000)))
+            .collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        let state = ready_state(&refs);
+        let first = pull_workspace_report(&HashMap::new(), &state);
+        let ids: HashMap<String, String> = first
+            .iter()
+            .map(|r| match r {
+                lsp::WorkspaceDocumentDiagnosticReport::Full(f) => (
+                    f.uri.as_str().to_string(),
+                    f.full_document_diagnostic_report.result_id.clone().unwrap(),
+                ),
+                _ => unreachable!(),
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let second = pull_workspace_report(&ids, &state);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
+        assert!(second.iter().all(|r| matches!(r, lsp::WorkspaceDocumentDiagnosticReport::Unchanged(_))));
     }
 }
