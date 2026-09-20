@@ -176,7 +176,7 @@ The formatter changes how a document is *written*, never how it *renders*. Guara
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `enable` | bool | `true` | Detect and realign GFM pipe tables (column widths, alignment markers). Cell content itself is reproduced verbatim — never re-parsed — so inline markdown/wikilinks inside cells survive untouched. A table with a row that has more cells than its header (usually an unescaped `\|` inside a wikilink or code span) is left exactly as you wrote it, because realigning it would delete the extra cells; escape the pipe (`\\|`) to have the table formatted. |
+| `enable` | bool | `true` | Detect and realign GFM pipe tables (column widths, alignment markers). Cell content itself is reproduced verbatim — never re-parsed — so inline markdown/wikilinks inside cells survive untouched. A table with a row that has more cells than its header (usually an unescaped `\|` inside a wikilink or code span) is left exactly as you wrote it, because realigning it would delete the extra cells; escape the pipe (`\\|`) to have the table formatted. A table inside a block quote or a list item is realigned too, with its `>` markers or indentation kept on every line; one whose markers differ from line to line, or that sits in a mix of containers, is left as written. |
 | `cell_padding` | integer | `1` | Minimum whitespace padding on each side of a cell's content. |
 | `min_column_width` | integer | `3` | Minimum width (display columns) reserved for a column, even if its content is shorter. |
 
