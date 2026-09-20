@@ -10,8 +10,7 @@ pub fn code_lens(params: CodeLensParams, state: &SatzState) -> Option<Vec<CodeLe
     let uri = params.text_document.uri.as_str();
     tracing::debug!(uri, "code_lens");
     let open_doc = state.open_docs.get(uri)?;
-    let rel_path =
-        crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root.as_deref());
+    let rel_path = crate::state::SatzState::get_rel_path(&open_doc.path, state.vault_root());
     let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
     let doc_id = satz_core::DocId::new(&rel_path_str);
 
@@ -43,11 +42,9 @@ mod tests {
     #[test]
     fn test_codelens_disabled_by_default() {
         let doc_a = parse_document("# Doc A\n\nContent", Path::new("doc-a.md"));
-        let state = SatzState {
-            index: Index::build(vec![doc_a]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let params = CodeLensParams {
             text_document: TextDocumentIdentifier {
@@ -72,12 +69,10 @@ mod tests {
         let uri_str = "file:///doc-a.md";
         let rel_a = Path::new("doc-a.md");
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc_a, doc_b, doc_c]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            config,
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a, doc_b, doc_c]);
+        state.config = config;
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             uri_str.to_string(),
             crate::state::OpenDocument::new(uri_str, rel_a.to_path_buf(), "# Doc A", 1),
@@ -109,17 +104,15 @@ mod tests {
             .find(|(p, _)| *p == "doc-a.md")
             .map(|(_, t)| *t)
             .unwrap();
-        let mut state = SatzState {
-            index: Index::build(
-                files
-                    .iter()
-                    .map(|(p, t)| parse_document(t, Path::new(p)))
-                    .collect(),
-            ),
-            vault_root: Some(Path::new("").to_path_buf()),
-            config,
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(
+            files
+                .iter()
+                .map(|(p, t)| parse_document(t, Path::new(p)))
+                .collect(),
+        );
+        state.config = config;
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             uri_str.to_string(),
             crate::state::OpenDocument::new(uri_str, rel_a.to_path_buf(), text_a, 1),
@@ -139,16 +132,14 @@ mod tests {
     fn the_lens_command_is_the_advertised_one_and_carries_the_note_uri() {
         let mut config = VaultConfig::default();
         config.lsp.codelens.enable = true;
-        let mut state = SatzState {
-            index: Index::build(vec![parse_document(
-                "# A
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![parse_document(
+            "# A
 ",
-                Path::new("doc-a.md"),
-            )]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            config,
-            ..Default::default()
-        };
+            Path::new("doc-a.md"),
+        )]);
+        state.config = config;
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new(
@@ -198,15 +189,13 @@ mod tests {
         let mut config = VaultConfig::default();
         config.lsp.codelens.enable = true;
         let uri = "file:///doc-a.md";
-        let mut state = SatzState {
-            index: Index::build(vec![
-                parse_document("# A\n", Path::new("doc-a.md")),
-                parse_document("# B\n", Path::new("doc-b.md")),
-            ]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            config,
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document("# A\n", Path::new("doc-a.md")),
+            parse_document("# B\n", Path::new("doc-b.md")),
+        ]);
+        state.config = config;
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             uri.to_string(),
             crate::state::OpenDocument::new(uri, Path::new("doc-a.md").to_path_buf(), "# A\n", 1),

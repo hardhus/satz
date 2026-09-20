@@ -297,11 +297,9 @@ mod tests {
         let doc_a = parse_document(text, rel_path);
         let doc_b = parse_document("# Doc B", Path::new("doc-b.md"));
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc_a, doc_b]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a, doc_b]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),
@@ -354,11 +352,9 @@ mod tests {
         let doc_a = parse_document(text, rel_path);
         let doc_b = parse_document("# Doc B", Path::new("doc-b.md"));
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc_a, doc_b]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a, doc_b]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),
@@ -389,12 +385,10 @@ mod tests {
         let doc_a = parse_document(text, rel_path);
         let doc_b = parse_document("# Doc B", Path::new("doc-b.md"));
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc_a, doc_b]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            config,
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a, doc_b]);
+        state.config = config;
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),
@@ -470,14 +464,12 @@ mod tests {
     /// an existing `doc-b.md`, so `[[doc-b]]` resolves).
     fn decoded(text: &str) -> Vec<(u32, u32, u32, u32)> {
         let rel_path = Path::new("doc-a.md");
-        let mut state = SatzState {
-            index: Index::build(vec![
-                parse_document(text, rel_path),
-                parse_document("# Doc B", Path::new("doc-b.md")),
-            ]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document(text, rel_path),
+            parse_document("# Doc B", Path::new("doc-b.md")),
+        ]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),

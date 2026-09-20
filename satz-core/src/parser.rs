@@ -1,6 +1,6 @@
-pub mod frontmatter;
-pub mod inline_scan;
-pub mod structure;
+pub(crate) mod frontmatter;
+pub(crate) mod inline_scan;
+pub(crate) mod structure;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

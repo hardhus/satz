@@ -40,11 +40,9 @@ mod tests {
         let rel_path = Path::new("test.md");
         let doc = parse_document(text, rel_path);
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///test.md".to_string(),
             crate::state::OpenDocument::new("file:///test.md", rel_path.to_path_buf(), text, 1),
@@ -98,11 +96,9 @@ mod tests {
         let rel_path = Path::new("test.md");
         let doc = parse_document(text, rel_path);
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///test.md".to_string(),
             crate::state::OpenDocument::new("file:///test.md", rel_path.to_path_buf(), text, 1),
@@ -127,11 +123,9 @@ mod tests {
     fn dirty_state() -> (SatzState, DocumentFormattingParams) {
         let text = "Line 1   \n\n\n\nLine 2   ";
         let rel_path = Path::new("test.md");
-        let mut state = SatzState {
-            index: Index::build(vec![parse_document(text, rel_path)]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![parse_document(text, rel_path)]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///test.md".to_string(),
             crate::state::OpenDocument::new("file:///test.md", rel_path.to_path_buf(), text, 1),
@@ -175,11 +169,9 @@ mod tests {
 
     fn state_and_params_for(text: &str) -> (SatzState, DocumentFormattingParams) {
         let rel_path = Path::new("test.md");
-        let mut state = SatzState {
-            index: Index::build(vec![parse_document(text, rel_path)]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![parse_document(text, rel_path)]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///test.md".to_string(),
             crate::state::OpenDocument::new("file:///test.md", rel_path.to_path_buf(), text, 1),
@@ -247,11 +239,9 @@ mod tests {
         let rel_path = Path::new("test.md");
         let doc = parse_document(text, rel_path);
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.config.formatter.enabled = false;
         state.open_docs.insert(
             "file:///test.md".to_string(),

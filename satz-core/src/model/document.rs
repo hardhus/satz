@@ -30,6 +30,13 @@ impl std::fmt::Display for DocId {
     }
 }
 
+/// One parsed note.
+///
+/// The fields are read directly, but they belong together: `line_index` holds the exact text that
+/// `content_hash`, `title`, `headings`, `links`, `tags` and `blocks` were derived from, and every
+/// range in them is a byte range into that text. Only `parse_document` / `parse_document_owned`
+/// produce a consistent `Document`; changing a field by hand (or mixing fields of two documents)
+/// breaks that, so build a new one by parsing instead.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Document {
     pub id: DocId,

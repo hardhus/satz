@@ -10,6 +10,9 @@ use crate::parser::structure::parse_structure;
 /// from scanning lines for fence characters: fence length, nesting, indentation, blockquote/list
 /// containers and unterminated blocks are all decided by the parser, so the two passes below can
 /// never disagree with each other or with how the document renders.
+///
+/// Only the tests call this entry point: `format_document` runs the two passes itself.
+#[cfg(test)]
 pub fn run(source: &str, config: &FormatterConfig) -> String {
     layout(&super::links::normalize(source, config), config)
 }

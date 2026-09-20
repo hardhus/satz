@@ -36,9 +36,9 @@ fn create_zettel_state() -> (SatzState, PathBuf) {
     let index = Index::build(docs);
 
     let mut state = SatzState::default();
-    state.vault_root = Some(vault_root.clone());
+    state.set_vault_root(Some(vault_root.clone()));
     state.index = index;
-    state.indexing_complete = true;
+    state.set_indexing_complete(true);
 
     // Register open docs
     let uri_ana = if cfg!(windows) {

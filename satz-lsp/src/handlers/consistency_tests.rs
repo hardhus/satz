@@ -46,7 +46,7 @@ fn judge(open: &str, files: &[(&str, &str)], config: VaultConfig) -> Verdict {
     } else {
         Path::new("/vault").to_path_buf()
     };
-    state.vault_root = Some(root.clone());
+    state.set_vault_root(Some(root.clone()));
     let text = files.iter().find(|(p, _)| *p == open).unwrap().1;
     let uri = crate::convert::path_to_uri(&root.join(open))
         .unwrap()

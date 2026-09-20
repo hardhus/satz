@@ -38,7 +38,7 @@ pub fn workspace_symbol(
     let mut scored_symbols: Vec<(u32, SymbolInformation)> = Vec::new();
 
     for doc in candidate_docs {
-        let doc_path = match &state.vault_root {
+        let doc_path = match state.vault_root() {
             Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
             _ => doc.path.clone(),
         };
@@ -152,11 +152,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         // 1. General search for "Wittgen"
         let params = WorkspaceSymbolParams {
@@ -197,11 +197,11 @@ mod tests {
                 .map(|(path, text)| parse_document(text, Path::new(path)))
                 .collect(),
         );
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
         let params = WorkspaceSymbolParams {
             query: query.to_string(),
             work_done_progress_params: Default::default(),

@@ -1,13 +1,13 @@
 pub mod diff;
-pub mod emphasis;
-pub mod line_pass;
-pub mod links;
-pub mod list;
+pub(crate) mod emphasis;
+pub(crate) mod line_pass;
+pub(crate) mod links;
+pub(crate) mod list;
 mod math;
-pub mod misc;
-pub mod table;
-pub mod wrap;
-pub mod zones;
+pub(crate) mod misc;
+pub(crate) mod table;
+pub(crate) mod wrap;
+pub(crate) mod zones;
 
 use crate::config::FormatterConfig;
 use crate::model::ByteRange;
@@ -96,12 +96,17 @@ fn format_stages(source: &str, config: &FormatterConfig) -> String {
         for span in spans {
             // A table whose rows have more cells than its header (typically an unescaped `|`
             // inside a wikilink or code span) can only be re-rendered by deleting the extra
-            // cells from the file, so it is left exactly as written.
-            let rendered = table::parse_table_block(source, span)
-                .filter(|block| block.dropped_cells == 0)
-                .map(|block| table::render(&block, &config.tables))
-                .unwrap_or_else(|| source[span.start..span.end].to_string());
-            replacements.push((span, rendered));
+            // cells from the file, so it is left exactly as written; so is one in a container
+            // whose line markers cannot be read (see `table::format_at`).
+            replacements.push((
+                span,
+                table::format_at(
+                    source,
+                    span,
+                    &config.tables,
+                    config.misc.enable && config.misc.blockquote_single_space,
+                ),
+            ));
         }
     }
 
@@ -409,5 +414,93 @@ mod tests {
         let pass1 = format_document(input, &config);
         let pass2 = format_document(&pass1, &config);
         assert_eq!(pass1, pass2, "kitchen-sink document must be idempotent");
+    }
+
+    // ---- tables inside block quotes and list items ----
+
+    fn formatted(source: &str) -> String {
+        format_document(source, &FormatterConfig::default())
+    }
+
+    #[test]
+    fn a_table_in_a_block_quote_is_aligned_and_keeps_its_markers() {
+        assert_eq!(
+            formatted("> | a | b |\n> |---|---|\n> | longer cell | 2 |\n"),
+            "> | a           | b   |\n> |-------------|-----|\n> | longer cell | 2   |\n"
+        );
+    }
+
+    #[test]
+    fn a_table_in_a_nested_block_quote_keeps_every_marker() {
+        assert_eq!(
+            formatted("> > | a | b |\n> > |---|:-:|\n> > | xxxx | 2 |\n"),
+            "> > | a    | b   |\n> > |------|:---:|\n> > | xxxx | 2   |\n"
+        );
+    }
+
+    #[test]
+    fn a_quote_without_spaces_after_the_marker_gets_one_on_every_line() {
+        assert_eq!(
+            formatted(">| a | b |\n>|---|---|\n>| xxxx | 2 |\n"),
+            "> | a    | b   |\n> |------|-----|\n> | xxxx | 2   |\n"
+        );
+    }
+
+    #[test]
+    fn a_table_in_a_list_item_is_aligned_at_its_indentation() {
+        assert_eq!(
+            formatted("- item\n\n  | a | b |\n  |---|---|\n  | 1 | 2222 |\n"),
+            "- item\n\n  | a   | b    |\n  |-----|------|\n  | 1   | 2222 |\n"
+        );
+        assert_eq!(
+            formatted("1. item\n\n   | a | b |\n   |---|---|\n   | 1 | 2222 |\n"),
+            "1. item\n\n   | a   | b    |\n   |-----|------|\n   | 1   | 2222 |\n"
+        );
+    }
+
+    #[test]
+    fn a_table_in_a_quote_or_list_is_formatted_once_and_stays_put() {
+        for text in [
+            "> | a | b |\n> |---|---|\n> | longer cell | 2 |\n",
+            "> > | a | b |\n> > |---|---|\n> > | x | 2 |\n",
+            "- item\n\n  | a | b |\n  |---|---|\n  | 1 | 2222 |\n",
+        ] {
+            let once = formatted(text);
+            assert_eq!(formatted(&once), once, "{text:?}");
+            let crlf = text.replace('\n', "\r\n");
+            assert_eq!(
+                formatted(&crlf),
+                once.replace('\n', "\r\n"),
+                "CRLF {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pipes_that_are_not_cell_borders_stay_intact_in_a_quoted_table() {
+        // An escaped pipe and a wikilink alias belong to their cell.
+        let out = formatted("> | a | b |\n> |---|---|\n> | x \\| y | [[n\\|m]] |\n");
+        assert!(out.contains("x \\| y"), "{out}");
+        assert!(out.contains("[[n\\|m]]"), "{out}");
+        assert_eq!(out.lines().count(), 3);
+        assert!(out.lines().all(|l| l.starts_with("> ")), "{out}");
+    }
+
+    #[test]
+    fn tables_the_prefix_rule_cannot_read_are_left_exactly_as_written() {
+        for text in [
+            // a quote inside a list item, and a list inside a quote
+            "- item\n\n  > | a | b |\n  > |---|---|\n  > | 1 | 2 |\n",
+            "> - item\n>\n>   | a | b |\n>   |---|---|\n>   | 1 | 2 |\n",
+            // tab-indented table under a list item
+            "- item\n\n\t| a | b |\n\t|---|---|\n\t| 1 | 2 |\n",
+        ] {
+            let out = formatted(text);
+            assert_eq!(formatted(&out), out, "idempotent: {text:?}");
+            // Nothing is lost: every cell text is still there.
+            for cell in ["a", "b", "1", "2"] {
+                assert!(out.contains(cell), "{cell} lost from {out:?}");
+            }
+        }
     }
 }

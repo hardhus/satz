@@ -30,7 +30,7 @@ pub fn goto_definition(
         && let Some(def) = doc.footnotes.find_def(label)
     {
         let range = byte_range_to_lsp(def.range, &doc.line_index);
-        let doc_path = match &state.vault_root {
+        let doc_path = match state.vault_root() {
             Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
             _ => doc.path.clone(),
         };
@@ -62,7 +62,7 @@ pub fn goto_definition(
             doc: target_doc,
             anchor,
         } => {
-            let target_path = match &state.vault_root {
+            let target_path = match state.vault_root() {
                 Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
                 _ => target_doc.path.clone(),
             };
@@ -81,7 +81,7 @@ pub fn goto_definition(
             )))
         }
         satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
-            let target_path = match &state.vault_root {
+            let target_path = match state.vault_root() {
                 Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
                 _ => target_doc.path.clone(),
             };
@@ -125,11 +125,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a.clone(), doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -180,11 +180,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
         let uri = if cfg!(windows) {
             "file:///C:/doc-a.md"
         } else {
@@ -227,11 +227,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -277,7 +277,7 @@ mod tests {
                 .map(|(p, t)| parse_document(t, Path::new(p)))
                 .collect(),
         );
-        state.vault_root = Some(root.clone());
+        state.set_vault_root(Some(root.clone()));
         let uri_of = |rel: &str| {
             crate::convert::path_to_uri(&root.join(rel))
                 .unwrap()

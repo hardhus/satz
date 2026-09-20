@@ -276,11 +276,9 @@ mod tests {
         let rel_path = Path::new("doc-a.md");
         let doc_a = parse_document(text, rel_path);
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc_a]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new("file:///doc-a.md", rel_path.to_path_buf(), text, 1),
@@ -331,7 +329,7 @@ mod behavior_tests {
                 .map(|(p, t)| parse_document(t, Path::new(p)))
                 .collect(),
         );
-        state.vault_root = Some(root.clone());
+        state.set_vault_root(Some(root.clone()));
         let text = files.iter().find(|(p, _)| *p == open).unwrap().1;
         let uri = crate::convert::path_to_uri(&root.join(open))
             .unwrap()

@@ -167,7 +167,7 @@ async fn process_file_event(
     client: &Client,
 ) -> bool {
     tracing::debug!(?path, "watcher: processing debounced event");
-    if !state.read().await.indexing_complete {
+    if !state.read().await.is_indexing_complete() {
         return true;
     }
     if is_config_file(path, vault_root) {
@@ -313,12 +313,12 @@ pub(crate) fn apply_prepared(
     path: &Path,
     prepared: PreparedChange,
 ) -> FsChange {
-    if !state.indexing_complete {
+    if !state.is_indexing_complete() {
         return FsChange::Deferred;
     }
     let is_open = |state: &SatzState, id: &satz_core::DocId| {
         state.open_docs.values().any(|open| {
-            let rel = SatzState::get_rel_path(&open.path, state.vault_root.as_deref());
+            let rel = SatzState::get_rel_path(&open.path, state.vault_root());
             satz_core::fold_key(&rel.to_string_lossy().replace('\\', "/"))
                 == satz_core::fold_key(id.as_str())
         })
@@ -656,8 +656,8 @@ mod tests {
 
     fn state_in(dir: &Path) -> SatzState {
         let mut state = SatzState::default();
-        state.vault_root = Some(dir.to_path_buf());
-        state.indexing_complete = true;
+        state.set_vault_root(Some(dir.to_path_buf()));
+        state.set_indexing_complete(true);
         state
     }
 
@@ -750,7 +750,7 @@ mod tests {
     #[test]
     fn open_path_matching_ignores_case_and_separator_spelling() {
         let mut state = SatzState::default();
-        state.vault_root = Some(PathBuf::from("/Vault"));
+        state.set_vault_root(Some(PathBuf::from("/Vault")));
         state.open_document("file:///x", "# X\n", Path::new("/Vault/Sub/X.md"), 1);
         assert!(state.is_open_path(Path::new("/Vault/Sub/X.md")));
         assert!(state.is_open_path(Path::new("/vault/sub/x.md")));
@@ -792,7 +792,7 @@ mod tests {
     fn changing_formatter_settings_changes_what_workspace_format_produces() {
         let v = TempVault::new("fmt-cache");
         let mut state = state_with_list_doc();
-        state.vault_root = Some(v.0.clone());
+        state.set_vault_root(Some(v.0.clone()));
 
         // Default settings: already clean. The (unchanged) result is cached.
         assert_eq!(
@@ -1104,14 +1104,14 @@ mod tests {
         let dir = temp_dir("deferred");
         let path = write(&dir, "new.md", "# new\n[[x]]\n");
         let mut state = state_in(&dir);
-        state.indexing_complete = false;
+        state.set_indexing_complete(false);
 
         assert_eq!(apply_fs_change(&mut state, &dir, &path), FsChange::Deferred);
         assert_eq!(ids(&state), Vec::<String>::new(), "nothing was applied");
 
         // The file changes again before indexing finishes; the retry reads the file as it is now.
         std::fs::write(&path, "# new\n[[y]]\n").unwrap();
-        state.indexing_complete = true;
+        state.set_indexing_complete(true);
         assert_eq!(
             apply_fs_change(&mut state, &dir, &path),
             FsChange::Reindexed
@@ -1125,7 +1125,7 @@ mod tests {
         let dir = temp_dir("deferred-dir");
         write(&dir, "d/a.md", "# a\n");
         let mut state = state_in(&dir);
-        state.indexing_complete = false;
+        state.set_indexing_complete(false);
         assert_eq!(
             apply_fs_change(&mut state, &dir, &dir.join("d")),
             FsChange::Deferred
@@ -1211,7 +1211,7 @@ today = [\"heute\"]
     fn a_skipped_change_leaves_the_index_revision_alone() {
         // The premise of the rule above: a skipped change really does not touch the index.
         let mut state = SatzState::default();
-        state.indexing_complete = true;
+        state.set_indexing_complete(true);
         let before = state.index.revision();
         let change = apply_prepared(&mut state, Path::new("/v/x.txt"), PreparedChange::Skip);
         assert_eq!(change, FsChange::Skipped);

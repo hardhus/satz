@@ -270,11 +270,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -330,11 +330,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -388,11 +388,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -444,11 +444,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -504,11 +504,11 @@ mod tests {
         let mut state = SatzState::default();
         state.config.hover.preview_lines = 4;
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -702,7 +702,7 @@ mod tests {
                 .map(|(p, t)| parse_document(t, Path::new(p)))
                 .collect(),
         );
-        state.vault_root = Some(root.clone());
+        state.set_vault_root(Some(root.clone()));
         let uri = crate::convert::path_to_uri(&root.join(open))
             .unwrap()
             .as_str()

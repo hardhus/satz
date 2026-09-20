@@ -94,7 +94,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
             let prefix = format!("{}/", clean_query);
 
             for tagged_doc in state.index.docs_with_tag(tag_name) {
-                let Some(u) = doc_uri(tagged_doc, state.vault_root.as_deref()) else {
+                let Some(u) = doc_uri(tagged_doc, state.vault_root()) else {
                     continue;
                 };
                 for t in &tagged_doc.tags {
@@ -111,7 +111,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
         CursorTarget::Block { ref doc, ref id } => {
             if let Some(target_doc) = state.index.get_doc(doc)
                 && let Some(b) = target_doc.resolve_block(id).map(|i| &target_doc.blocks[i])
-                && let Some(u) = doc_uri(target_doc, state.vault_root.as_deref())
+                && let Some(u) = doc_uri(target_doc, state.vault_root())
             {
                 let location = Location::new(u, byte_range_to_lsp(b.range, &target_doc.line_index));
                 declaration = Some(location.clone());
@@ -125,7 +125,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
             for src_id in &candidate_ids {
                 if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = doc_uri(src_doc, state.vault_root.as_deref()) else {
+                    let Some(src_uri) = doc_uri(src_doc, state.vault_root()) else {
                         continue;
                     };
 
@@ -158,7 +158,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                     Some(i) => target_doc.headings.get(i),
                     None => target_doc.headings.iter().find(|h| &h.slug == slug),
                 }
-                && let Some(u) = doc_uri(target_doc, state.vault_root.as_deref())
+                && let Some(u) = doc_uri(target_doc, state.vault_root())
             {
                 let location = Location::new(u, byte_range_to_lsp(h.range, &target_doc.line_index));
                 declaration = Some(location.clone());
@@ -172,7 +172,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
             for src_id in &candidate_ids {
                 if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = doc_uri(src_doc, state.vault_root.as_deref()) else {
+                    let Some(src_uri) = doc_uri(src_doc, state.vault_root()) else {
                         continue;
                     };
 
@@ -201,7 +201,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
         }
         CursorTarget::Doc(ref target_doc_id) => {
             if let Some(target_doc) = state.index.get_doc(target_doc_id)
-                && let Some(u) = doc_uri(target_doc, state.vault_root.as_deref())
+                && let Some(u) = doc_uri(target_doc, state.vault_root())
             {
                 let range = if let Some(h) = target_doc.headings.first() {
                     byte_range_to_lsp(h.range, &target_doc.line_index)
@@ -221,7 +221,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
             for src_id in &candidate_ids {
                 if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = doc_uri(src_doc, state.vault_root.as_deref()) else {
+                    let Some(src_uri) = doc_uri(src_doc, state.vault_root()) else {
                         continue;
                     };
 
@@ -293,11 +293,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -353,11 +353,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_lsp, doc_daily]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_daily_str = if cfg!(windows) {
             "file:///C:/daily.md"
@@ -425,7 +425,7 @@ mod tests {
                 .map(|(rel, text)| parse_document(text, Path::new(rel)))
                 .collect(),
         );
-        state.vault_root = Some(root());
+        state.set_vault_root(Some(root()));
         for (rel, text) in files {
             let uri = uri_of(rel);
             state.open_docs.insert(

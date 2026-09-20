@@ -3,7 +3,7 @@ members = ["satz-core", "satz-cli", "satz-lsp"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.34"
+version = "0.1.35"
 edition = "2024"
 # let-chains (`if let .. && ..`, used throughout) are stable from 1.88 in edition 2024.
 rust-version = "1.88"

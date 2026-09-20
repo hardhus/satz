@@ -17,7 +17,7 @@ fn state() -> (SatzState, String) {
     let root = PathBuf::from(if cfg!(windows) { "C:\\vault" } else { "/vault" });
     let mut state = SatzState::default();
     state.index = Index::build(vec![parse_document(BODY, Path::new("a.md"))]);
-    state.vault_root = Some(root.clone());
+    state.set_vault_root(Some(root.clone()));
     let uri = satz_lsp::convert::path_to_uri(&root.join("a.md"))
         .unwrap()
         .as_str()

@@ -84,11 +84,9 @@ Section 2 content
         let rel_path = Path::new("test.md");
         let doc = parse_document(text, rel_path);
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let uri_str = "file:///test.md";
         state.open_docs.insert(
@@ -133,11 +131,9 @@ Content here
         let rel_path = Path::new("fm.md");
         let doc = parse_document(text, rel_path);
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let uri_str = "file:///fm.md";
         state.open_docs.insert(
@@ -167,11 +163,9 @@ Content here
 
     fn folds(text: &str) -> Vec<(u32, u32)> {
         let rel_path = Path::new("f.md");
-        let mut state = SatzState {
-            index: Index::build(vec![parse_document(text, rel_path)]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![parse_document(text, rel_path)]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///f.md".to_string(),
             crate::state::OpenDocument::new("file:///f.md", rel_path.to_path_buf(), text, 1),

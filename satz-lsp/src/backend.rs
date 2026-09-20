@@ -184,6 +184,36 @@ async fn run_reparse(
     }
 }
 
+/// Which folder the server indexes, and which of the client's workspace folders it leaves out.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WorkspaceChoice {
+    pub root: Option<PathBuf>,
+    pub ignored: Vec<PathBuf>,
+}
+
+/// One vault per server: the first local workspace folder is the vault, the others are reported as
+/// ignored (the same folder listed twice is not "another"). Without folders the deprecated
+/// `rootUri` is used.
+pub(crate) fn pick_workspace_root(folders: &[String], root_uri: Option<&str>) -> WorkspaceChoice {
+    let mut local: Vec<PathBuf> = Vec::new();
+    for path in folders.iter().filter_map(|uri| uri_to_path(uri)) {
+        if !local.contains(&path) {
+            local.push(path);
+        }
+    }
+    if local.is_empty() {
+        return WorkspaceChoice {
+            root: root_uri.and_then(uri_to_path),
+            ignored: Vec::new(),
+        };
+    }
+    let root = local.remove(0);
+    WorkspaceChoice {
+        root: Some(root),
+        ignored: local,
+    }
+}
+
 pub struct Backend {
     pub client: Client,
     pub state: Arc<RwLock<SatzState>>,
@@ -201,7 +231,7 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
             return;
         }
 
-        if !state_guard.indexing_complete {
+        if !state_guard.is_indexing_complete() {
             tracing::debug!(uri, "publish_for: initial indexing not complete yet, skipping");
             return;
         }
@@ -209,7 +239,7 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
         let Some(open_doc) = state_guard.open_docs.get(uri) else {
             return;
         };
-        let rel_path = SatzState::get_rel_path(&open_doc.path, state_guard.vault_root.as_deref());
+        let rel_path = SatzState::get_rel_path(&open_doc.path, state_guard.vault_root());
         let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
         let doc_id = satz_core::DocId::new(&rel_path_str);
 
@@ -309,19 +339,31 @@ impl LanguageServer for Backend {
             self.apply_log_level(level);
         }
 
-        let vault_root: Option<PathBuf> = params
+        let folder_uris: Vec<String> = params
             .workspace_folders
             .as_deref()
-            .and_then(|folders| folders.first())
-            .and_then(|f| uri_to_path(f.uri.as_str()))
-            .or_else(|| {
-                // The LSP type marks this field `#[deprecated]` but the protocol still requires it.
-                #[allow(deprecated)]
-                params
-                    .root_uri
-                    .as_ref()
-                    .and_then(|u| uri_to_path(u.as_str()))
-            });
+            .unwrap_or_default()
+            .iter()
+            .map(|f| f.uri.as_str().to_string())
+            .collect();
+        // The LSP type marks `root_uri` `#[deprecated]` but the protocol still requires it.
+        #[allow(deprecated)]
+        let legacy_root = params.root_uri.as_ref().map(|u| u.as_str().to_string());
+        let WorkspaceChoice {
+            root: vault_root,
+            ignored: ignored_folders,
+        } = pick_workspace_root(&folder_uris, legacy_root.as_deref());
+        if !ignored_folders.is_empty() {
+            // One server indexes one vault; say so instead of silently serving only the first.
+            let names: Vec<String> = ignored_folders.iter().map(|p| p.display().to_string()).collect();
+            let message = format!(
+                "satz indexes one vault per server: using {} and ignoring {}. Start another server for each other folder.",
+                vault_root.as_deref().map_or_else(String::new, |p| p.display().to_string()),
+                names.join(", ")
+            );
+            tracing::warn!("{message}");
+            self.client.show_message(MessageType::WARNING, message).await;
+        }
 
         let supports_pull = params
             .capabilities
@@ -425,7 +467,7 @@ impl LanguageServer for Backend {
             // No workspace root at all: there is no vault to walk, so there is nothing for
             // `indexing_complete` to wait on — diagnostics can run immediately.
             let mut state = self.state.write().await;
-            state.indexing_complete = true;
+            state.set_indexing_complete(true);
         }
 
         Ok(InitializeResult {
@@ -938,7 +980,7 @@ mod tests {
         let backend = service.inner();
         {
             let mut state = backend.state.write().await;
-            state.vault_root = Some(root());
+            state.set_vault_root(Some(root()));
             state.index = satz_core::Index::build(vec![
                 satz_core::parse_document("# A\n", std::path::Path::new("a.md")),
                 satz_core::parse_document("see [[a]]\n", std::path::Path::new("b.md")),
@@ -1023,10 +1065,10 @@ mod tests {
         let backend = Arc::new(Backend::new(client, handle2));
         {
             let mut state = backend.state.write().await;
-            state.vault_root = Some(root());
+            state.set_vault_root(Some(root()));
             state.config.lsp.reparse_debounce_ms = 600_000;
             state.config.lsp.reparse_max_wait_ms = 600_000;
-            state.indexing_complete = true;
+            state.set_indexing_complete(true);
             state.open_document("file:///a.md", "# A\n", &root().join("a.md"), 1);
         }
         (backend, service)
@@ -1576,15 +1618,15 @@ mod tests {
         backend
             .did_open(open_params("file:///p.md", 1, "# P\n\n[[a]]\n"))
             .await;
-        assert!(!backend.state.read().await.peers_dirty, "consumed by did_open");
+        assert!(!backend.state.read().await.peers_dirty(), "consumed by did_open");
 
-        backend.state.write().await.peers_dirty = true;
+        backend.state.write().await.mark_peers_dirty();
         backend
             .did_change(change_params("file:///p.md", 2, "# P\n\n[[nothing]]\n"))
             .await;
-        backend.state.write().await.peers_dirty = true;
+        backend.state.write().await.mark_peers_dirty();
         backend.did_close(close_params("file:///p.md")).await;
-        assert!(!backend.state.read().await.peers_dirty, "consumed by did_close");
+        assert!(!backend.state.read().await.peers_dirty(), "consumed by did_close");
     }
 
     #[tokio::test]
@@ -1597,5 +1639,53 @@ mod tests {
         assert!(handle.is_stopped());
         assert!(backend.watcher.lock().unwrap().is_none());
         backend.shutdown().await.unwrap();
+    }
+
+    // ---- which workspace folder is the vault ----
+
+    fn uri(path: &str) -> String {
+        crate::convert::path_to_uri(&root().join(path)).unwrap().as_str().to_string()
+    }
+
+    #[test]
+    fn one_folder_is_the_vault_and_nothing_is_ignored() {
+        let choice = pick_workspace_root(&[uri("v")], None);
+        assert_eq!(choice.root, Some(root().join("v")));
+        assert!(choice.ignored.is_empty());
+    }
+
+    #[test]
+    fn with_several_folders_the_first_is_the_vault_and_the_rest_are_ignored() {
+        let choice = pick_workspace_root(&[uri("a"), uri("b"), uri("c")], None);
+        assert_eq!(choice.root, Some(root().join("a")));
+        assert_eq!(choice.ignored, vec![root().join("b"), root().join("c")]);
+    }
+
+    #[test]
+    fn the_same_folder_twice_is_not_another_folder() {
+        let choice = pick_workspace_root(&[uri("a"), uri("a"), uri("b")], None);
+        assert_eq!(choice.root, Some(root().join("a")));
+        assert_eq!(choice.ignored, vec![root().join("b")]);
+    }
+
+    #[test]
+    fn folders_that_are_not_local_files_are_skipped() {
+        let choice = pick_workspace_root(
+            &["untitled:x".to_string(), "https://example.com/w".to_string(), uri("real")],
+            None,
+        );
+        assert_eq!(choice.root, Some(root().join("real")));
+        assert!(choice.ignored.is_empty());
+    }
+
+    #[test]
+    fn without_folders_the_root_uri_is_used_and_without_either_there_is_no_vault() {
+        let choice = pick_workspace_root(&[], Some(&uri("legacy")));
+        assert_eq!(choice.root, Some(root().join("legacy")));
+        assert_eq!(pick_workspace_root(&[], None), WorkspaceChoice::default());
+        assert_eq!(pick_workspace_root(&["untitled:x".to_string()], None).root, None);
+        // Folders win over the legacy root.
+        let both = pick_workspace_root(&[uri("f")], Some(&uri("legacy")));
+        assert_eq!(both.root, Some(root().join("f")));
     }
 }

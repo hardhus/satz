@@ -130,5 +130,26 @@ fn main() {
         formatted_messy.len()
     );
 
+    // 8. One big note with wrapping on: the wrap pass parses the text once more, so this is its
+    //    worst case (about 5 MB of prose with links).
+    let mut wrap_config = satz_core::config::VaultConfig::default();
+    wrap_config.formatter.wrap.enable = true;
+    let big = "A paragraph of prose with a [[link|alias]] and some more words to wrap at eighty columns,                so that every line has to be reflowed.
+
+"
+        .repeat(30_000);
+    let t7 = Instant::now();
+    let wrapped = black_box(satz_core::formatter::format_document(
+        black_box(&big),
+        &wrap_config.formatter,
+    ));
+    let wrap_time = t7.elapsed();
+    println!(
+        "8. Formatted one {:.1} MB note with wrapping on: {:?} (output {} bytes)",
+        big.len() as f64 / 1_048_576.0,
+        wrap_time,
+        wrapped.len()
+    );
+
     println!("============================================================");
 }

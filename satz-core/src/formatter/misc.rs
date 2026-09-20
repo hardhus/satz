@@ -169,7 +169,7 @@ fn blockquote_replacements(source: &str, span: ByteRange) -> Vec<(ByteRange, Str
 
 /// Returns `(prefix_byte_len, replacement_text)` for a line's leading indentation + `>` marker
 /// run, or `None` if the line doesn't start with `>` (after up to 3 leading spaces) at all.
-fn normalize_blockquote_line(line: &str) -> Option<(usize, String)> {
+pub(super) fn normalize_blockquote_line(line: &str) -> Option<(usize, String)> {
     let bytes = line.as_bytes();
     let mut i = 0;
     let mut leading_spaces = 0;

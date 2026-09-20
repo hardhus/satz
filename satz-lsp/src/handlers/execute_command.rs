@@ -29,7 +29,7 @@ pub fn show_backlinks(
         .ok_or("satz.showBacklinks expects the note's URI as its first argument")?;
     let path = crate::convert::uri_to_path(uri)
         .ok_or_else(|| format!("satz.showBacklinks: '{uri}' is not a file URI"))?;
-    let rel_path = SatzState::get_rel_path(&path, state.vault_root.as_deref());
+    let rel_path = SatzState::get_rel_path(&path, state.vault_root());
     let target = satz_core::DocId::new(rel_path.to_string_lossy().replace('\\', "/"));
     if state.index.get_doc(&target).is_none() {
         return Ok(Vec::new());
@@ -40,7 +40,7 @@ pub fn show_backlinks(
         let Some(source) = state.index.get_doc(source_id) else {
             continue;
         };
-        let source_path = match &state.vault_root {
+        let source_path = match state.vault_root() {
             Some(root) if !source.path.is_absolute() => root.join(&source.path),
             _ => source.path.clone(),
         };
@@ -167,7 +167,7 @@ pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
         let uri = match open.and_then(|(_, open_doc)| open_doc.uri.parse::<Uri>().ok()) {
             Some(uri) => uri,
             None => {
-                let doc_path = match &state.vault_root {
+                let doc_path = match state.vault_root() {
                     Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
                     _ => doc.path.clone(),
                 };
@@ -243,11 +243,10 @@ mod tests {
         } else {
             Path::new("/").to_path_buf()
         };
-        SatzState {
-            index: Index::build(docs),
-            vault_root: Some(root),
-            ..Default::default()
-        }
+        let mut state = SatzState::default();
+        state.index = Index::build(docs);
+        state.set_vault_root(Some(root));
+        state
     }
 
     #[test]
@@ -566,10 +565,8 @@ mod tests {
     /// A vault with `a.md` open at `version` whose buffer is `buffer`, while the index still holds
     /// `indexed` (the debounced reparse has not run yet).
     fn open_state(indexed: &str, buffer: &str, version: i32) -> (SatzState, String) {
-        let mut state = SatzState {
-            vault_root: Some(root_dir()),
-            ..SatzState::default()
-        };
+        let mut state = SatzState::default();
+        state.set_vault_root(Some(root_dir()));
         let uri = uri_for("a.md");
         state.open_document(&uri, indexed, &root_dir().join("a.md"), 1);
         let open = state.open_docs.get_mut(&uri).unwrap();
@@ -636,10 +633,8 @@ mod tests {
         } else {
             std::path::PathBuf::from("/notes/a.md")
         };
-        let mut state = SatzState {
-            vault_root: path.parent().map(|p| p.to_path_buf()),
-            ..SatzState::default()
-        };
+        let mut state = SatzState::default();
+        state.set_vault_root(path.parent().map(|p| p.to_path_buf()));
         state.open_document(&client_uri, "dirty   \n\n\n\nx\n", &path, 3);
         let change = &compute_format_changes(&state).changes[0];
         assert_eq!(

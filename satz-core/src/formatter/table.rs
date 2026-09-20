@@ -140,6 +140,72 @@ fn split_row(line: &str) -> Vec<String> {
     cells
 }
 
+/// The text that replaces the table at `span` in `source`: the table re-rendered with aligned
+/// columns, or the original text when it cannot be re-rendered without losing anything.
+///
+/// A table inside a block quote or a list item has the container's markers in front of each line
+/// (`> `, `  `). The span of the first line starts after them, the other lines carry them. They are
+/// taken off, the table is rendered, and they are put back in front of every line but the first.
+/// Markers that are not plain `>` and spaces, or that differ from line to line, mean the table is
+/// left exactly as written.
+pub(crate) fn format_at(
+    source: &str,
+    span: ByteRange,
+    config: &TablesConfig,
+    single_space_quotes: bool,
+) -> String {
+    let original = || source[span.start..span.end].to_string();
+
+    let line_start = source[..span.start].rfind('\n').map_or(0, |i| i + 1);
+    let prefix = &source[line_start..span.start];
+    if !prefix.chars().all(|c| c == '>' || c == ' ') {
+        return original();
+    }
+
+    let mut plain = String::with_capacity(span.end - span.start);
+    for (i, line) in source[span.start..span.end]
+        .split_inclusive('\n')
+        .enumerate()
+    {
+        if i == 0 {
+            plain.push_str(line);
+        } else if let Some(rest) = line.strip_prefix(prefix) {
+            plain.push_str(rest);
+        } else {
+            return original();
+        }
+    }
+
+    let Some(block) = parse_table_block(&plain, ByteRange::new(0, plain.len())) else {
+        return original();
+    };
+    if block.dropped_cells > 0 {
+        return original();
+    }
+    let rendered = render(&block, config);
+    if prefix.is_empty() {
+        return rendered;
+    }
+    // The marker spacing pass rewrites the first line's markers (they are outside the span); the
+    // other lines get the same spelling, so the block quote reads the same on every line.
+    let written = if single_space_quotes {
+        super::misc::normalize_blockquote_line(&format!("{prefix}|")).map_or_else(
+            || prefix.to_string(),
+            |(len, repl)| format!("{repl}{}", &prefix[len.min(prefix.len())..]),
+        )
+    } else {
+        prefix.to_string()
+    };
+    let mut out = String::with_capacity(rendered.len() + written.len() * 4);
+    for (i, line) in rendered.split_inclusive('\n').enumerate() {
+        if i > 0 {
+            out.push_str(&written);
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// Renders a `TableBlock` back to GFM pipe-table text, with every column padded to the widest
 /// cell (measured with Unicode display width, so emoji/CJK/Turkish content aligns visually) and
 /// the delimiter row's alignment markers preserved. Cell text is reproduced verbatim.

@@ -13,6 +13,9 @@ pub struct ByteRange {
 impl ByteRange {
     #[inline]
     pub const fn new(start: usize, end: usize) -> Self {
+        // A range never runs backwards: two offsets in the wrong order make an empty range at
+        // `start` (no panic, whatever the text that produced them).
+        let end = if end < start { start } else { end };
         Self { start, end }
     }
 

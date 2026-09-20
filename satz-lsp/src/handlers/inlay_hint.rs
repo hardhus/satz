@@ -109,12 +109,10 @@ mod tests {
         let doc_a = parse_document("# Doc A\n\n[[doc-b]]", Path::new("doc-a.md"));
         let doc_b = parse_document("# Doc B", Path::new("doc-b.md"));
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc_a, doc_b]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            config,
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a, doc_b]);
+        state.config = config;
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new(
@@ -147,11 +145,9 @@ mod tests {
             Path::new("doc-b.md"),
         );
 
-        let mut state = SatzState {
-            index: Index::build(vec![doc_a, doc_b]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![doc_a, doc_b]);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///doc-a.md".to_string(),
             crate::state::OpenDocument::new(
@@ -199,15 +195,13 @@ mod tests {
         let rel_a = Path::new("a.md");
         let mut config = VaultConfig::default();
         config.lsp.inlay_hints.enable = true;
-        let mut state = SatzState {
-            index: Index::build(vec![
-                parse_document(A_TEXT, rel_a),
-                parse_document("# B\n\n## Real\n\ntext ^blk\n", Path::new("b.md")),
-            ]),
-            vault_root: Some(Path::new("").to_path_buf()),
-            config,
-            ..Default::default()
-        };
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document(A_TEXT, rel_a),
+            parse_document("# B\n\n## Real\n\ntext ^blk\n", Path::new("b.md")),
+        ]);
+        state.config = config;
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///a.md".to_string(),
             crate::state::OpenDocument::new("file:///a.md", rel_a.to_path_buf(), A_TEXT, 1),

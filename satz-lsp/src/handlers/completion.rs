@@ -451,7 +451,7 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a.clone(), doc_b]);
-        state.vault_root = Some(Path::new("").to_path_buf());
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let uri_str = "file:///doc-a.md";
         state.open_docs.insert(
@@ -498,7 +498,7 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![stale_doc_a, doc_b]);
-        state.vault_root = Some(Path::new("").to_path_buf());
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let uri_str = "file:///doc-a.md";
         // Live buffer already has the closing brackets the editor auto-paired.
@@ -566,7 +566,7 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a.clone(), doc_b]);
-        state.vault_root = Some(Path::new("").to_path_buf());
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let uri_str = "file:///doc-a.md";
         state.open_docs.insert(
@@ -617,7 +617,7 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a.clone(), doc_b]);
-        state.vault_root = Some(Path::new("").to_path_buf());
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let uri_str = "file:///doc-a.md";
         state.open_docs.insert(
@@ -686,7 +686,7 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a.clone(), doc_b]);
-        state.vault_root = Some(Path::new("").to_path_buf());
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
 
         let uri_str = "file:///doc-a.md";
         state.open_docs.insert(
@@ -756,7 +756,7 @@ mod tests {
             parse_document(&text, Path::new("a.md")),
             parse_document(b_text, Path::new("b.md")),
         ]);
-        state.vault_root = Some(vault_root());
+        state.set_vault_root(Some(vault_root()));
         let uri = crate::convert::path_to_uri(&vault_root().join("a.md"))
             .unwrap()
             .as_str()
@@ -981,7 +981,7 @@ mod tests {
             .collect();
         docs.push(parse_document(&text, Path::new("open.md")));
         state.index = Index::build(docs);
-        state.vault_root = Some(Path::new("").to_path_buf());
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///open.md".to_string(),
             crate::state::OpenDocument::new(
@@ -1337,7 +1337,7 @@ body"
             parse_document("# A\n\n[[b#", Path::new("a.md")),
             parse_document("# B\n\n## Same\n\n## Other\n\n## Same\n", Path::new("b.md")),
         ]);
-        state.vault_root = Some(Path::new("").to_path_buf());
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///a.md".to_string(),
             crate::state::OpenDocument::new(

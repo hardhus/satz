@@ -36,7 +36,7 @@ pub fn document_link(params: DocumentLinkParams, state: &SatzState) -> Option<Ve
                     doc: target_doc, ..
                 }
                 | satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
-                    let target_path = match &state.vault_root {
+                    let target_path = match state.vault_root() {
                         Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
                         _ => target_doc.path.clone(),
                     };
@@ -86,11 +86,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"

@@ -175,7 +175,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
 
     let old_doc_path = absolute_path(state, target_doc);
     let new_doc_path = old_doc_path.with_file_name(format!("{clean_new_doc_name}.md"));
-    let new_rel = match &state.vault_root {
+    let new_rel = match state.vault_root() {
         Some(root) => new_doc_path.strip_prefix(root).unwrap_or(&new_doc_path),
         None => &new_doc_path,
     };
@@ -253,7 +253,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
 }
 
 fn absolute_path(state: &SatzState, doc: &Document) -> std::path::PathBuf {
-    match &state.vault_root {
+    match state.vault_root() {
         Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
         _ => doc.path.clone(),
     }
@@ -603,11 +603,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a.clone(), doc_b.clone()]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -665,11 +665,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_b_str = if cfg!(windows) {
             "file:///C:/doc-b.md"
@@ -736,11 +736,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a.clone(), doc_b.clone()]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -790,11 +790,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -862,7 +862,7 @@ mod tests {
                 .map(|(rel, text)| parse_document(text, Path::new(rel)))
                 .collect(),
         );
-        state.vault_root = Some(root());
+        state.set_vault_root(Some(root()));
         for (rel, text) in files {
             let uri = uri_of(rel);
             state.open_docs.insert(

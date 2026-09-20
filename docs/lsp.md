@@ -53,6 +53,10 @@ Offered contextually depending on what's under the cursor/selection:
 - **Insert frontmatter template** — offered when the document has no `---` frontmatter block yet; inserts a title/date/aliases/tags template at the top.
 - **Format entire vault** (`CodeActionKind::SOURCE`) — always offered (whenever `formatter.enabled` is true), regardless of cursor position; runs the same `satz.formatWorkspace` command described below. Some clients surface source actions in the code action menu more discoverably than a command palette entry, hence offering both.
 
+## Workspaces
+
+One server indexes one vault. With several workspace folders the first local folder is the vault; the others are named in a warning message and are not indexed (start another server for each). A folder listed twice counts once, and a folder that is not a local `file:` URI is skipped.
+
 ## Link resolution
 
 A link target is tried in one fixed order: the exact path, the path plus `.md`, the path ignoring letter case, the file name (the last path component, without `.md`), then a note's title or alias (case- and Unicode-folded, matched whole). Because the file name decides, the folder part of a `[[wrong-folder/note]]` is a hint only: it still reaches `other/note.md` when that is the only `note.md` (the Obsidian "shortest path" habit). A dot in a name is part of the name, not an extension: `[[2.0121]]` is the note called `2.0121`. Names, titles, headings and tags are compared after Unicode normalization, so `dünya` typed precomposed matches a file or heading written with a combining diaeresis (what macOS file systems hand out).

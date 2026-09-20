@@ -156,7 +156,7 @@ impl Default for FormatCache {
 #[derive(Debug, Default)]
 pub struct SatzState {
     /// Vault root path (from LSP initialize params)
-    pub vault_root: Option<PathBuf>,
+    vault_root: Option<PathBuf>,
 
     /// In-memory vault index
     pub index: Index,
@@ -188,7 +188,7 @@ pub struct SatzState {
     pub client_supports_semantic_tokens_refresh: bool,
 
     /// Flag indicating that open document identity keys changed and peers need diagnostic refresh
-    pub peers_dirty: bool,
+    peers_dirty: bool,
 
     /// `satz.formatWorkspace` result cache — see `FormatCache`.
     pub format_cache: FormatCache,
@@ -199,7 +199,7 @@ pub struct SatzState {
     /// link to a not-yet-indexed peer looks spuriously broken. Handlers should return empty
     /// diagnostics rather than that false positive — the `workspace/diagnostic/refresh` push
     /// sent once indexing finishes will make the client re-pull the real results.
-    pub indexing_complete: bool,
+    indexing_complete: bool,
 }
 
 pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<String> {
@@ -249,6 +249,48 @@ pub struct ReparseJob {
     pub rel_path: PathBuf,
     pub content: String,
     pub version: i32,
+}
+
+impl SatzState {
+    /// The vault's root directory (from the client's `initialize`), if there is one.
+    pub fn vault_root(&self) -> Option<&Path> {
+        self.vault_root.as_deref()
+    }
+
+    pub fn set_vault_root(&mut self, root: Option<PathBuf>) {
+        self.vault_root = root;
+    }
+
+    /// A state for the vault at `root`, everything else as by default.
+    pub fn with_vault_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            vault_root: Some(root.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the first indexing of the vault has finished. Until then the index may hold only some
+    /// of the notes and handlers answer nothing rather than a spurious "broken link".
+    pub fn is_indexing_complete(&self) -> bool {
+        self.indexing_complete
+    }
+
+    pub fn set_indexing_complete(&mut self, done: bool) {
+        self.indexing_complete = done;
+    }
+
+    /// Whether what the other open documents depend on changed since they were last told.
+    pub fn peers_dirty(&self) -> bool {
+        self.peers_dirty
+    }
+
+    pub fn mark_peers_dirty(&mut self) {
+        self.peers_dirty = true;
+    }
+
+    pub fn clear_peers_dirty(&mut self) {
+        self.peers_dirty = false;
+    }
 }
 
 /// What has to be told to the other open documents after a change to one of them.
@@ -1857,5 +1899,54 @@ mod tests {
         state.close_document("file:///b.md");
         state.close_document("file:///c.md");
         assert!(state.take_peer_refresh("file:///a.md", true).others.is_empty());
+    }
+
+    // ---- the state's own invariants are read and changed through methods ----
+
+    #[test]
+    fn a_new_state_has_no_root_is_not_indexed_and_has_nothing_dirty() {
+        let state = SatzState::default();
+        assert_eq!(state.vault_root(), None);
+        assert!(!state.is_indexing_complete());
+        assert!(!state.peers_dirty());
+    }
+
+    #[test]
+    fn the_indexing_flag_and_the_dirty_flag_can_be_set_and_cleared_repeatedly() {
+        let mut state = SatzState::default();
+        state.set_indexing_complete(true);
+        state.set_indexing_complete(true);
+        assert!(state.is_indexing_complete());
+        state.set_indexing_complete(false);
+        assert!(!state.is_indexing_complete());
+        state.mark_peers_dirty();
+        state.mark_peers_dirty();
+        assert!(state.peers_dirty());
+        state.clear_peers_dirty();
+        state.clear_peers_dirty();
+        assert!(!state.peers_dirty());
+    }
+
+    #[test]
+    fn a_finished_first_index_is_complete_and_keeps_the_root() {
+        let mut state = SatzState::with_vault_root("/vault");
+        assert_eq!(state.vault_root(), Some(Path::new("/vault")));
+        let fresh = SatzState::with_vault_root("/vault");
+        let mut fresh = fresh;
+        fresh.set_indexing_complete(true);
+        state.finish_indexing(Ok(fresh), Path::new("/vault"));
+        assert!(state.is_indexing_complete());
+        assert_eq!(state.vault_root(), Some(Path::new("/vault")));
+    }
+
+    #[test]
+    fn changing_the_root_changes_how_paths_are_made_relative() {
+        let mut state = SatzState::with_vault_root("/vault");
+        let inside = |s: &SatzState| SatzState::get_rel_path(Path::new("/vault/sub/a.md"), s.vault_root());
+        assert_eq!(inside(&state), PathBuf::from("sub/a.md"));
+        state.set_vault_root(Some(PathBuf::from("/vault/sub")));
+        assert_eq!(inside(&state), PathBuf::from("a.md"));
+        state.set_vault_root(None);
+        assert_eq!(inside(&state), PathBuf::from("/vault/sub/a.md"));
     }
 }

@@ -107,8 +107,8 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
             satz_core::LinkResolution::DocMissing if !link.target_doc.is_empty() => {
                 let components = note_components(&link.target_doc);
                 let target_path = components.as_ref().map(|parts| {
-                    let mut path = match &state.vault_root {
-                        Some(root) => root.clone(),
+                    let mut path = match state.vault_root() {
+                        Some(root) => root.to_path_buf(),
                         None => std::path::PathBuf::new(),
                     };
                     path.extend(parts);
@@ -172,7 +172,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
             }
             satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
                 if let Some(heading_name) = &link.target_heading {
-                    let target_path = match &state.vault_root {
+                    let target_path = match state.vault_root() {
                         Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
                         _ => target_doc.path.clone(),
                     };
@@ -337,11 +337,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -407,7 +407,7 @@ mod tests {
         let rel_a = Path::new("doc-a.md");
         let mut state = SatzState::default();
         state.index = Index::build(vec![parse_document(&text, rel_a)]);
-        state.vault_root = Some(vault_root());
+        state.set_vault_root(Some(vault_root()));
         let (uri_str, abs) = if cfg!(windows) {
             ("file:///C:/vault/doc-a.md", "C:\\vault\\doc-a.md")
         } else {
@@ -569,11 +569,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -627,11 +627,11 @@ mod tests {
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a, doc_b]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -701,7 +701,7 @@ mod tests {
             parse_document(b_text, Path::new("b.md")),
         ]);
         let root = if cfg!(windows) { "C:\\" } else { "/" };
-        state.vault_root = Some(Path::new(root).to_path_buf());
+        state.set_vault_root(Some(Path::new(root).to_path_buf()));
         let uri_a = if cfg!(windows) {
             "file:///C:/a.md"
         } else {
@@ -840,11 +840,11 @@ no trailing newline
 
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
         state.open_docs.insert(
             uri_a_str.to_string(),
             crate::state::OpenDocument::new(uri_a_str, abs_a.to_path_buf(), text, 1),
@@ -883,11 +883,11 @@ no trailing newline
         let mut state = SatzState::default();
         state.config.formatter.enabled = false;
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(if cfg!(windows) {
+        state.set_vault_root(Some(if cfg!(windows) {
             Path::new("C:\\").to_path_buf()
         } else {
             Path::new("/").to_path_buf()
-        });
+        }));
 
         let uri_a_str = if cfg!(windows) {
             "file:///C:/doc-a.md"
@@ -940,7 +940,7 @@ no trailing newline
         let mut state = SatzState::default();
         state.index = Index::build(vec![parse_document(text, Path::new("a.md"))]);
         let root = if cfg!(windows) { "C:\\" } else { "/" };
-        state.vault_root = Some(Path::new(root).to_path_buf());
+        state.set_vault_root(Some(Path::new(root).to_path_buf()));
         let uri = if cfg!(windows) {
             "file:///C:/a.md"
         } else {

@@ -51,7 +51,7 @@ pub fn pull_document_report(
     previous_result_id: Option<&str>,
     state: &SatzState,
 ) -> DocumentPull {
-    if !state.indexing_complete {
+    if !state.is_indexing_complete() {
         tracing::debug!(uri, "pull_document_report: initial indexing not complete yet");
         return DocumentPull::Full {
             items: Vec::new(),
@@ -85,7 +85,7 @@ pub fn pull_workspace_report(
     previous: &std::collections::HashMap<String, String>,
     state: &SatzState,
 ) -> Vec<lsp::WorkspaceDocumentDiagnosticReport> {
-    if !state.indexing_complete {
+    if !state.is_indexing_complete() {
         tracing::debug!("pull_workspace_report: initial indexing not complete yet");
         return Vec::new();
     }
@@ -93,7 +93,7 @@ pub fn pull_workspace_report(
     let result_id = diagnostics_result_id(state);
     let mut items = Vec::new();
     for doc in state.index.documents() {
-        let doc_path = match &state.vault_root {
+        let doc_path = match state.vault_root() {
             Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
             _ => doc.path.clone(),
         };
@@ -575,7 +575,7 @@ mod tests {
         let doc_a = parse_document("# Doc A\n\n[[missing-note]]", Path::new("doc-a.md"));
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(abs_root());
+        state.set_vault_root(Some(abs_root()));
         let uri = "file:///doc-a.md";
         state.open_docs.insert(
             uri.to_string(),
@@ -586,7 +586,7 @@ mod tests {
         // scan hasn't finished, so a real broken link must not be reported yet.
         assert!(pull_document_diagnostics(uri, &state).is_empty());
 
-        state.indexing_complete = true;
+        state.set_indexing_complete(true);
         // broken-link (missing-note) + orphan-note (nothing links back to doc-a)
         assert_eq!(pull_document_diagnostics(uri, &state).len(), 2);
     }
@@ -596,11 +596,11 @@ mod tests {
         let doc_a = parse_document("# Orphan Doc", Path::new("doc-a.md"));
         let mut state = SatzState::default();
         state.index = Index::build(vec![doc_a]);
-        state.vault_root = Some(abs_root());
+        state.set_vault_root(Some(abs_root()));
 
         assert!(pull_workspace_diagnostics(&state).is_empty());
 
-        state.indexing_complete = true;
+        state.set_indexing_complete(true);
         assert_eq!(pull_workspace_diagnostics(&state).len(), 1);
     }
 
@@ -658,26 +658,24 @@ mod tests {
     use std::collections::HashMap;
 
     fn ready_state(files: &[(&str, &str)]) -> SatzState {
-        let mut state = SatzState {
-            index: Index::build(
-                files
-                    .iter()
-                    .map(|(p, t)| parse_document(t, Path::new(p)))
-                    .collect(),
-            ),
-            vault_root: Some(if cfg!(windows) {
+        let mut state = SatzState::default();
+        state.index = Index::build(
+            files
+                .iter()
+                .map(|(p, t)| parse_document(t, Path::new(p)))
+                .collect(),
+        );
+        state.set_vault_root(Some(if cfg!(windows) {
                 PathBuf::from("C:\\vault")
             } else {
                 PathBuf::from("/vault")
-            }),
-            ..SatzState::default()
-        };
-        state.indexing_complete = true;
+            }));
+        state.set_indexing_complete(true);
         state
     }
 
     fn uri_of(state: &SatzState, rel: &str) -> String {
-        path_to_uri(&state.vault_root.clone().unwrap().join(rel))
+        path_to_uri(&state.vault_root().unwrap().join(rel))
             .unwrap()
             .as_str()
             .to_string()
@@ -712,7 +710,7 @@ mod tests {
         let uri = uri_of(&state, "a.md");
         // The document must be open for a per-document pull.
         let mut state = state;
-        state.open_document(&uri, "# A\n[[missing]]\n", &state.vault_root.clone().unwrap().join("a.md"), 1);
+        state.open_document(&uri, "# A\n[[missing]]\n", &state.vault_root().unwrap().join("a.md"), 1);
 
         let first = pull_document_report(&uri, None, &state);
         let id = full_id(&first);
@@ -735,7 +733,7 @@ mod tests {
     fn a_change_anywhere_invalidates_every_result_id() {
         let mut state = ready_state(&[("a.md", "# A\n[[b]]\n"), ("b.md", "# B\n")]);
         let uri = uri_of(&state, "a.md");
-        state.open_document(&uri, "# A\n[[b]]\n", &state.vault_root.clone().unwrap().join("a.md"), 1);
+        state.open_document(&uri, "# A\n[[b]]\n", &state.vault_root().unwrap().join("a.md"), 1);
         let id = full_id(&pull_document_report(&uri, None, &state));
 
         // Removing `b.md` breaks the link in a.md: its diagnostics change though a.md did not.
@@ -751,7 +749,7 @@ mod tests {
     #[test]
     fn before_the_first_index_is_complete_a_pull_is_empty_and_has_no_id() {
         let mut state = ready_state(&[("a.md", "# A\n")]);
-        state.indexing_complete = false;
+        state.set_indexing_complete(false);
         let uri = uri_of(&state, "a.md");
         match pull_document_report(&uri, None, &state) {
             DocumentPull::Full { items, result_id } => {
@@ -822,7 +820,7 @@ mod tests {
     #[test]
     fn open_documents_keep_their_version_in_both_report_kinds() {
         let mut state = ready_state(&[("a.md", "# A\n")]);
-        let path = state.vault_root.clone().unwrap().join("a.md");
+        let path = state.vault_root().unwrap().join("a.md");
         let uri = uri_of(&state, "a.md");
         state.open_document(&uri, "# A\n", &path, 7);
         let full = pull_workspace_report(&HashMap::new(), &state);
