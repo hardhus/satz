@@ -609,6 +609,30 @@ impl Index {
         self.add_doc_edges(&id);
     }
 
+    /// Removes several documents with ONE rebuild of the derived tables (removing them one by one
+    /// rebuilds after each, which is quadratic for a whole folder). The result is the same.
+    pub fn remove_docs(&mut self, ids: &[DocId]) {
+        let mut removed = false;
+        for id in ids {
+            removed |= self.docs.remove(id).is_some();
+        }
+        if removed {
+            self.rebuild_derived(false);
+        }
+    }
+
+    /// Inserts or replaces several documents with ONE rebuild of the derived tables; the same result
+    /// as calling `replace_doc` for each.
+    pub fn replace_docs(&mut self, docs: Vec<Document>) {
+        if docs.is_empty() {
+            return;
+        }
+        for doc in docs {
+            self.docs.insert(doc.id.clone(), doc);
+        }
+        self.rebuild_derived(false);
+    }
+
     /// Removes a document from the index.
     pub fn remove_doc(&mut self, id: &DocId) {
         tracing::debug!(?id, "Index::remove_doc");

@@ -18,6 +18,16 @@ use crate::state::SatzState;
 /// runtime without an env var or a rebuild.
 pub type LogReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
+/// Whether the client can take versioned document edits (`WorkspaceEdit.documentChanges`).
+pub fn client_supports_document_changes(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.workspace_edit.as_ref())
+        .and_then(|e| e.document_changes)
+        .unwrap_or(false)
+}
+
 /// What the server offers the client (the `capabilities` of the `initialize` response).
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
@@ -72,6 +82,70 @@ pub fn server_capabilities() -> ServerCapabilities {
             work_done_progress_options: Default::default(),
         }),
         ..Default::default()
+    }
+}
+
+/// The debounced reparse of one open document after a change: wait, snapshot the buffer, parse it
+/// WITHOUT holding the state lock (readers keep working while a big note is parsed), then apply
+/// the result if the buffer has not moved on -- a newer change has its own task -- and refresh
+/// diagnostics.
+async fn run_reparse(
+    state_arc: Arc<RwLock<SatzState>>,
+    client: Client,
+    uri: String,
+    delay: std::time::Duration,
+) {
+    tokio::time::sleep(delay).await;
+
+    let Some(job) = ({ state_arc.read().await.prepare_reparse(&uri) }) else {
+        return;
+    };
+    let version = job.version;
+    let parsed =
+        tokio::task::spawn_blocking(move || satz_core::parse_document(&job.content, &job.rel_path))
+            .await;
+    let Ok(new_doc) = parsed else {
+        tracing::error!(%uri, "reparse: the parsing task failed");
+        return;
+    };
+
+    let (applied, peers_dirty, supports_pull, other_uris) = {
+        let mut state = state_arc.write().await;
+        let applied = state.apply_reparse(&uri, version, new_doc);
+        let dirty = state.peers_dirty;
+        if applied {
+            state.peers_dirty = false;
+        }
+        let other: Vec<String> = state
+            .open_docs
+            .keys()
+            .filter(|u| **u != uri)
+            .cloned()
+            .collect();
+        (
+            applied,
+            dirty && applied,
+            state.client_supports_pull_diagnostics,
+            other,
+        )
+    };
+    if !applied {
+        return; // the buffer changed while parsing; the task of that change takes over
+    }
+
+    publish_for(&client, &state_arc, &uri).await;
+
+    let plan = refresh_after_reparse(peers_dirty, supports_pull);
+    if plan.pull_diagnostics {
+        let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
+    }
+    if plan.push_peers {
+        for other_uri in other_uris {
+            publish_for(&client, &state_arc, &other_uri).await;
+        }
+    }
+    if plan.semantic_tokens {
+        let _ = client.send_request::<SemanticTokensRefresh>(()).await;
     }
 }
 
@@ -179,10 +253,12 @@ impl LanguageServer for Backend {
             .as_ref()
             .and_then(|td| td.diagnostic.as_ref())
             .is_some();
+        let supports_document_changes = client_supports_document_changes(&params.capabilities);
 
         {
             let mut state = self.state.write().await;
             state.client_supports_pull_diagnostics = supports_pull;
+            state.client_supports_document_changes = supports_document_changes;
         }
 
         tracing::debug!(?vault_root, "initialize: resolved vault root");
@@ -194,100 +270,72 @@ impl LanguageServer for Backend {
 
             tokio::task::spawn(async move {
                 tracing::debug!(vault_root = ?root_clone, "walk_vault: starting");
+                // Watching starts BEFORE the walk: what changes while it runs is held back until
+                // the index is complete and is then applied from what is on disk.
+                crate::watcher::spawn_watcher(
+                    root_clone.clone(),
+                    state_arc.clone(),
+                    client.clone(),
+                );
+
                 let root_for_blocking = root_clone.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     SatzState::initialize_index(root_for_blocking)
                 })
-                .await;
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("the indexing task panicked: {e}")));
 
-                match result {
-                    Ok(Ok(mut new_state)) => {
-                        let doc_count = new_state.index.doc_count();
-                        let startup_config_error = new_state.config_error.clone();
-                        tracing::info!(doc_count, vault_root = ?new_state.vault_root, "walk_vault: succeeded");
+                let outcome = {
+                    let mut current_state = state_arc.write().await;
+                    current_state.finish_indexing(result, &root_clone)
+                };
 
-                        {
-                            let mut current_state = state_arc.write().await;
-                            new_state.client_supports_pull_diagnostics =
-                                current_state.client_supports_pull_diagnostics;
-                            new_state.open_docs = std::mem::take(&mut current_state.open_docs);
+                if let Some(failure) = &outcome.failure {
+                    // The server keeps working for the documents that are open; the reason is shown.
+                    tracing::error!(error = %failure, "walk_vault: failed");
+                    let message = format!("satz: indexing failed: {failure}");
+                    client.log_message(MessageType::ERROR, &message).await;
+                    client.show_message(MessageType::ERROR, message).await;
+                } else {
+                    tracing::info!(doc_count = outcome.doc_count, "walk_vault: succeeded");
+                    client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("satz: indexed {} documents", outcome.doc_count),
+                        )
+                        .await;
+                }
 
-                            for doc in new_state.open_docs.values() {
-                                let rel_path = SatzState::get_rel_path(
-                                    &doc.path,
-                                    new_state.vault_root.as_deref(),
-                                );
-                                let content = doc.rope.to_string();
-                                let parsed = satz_core::parse_document(&content, &rel_path);
-                                new_state.index.replace_doc(parsed);
-                            }
+                // A `.satz.toml` that exists but can't be used must be visible: falling back to
+                // defaults silently would look like the settings were ignored.
+                if let Some(error) = outcome.config_error {
+                    let message = crate::state::config_error_message(&error, "default");
+                    client.log_message(MessageType::WARNING, &message).await;
+                    client.show_message(MessageType::WARNING, message).await;
+                }
 
-                            *current_state = new_state;
-                        }
+                let (supports_pull, uris) = {
+                    let s = state_arc.read().await;
+                    (
+                        s.client_supports_pull_diagnostics,
+                        s.open_docs.keys().cloned().collect::<Vec<_>>(),
+                    )
+                };
 
-                        crate::watcher::spawn_watcher(
-                            root_clone,
-                            state_arc.clone(),
-                            client.clone(),
-                        );
-                        client
-                            .log_message(
-                                MessageType::INFO,
-                                format!("satz: indexed {} documents", doc_count),
-                            )
-                            .await;
-
-                        // A `.satz.toml` that exists but can't be used must be visible: falling
-                        // back to defaults silently would look like the settings were ignored.
-                        if let Some(error) = startup_config_error {
-                            let message = crate::state::config_error_message(&error, "default");
-                            client.log_message(MessageType::WARNING, &message).await;
-                            client.show_message(MessageType::WARNING, message).await;
-                        }
-
-                        let (supports_pull, uris) = {
-                            let s = state_arc.read().await;
-                            (
-                                s.client_supports_pull_diagnostics,
-                                s.open_docs.keys().cloned().collect::<Vec<_>>(),
-                            )
-                        };
-
-                        if supports_pull {
-                            let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
-                        } else {
-                            for uri in uris {
-                                publish_for(&client, &state_arc, &uri).await;
-                            }
-                        }
-
-                        // Any document opened before indexing finished had its links colored
-                        // against a still-partial index (peers not yet indexed resolve as
-                        // missing), so its semantic tokens may be stale/wrong now that the full
-                        // index is in place. Unconditional (unlike the diagnostics push above,
-                        // which branches on pull-vs-push support) -- this is a separate
-                        // capability a client simply ignores if it never declared support.
-                        let _ = client.send_request::<SemanticTokensRefresh>(()).await;
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!(error = %e, "walk_vault: failed");
-                        client
-                            .log_message(
-                                MessageType::ERROR,
-                                format!("satz: indexing failed: {}", e),
-                            )
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "walk_vault: spawn_blocking panicked");
-                        client
-                            .log_message(
-                                MessageType::ERROR,
-                                format!("satz: spawn_blocking panicked: {}", e),
-                            )
-                            .await;
+                if supports_pull {
+                    let _ = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
+                } else {
+                    for uri in uris {
+                        publish_for(&client, &state_arc, &uri).await;
                     }
                 }
+
+                // Any document opened before indexing finished had its links colored against a
+                // still-partial index (peers not yet indexed resolve as missing), so its semantic
+                // tokens may be stale/wrong now that the full index is in place. Unconditional
+                // (unlike the diagnostics push above, which branches on pull-vs-push support) --
+                // this is a separate capability a client simply ignores if it never declared support.
+                let _ = client.send_request::<SemanticTokensRefresh>(()).await;
             });
         } else {
             // No workspace root at all: there is no vault to walk, so there is nothing for
@@ -324,7 +372,7 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         tracing::debug!(%uri, version, "did_open");
         let Some(path) = uri_to_path(&uri) else {
-            tracing::warn!(%uri, "did_open: uri_to_path failed, ignoring");
+            tracing::warn!(%uri, "did_open: not a local file (untitled buffer, remote or malformed URI); ignoring");
             return;
         };
 
@@ -363,76 +411,35 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         tracing::trace!(%uri, version, "did_change");
 
-        let (delay, prev_task) = {
-            let mut state = self.state.write().await;
-            let debounce = std::time::Duration::from_millis(state.config.lsp.reparse_debounce_ms);
-            let max_wait = std::time::Duration::from_millis(state.config.lsp.reparse_max_wait_ms);
-
-            let Some(open_doc) = state.open_docs.get_mut(&uri) else {
-                return;
-            };
-
-            if !open_doc.apply_change_events(version, params.content_changes) {
-                return;
-            }
-
-            let now = std::time::Instant::now();
-            let first = open_doc.first_change_at.get_or_insert(now);
-            let elapsed = now.duration_since(*first);
-            let remaining = max_wait.saturating_sub(elapsed);
-            let delay = debounce.min(remaining);
-
-            let prev = open_doc.pending_task.take();
-            (delay, prev)
-        };
-
-        if let Some(task) = prev_task {
-            task.abort();
-        }
-
-        let state_arc = self.state.clone();
-        let client_clone = self.client.clone();
-        let uri_clone = uri.clone();
-
-        let handle = tokio::task::spawn(async move {
-            tokio::time::sleep(delay).await;
-
-            let (peers_dirty, supports_pull, other_uris) = {
-                let mut state = state_arc.write().await;
-                state.reparse_open_document(&uri_clone);
-                let dirty = state.peers_dirty;
-                state.peers_dirty = false;
-                let other: Vec<String> = state
-                    .open_docs
-                    .keys()
-                    .filter(|u| *u != &uri_clone)
-                    .cloned()
-                    .collect();
-                (dirty, state.client_supports_pull_diagnostics, other)
-            };
-
-            publish_for(&client_clone, &state_arc, &uri_clone).await;
-
-            let plan = refresh_after_reparse(peers_dirty, supports_pull);
-            if plan.pull_diagnostics {
-                let _ = client_clone
-                    .send_request::<WorkspaceDiagnosticRefresh>(())
-                    .await;
-            }
-            if plan.push_peers {
-                for other_uri in other_uris {
-                    publish_for(&client_clone, &state_arc, &other_uri).await;
-                }
-            }
-            if plan.semantic_tokens {
-                let _ = client_clone.send_request::<SemanticTokensRefresh>(()).await;
-            }
-        });
-
+        // Everything happens under ONE lock: the buffer is updated, the previous reparse task is
+        // cancelled and the new one is spawned and stored. (Storing the handle under a second lock
+        // let two simultaneous changes overwrite each other's handle and leave a task that nothing
+        // could cancel any more.)
         let mut state = self.state.write().await;
-        if let Some(open_doc) = state.open_docs.get_mut(&uri) {
-            open_doc.pending_task = Some(handle);
+        let debounce = std::time::Duration::from_millis(state.config.lsp.reparse_debounce_ms);
+        let max_wait = std::time::Duration::from_millis(state.config.lsp.reparse_max_wait_ms);
+
+        let Some(open_doc) = state.open_docs.get_mut(&uri) else {
+            return;
+        };
+        if !open_doc.apply_change_events(version, params.content_changes) {
+            return;
         }
+
+        let now = std::time::Instant::now();
+        let first = open_doc.first_change_at.get_or_insert(now);
+        let elapsed = now.duration_since(*first);
+        let delay = debounce.min(max_wait.saturating_sub(elapsed));
+
+        if let Some(previous) = open_doc.pending_task.take() {
+            previous.abort();
+        }
+        open_doc.pending_task = Some(tokio::task::spawn(run_reparse(
+            self.state.clone(),
+            self.client.clone(),
+            uri,
+            delay,
+        )));
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -683,7 +690,14 @@ impl LanguageServer for Backend {
         }
 
         let count = changes.len();
-        let edit = crate::handlers::execute_command::build_workspace_edit(&changes);
+        // Open documents carry the version the edits were computed against, when the client can
+        // take versioned edits: it then refuses them if the user has typed since.
+        let versioned = self.state.read().await.client_supports_document_changes;
+        let edit = if versioned {
+            crate::handlers::execute_command::build_workspace_edit_versioned(&changes)
+        } else {
+            crate::handlers::execute_command::build_workspace_edit(&changes)
+        };
 
         let applied = match self.client.apply_edit(edit).await {
             Ok(response) => response.applied,
@@ -708,53 +722,15 @@ impl LanguageServer for Backend {
             return Ok(Some(serde_json::json!({ "formatted": 0 })));
         }
 
-        // Keep any open document's in-memory rope (and the index built from it) in sync right
-        // away, rather than waiting for the client's own follow-up `didChange` notification.
-        let formatted_by_uri: std::collections::HashMap<String, &str> = changes
-            .iter()
-            .map(|c| (c.uri.as_str().to_string(), c.formatted.as_str()))
-            .collect();
-
-        let (supports_pull, all_open_uris) = {
-            let mut state = self.state.write().await;
-            let open_uris: Vec<String> = formatted_by_uri
-                .keys()
-                .filter(|uri| state.open_docs.contains_key(*uri))
-                .cloned()
-                .collect();
-
-            for uri in &open_uris {
-                if let Some(open_doc) = state.open_docs.get_mut(uri) {
-                    open_doc.rope = ropey::Rope::from_str(formatted_by_uri[uri]);
-                }
-            }
-            for uri in &open_uris {
-                state.reparse_open_document(uri);
-            }
-
-            (
-                state.client_supports_pull_diagnostics,
-                state.open_docs.keys().cloned().collect::<Vec<_>>(),
-            )
-        };
-
+        // The server does NOT touch the open documents' buffers here. The client applied the edit
+        // to its own buffer and now reports it with `didChange`; changing the rope first would apply
+        // the same edit twice. Files that are not open are picked up by the file watcher.
         self.client
             .log_message(
                 MessageType::INFO,
                 format!("satz: formatted {count} file(s)"),
             )
             .await;
-
-        if supports_pull {
-            let _ = self
-                .client
-                .send_request::<WorkspaceDiagnosticRefresh>(())
-                .await;
-        } else {
-            for uri in all_open_uris {
-                publish_for(&self.client, &self.state, &uri).await;
-            }
-        }
 
         Ok(Some(serde_json::json!({ "formatted": count })))
     }
@@ -954,5 +930,166 @@ mod tests {
                 .expect_err(&format!("{name:?} is not a command"));
             assert_eq!(err.code, jsonrpc::ErrorCode::MethodNotFound, "{name:?}");
         }
+    }
+
+    // ---- did_change: one reparse task per document, whoever wins the lock ----
+
+    fn change_params(uri: &str, version: i32, text: &str) -> DidChangeTextDocumentParams {
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.parse().unwrap(),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// A backend that can be shared between tasks, with `a.md` open and a debounce so long that no
+    /// reparse ever fires during a test.
+    async fn shared_backend() -> (Arc<Backend>, tower_lsp_server::LspService<Backend>) {
+        let client_slot = std::sync::Mutex::new(None);
+        let (_layer, handle): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            *client_slot.lock().unwrap() = Some(client.clone());
+            Backend::new(client, handle)
+        });
+        let client = client_slot.lock().unwrap().take().unwrap();
+        let (_layer2, handle2): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
+        let backend = Arc::new(Backend::new(client, handle2));
+        {
+            let mut state = backend.state.write().await;
+            state.vault_root = Some(root());
+            state.config.lsp.reparse_debounce_ms = 600_000;
+            state.config.lsp.reparse_max_wait_ms = 600_000;
+            state.indexing_complete = true;
+            state.open_document("file:///a.md", "# A\n", &root().join("a.md"), 1);
+        }
+        (backend, service)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_simultaneous_changes_leave_exactly_one_pending_reparse() {
+        let (backend, _service) = shared_backend().await;
+        let alive_before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        let mut changes = Vec::new();
+        for i in 0..64 {
+            let backend = backend.clone();
+            changes.push(tokio::spawn(async move {
+                backend
+                    .did_change(change_params(
+                        "file:///a.md",
+                        2,
+                        &format!("# A\n\n[[n{i}]]\n"),
+                    ))
+                    .await;
+            }));
+        }
+        for change in changes {
+            change.await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let alive_after = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        assert_eq!(
+            alive_after - alive_before,
+            1,
+            "every earlier reparse must have been cancelled: only the stored one may live"
+        );
+        let state = backend.state.read().await;
+        let pending = state.open_docs["file:///a.md"].pending_task.as_ref();
+        assert!(pending.is_some_and(|task| !task.is_finished()));
+    }
+
+    #[tokio::test]
+    async fn a_change_stores_its_reparse_task_before_it_returns() {
+        let (backend, _service) = shared_backend().await;
+        backend
+            .did_change(change_params("file:///a.md", 2, "# A\n\nfirst\n"))
+            .await;
+        let first = {
+            let state = backend.state.read().await;
+            let task = state.open_docs["file:///a.md"]
+                .pending_task
+                .as_ref()
+                .unwrap();
+            task.abort_handle()
+        };
+        backend
+            .did_change(change_params("file:///a.md", 3, "# A\n\nsecond\n"))
+            .await;
+        // The first task was cancelled by the second change and a new one is stored.
+        for _ in 0..50 {
+            if first.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(first.is_finished());
+        let state = backend.state.read().await;
+        let second = state.open_docs["file:///a.md"]
+            .pending_task
+            .as_ref()
+            .unwrap();
+        assert!(!second.is_finished());
+    }
+
+    #[tokio::test]
+    async fn changes_that_cannot_be_applied_start_no_task() {
+        let (backend, _service) = shared_backend().await;
+        // Unknown document.
+        backend
+            .did_change(change_params("file:///unknown.md", 2, "x"))
+            .await;
+        // A version older than the buffer's is stale.
+        backend
+            .did_change(change_params("file:///a.md", 5, "# A\n\nfive\n"))
+            .await;
+        let first = {
+            let state = backend.state.read().await;
+            state.open_docs["file:///a.md"]
+                .pending_task
+                .as_ref()
+                .unwrap()
+                .abort_handle()
+        };
+        backend
+            .did_change(change_params("file:///a.md", 4, "# A\n\nstale\n"))
+            .await;
+        let state = backend.state.read().await;
+        assert!(
+            !first.is_finished(),
+            "a stale change must not cancel the pending task"
+        );
+        assert_eq!(
+            state.open_docs["file:///a.md"].rope.to_string(),
+            "# A\n\nfive\n"
+        );
+    }
+
+    #[test]
+    fn versioned_edits_are_used_only_when_the_client_says_it_supports_them() {
+        let mut caps = ClientCapabilities::default();
+        assert!(!client_supports_document_changes(&caps));
+        caps.workspace = Some(WorkspaceClientCapabilities::default());
+        assert!(!client_supports_document_changes(&caps));
+        caps.workspace.as_mut().unwrap().workspace_edit = Some(WorkspaceEditClientCapabilities {
+            document_changes: Some(false),
+            ..Default::default()
+        });
+        assert!(!client_supports_document_changes(&caps));
+        caps.workspace.as_mut().unwrap().workspace_edit = Some(WorkspaceEditClientCapabilities {
+            document_changes: Some(true),
+            ..Default::default()
+        });
+        assert!(client_supports_document_changes(&caps));
     }
 }

@@ -167,6 +167,9 @@ pub struct SatzState {
     /// Whether the client supports pull diagnostics
     pub client_supports_pull_diagnostics: bool,
 
+    /// Whether the client understands `WorkspaceEdit.documentChanges` (versioned edits).
+    pub client_supports_document_changes: bool,
+
     /// Flag indicating that open document identity keys changed and peers need diagnostic refresh
     pub peers_dirty: bool,
 
@@ -223,19 +226,97 @@ pub fn config_error_message(error: &str, fallback: &str) -> String {
     )
 }
 
+/// A snapshot of an open document to parse OUTSIDE the state lock.
+#[derive(Debug, Clone)]
+pub struct ReparseJob {
+    pub rel_path: PathBuf,
+    pub content: String,
+    pub version: i32,
+}
+
+/// What the initial indexing came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexingOutcome {
+    /// Notes found on disk.
+    pub doc_count: usize,
+    /// Why `.satz.toml` could not be used (defaults are in effect), if it could not.
+    pub config_error: Option<String>,
+    /// Why the vault could not be indexed at all, if it could not.
+    pub failure: Option<String>,
+}
+
 impl SatzState {
+    /// Installs the result of the initial indexing over the state the server has been running with
+    /// meanwhile, keeping what the client already told it: the documents it opened (indexed from
+    /// their buffers, not their files) and its capabilities.
+    ///
+    /// A vault that could not be indexed (its folder is missing, the walk panicked) does NOT leave
+    /// the server waiting forever: the settings are loaded, the index holds the open documents,
+    /// `indexing_complete` is set, and the reason comes back in `IndexingOutcome::failure` for the
+    /// caller to show. Calling it again with a new result replaces the previous one.
+    pub fn finish_indexing(
+        &mut self,
+        result: anyhow::Result<SatzState>,
+        vault_root: &Path,
+    ) -> IndexingOutcome {
+        let (mut new_state, failure) = match result {
+            Ok(state) => (state, None),
+            Err(error) => {
+                tracing::error!(%error, "initial indexing failed");
+                let (config, config_error) = Self::load_config(vault_root);
+                let state = SatzState {
+                    vault_root: Some(vault_root.to_path_buf()),
+                    format_cache: FormatCache::new(config.lsp.format_cache_capacity),
+                    config,
+                    config_error,
+                    indexing_complete: true,
+                    ..SatzState::default()
+                };
+                (state, Some(error.to_string()))
+            }
+        };
+        let outcome = IndexingOutcome {
+            doc_count: new_state.index.doc_count(),
+            config_error: new_state.config_error.clone(),
+            failure,
+        };
+        new_state.client_supports_pull_diagnostics = self.client_supports_pull_diagnostics;
+        new_state.client_supports_document_changes = self.client_supports_document_changes;
+        new_state.open_docs = std::mem::take(&mut self.open_docs);
+        for doc in new_state.open_docs.values() {
+            let rel_path = Self::get_rel_path(&doc.path, new_state.vault_root.as_deref());
+            let content = doc.rope.to_string();
+            new_state
+                .index
+                .replace_doc(satz_core::parse_document(&content, &rel_path));
+        }
+        *self = new_state;
+        outcome
+    }
+
     /// Records what a workspace-format pass computed. Entries of documents that no longer exist
     /// (edited or deleted notes) are dropped first, so the cache capacity always goes to current
     /// content; a result equal to its source is remembered as "already formatted" without a copy.
     pub fn apply_format_cache_updates(&mut self, updates: Vec<(u64, String)>) {
-        let live: std::collections::HashSet<u64> =
+        // The text of an open document is its buffer, which may be newer than what the index holds.
+        let buffers: Vec<(u64, String)> = self
+            .open_docs
+            .values()
+            .map(|open| {
+                let text = open.rope.to_string();
+                (satz_core::content_hash(&text), text)
+            })
+            .collect();
+        let mut live: std::collections::HashSet<u64> =
             self.index.documents().map(|d| d.content_hash).collect();
+        live.extend(buffers.iter().map(|(hash, _)| *hash));
         self.format_cache.retain_hashes(&live);
-        let sources: HashMap<u64, &str> = self
+        let mut sources: HashMap<u64, &str> = self
             .index
             .documents()
             .map(|d| (d.content_hash, d.line_index.source()))
             .collect();
+        sources.extend(buffers.iter().map(|(hash, text)| (*hash, text.as_str())));
         for (hash, formatted) in updates {
             if sources
                 .get(&hash)
@@ -269,14 +350,19 @@ impl SatzState {
     ///
     /// An unusable `.satz.toml` does not stop indexing: the default configuration is used and
     /// the reason is recorded in `config_error` for the caller to show to the user.
-    pub fn initialize_index(vault_root: PathBuf) -> anyhow::Result<Self> {
-        let (config, config_error) = match VaultConfig::load(&vault_root) {
+    /// The vault's settings, or the defaults and the reason when `.satz.toml` cannot be used.
+    fn load_config(vault_root: &Path) -> (VaultConfig, Option<String>) {
+        match VaultConfig::load(vault_root) {
             Ok(config) => (config, None),
             Err(e) => {
                 tracing::warn!("initialize_index: {e}; using default settings");
                 (VaultConfig::default(), Some(e.to_string()))
             }
-        };
+        }
+    }
+
+    pub fn initialize_index(vault_root: PathBuf) -> anyhow::Result<Self> {
+        let (config, config_error) = Self::load_config(&vault_root);
         tracing::debug!(
             config_error = config_error.is_some(),
             "initialize_index: loaded .satz.toml (or default)"
@@ -297,6 +383,7 @@ impl SatzState {
             config,
             config_error,
             client_supports_pull_diagnostics: false,
+            client_supports_document_changes: false,
             peers_dirty: false,
             format_cache,
             indexing_complete: true,
@@ -310,6 +397,12 @@ impl SatzState {
     /// case on Windows/macOS), and mistaking an open, possibly unsaved document for a closed one
     /// would replace its buffer contents in the index with the disk version.
     pub fn is_open_path(&self, path: &Path) -> bool {
+        self.open_doc_for_path(path).is_some()
+    }
+
+    /// The open document whose file is `path` (compared as `is_open_path` does), with the key it is
+    /// stored under -- the URI the client opened it with.
+    pub fn open_doc_for_path(&self, path: &Path) -> Option<(&String, &OpenDocument)> {
         let root = self.vault_root.as_deref();
         let key = |p: &Path| {
             satz_core::slug::fold_key(
@@ -319,7 +412,7 @@ impl SatzState {
             )
         };
         let wanted = key(path);
-        self.open_docs.values().any(|d| key(&d.path) == wanted)
+        self.open_docs.iter().find(|(_, d)| key(&d.path) == wanted)
     }
 
     /// The note a link of `doc` points at (`None`: external, footnote, no target at all, or the
@@ -411,33 +504,53 @@ impl SatzState {
         self.index.replace_doc(new_doc);
     }
 
-    /// Re-parses the in-memory rope content of an open document and updates index.
-    pub fn reparse_open_document(&mut self, uri: &str) {
+    /// Takes what is needed to re-parse an open document: its text, path and version. Quick (a copy
+    /// of the buffer); the parse itself can then run without any lock.
+    pub fn prepare_reparse(&self, uri: &str) -> Option<ReparseJob> {
+        let open_doc = self.open_docs.get(uri)?;
+        let rel_path = Self::get_rel_path(&open_doc.path, self.vault_root.as_deref());
+        Some(ReparseJob {
+            rel_path,
+            content: open_doc.rope.to_string(),
+            version: open_doc.version,
+        })
+    }
+
+    /// Puts a parsed document into the index -- but only if the open document is still at the
+    /// version the parse was made from. A result the user has typed past is dropped (`false`): a
+    /// newer reparse is already queued for the newer text, and applying the old one would briefly
+    /// show stale links and diagnostics.
+    pub fn apply_reparse(&mut self, uri: &str, version: i32, new_doc: satz_core::Document) -> bool {
         let Some(open_doc) = self.open_docs.get_mut(uri) else {
-            return;
+            return false;
         };
+        if open_doc.version != version {
+            return false;
+        }
         open_doc.first_change_at = None;
-        let path = open_doc.path.clone();
-        let content = open_doc.rope.to_string();
 
-        let rel_path = Self::get_rel_path(&path, self.vault_root.as_deref());
-        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-        let doc_id = satz_core::DocId::new(&rel_path_str);
-        tracing::trace!(%uri, ?doc_id, "reparse_open_document");
-
+        let doc_id = new_doc.id.clone();
+        tracing::trace!(%uri, ?doc_id, "apply_reparse");
         let old_keys = self
             .index
             .get_doc(&doc_id)
             .map(peer_signature)
             .unwrap_or_default();
-        let new_doc = satz_core::parse_document(&content, &rel_path);
-        let new_keys = peer_signature(&new_doc);
-
-        if old_keys != new_keys {
+        if old_keys != peer_signature(&new_doc) {
             self.peers_dirty = true;
         }
-
         self.index.replace_doc(new_doc);
+        true
+    }
+
+    /// Re-parses the in-memory rope content of an open document and updates the index, at once
+    /// (save, format): prepare and apply in one go, so nothing can change in between.
+    pub fn reparse_open_document(&mut self, uri: &str) {
+        let Some(job) = self.prepare_reparse(uri) else {
+            return;
+        };
+        let new_doc = satz_core::parse_document(&job.content, &job.rel_path);
+        self.apply_reparse(uri, job.version, new_doc);
     }
 
     /// Closes and untracks an open document, aborting any background debounce tasks.
@@ -1194,5 +1307,227 @@ mod tests {
         assert!(cache.get(1).is_none() && !cache.is_unchanged(4));
         assert!(cache.is_unchanged(2));
         assert_eq!(cache.get(3), Some("three"));
+    }
+
+    // ---- the initial indexing: a failure must not leave the server dead ----
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "satz-index-{}-{tag}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn doc_ids(state: &SatzState) -> Vec<String> {
+        let mut ids: Vec<String> = state
+            .index
+            .documents()
+            .map(|d| d.id.as_str().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A state that already has a document open, as if the client opened it during indexing.
+    fn state_with_open_buffer(dir: &Path) -> SatzState {
+        let mut state = SatzState::default();
+        state.client_supports_pull_diagnostics = true;
+        state.open_document(
+            "file:///b.md",
+            "# B\n\n[[from-the-buffer]]\n",
+            &dir.join("b.md"),
+            3,
+        );
+        state
+    }
+
+    #[test]
+    fn a_finished_index_keeps_the_open_buffers_and_the_client_settings() {
+        let dir = scratch_dir("ok");
+        std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+        std::fs::write(dir.join("b.md"), "# B on disk\n").unwrap();
+        let mut state = state_with_open_buffer(&dir);
+
+        let outcome = state.finish_indexing(SatzState::initialize_index(dir.clone()), &dir);
+
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.doc_count, 2);
+        assert!(state.indexing_complete);
+        assert!(state.client_supports_pull_diagnostics);
+        assert_eq!(doc_ids(&state), vec!["a.md", "b.md"]);
+        // The buffer, not the file, is what is indexed for the open note.
+        let b = state.index.get_doc(&satz_core::DocId::new("b.md")).unwrap();
+        assert_eq!(b.links[0].target_doc, "from-the-buffer");
+        assert_eq!(state.open_docs["file:///b.md"].version, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_index_does_not_leave_the_server_waiting_forever() {
+        let dir = scratch_dir("fail");
+        let missing = dir.join("no-such-vault");
+        let mut state = state_with_open_buffer(&missing);
+        assert!(!state.indexing_complete);
+
+        let result = SatzState::initialize_index(missing.clone());
+        let outcome = state.finish_indexing(result, &missing);
+
+        let failure = outcome.failure.expect("the failure is reported");
+        assert!(failure.contains("no-such-vault"), "{failure}");
+        assert!(state.indexing_complete, "handlers must not stay silent");
+        assert_eq!(state.vault_root.as_deref(), Some(missing.as_path()));
+        assert!(state.client_supports_pull_diagnostics);
+        // What the user has open still works.
+        assert_eq!(doc_ids(&state), vec!["b.md"]);
+        assert_eq!(state.open_docs.len(), 1);
+        assert_eq!(outcome.doc_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexing_can_be_tried_again_after_a_failure() {
+        let dir = scratch_dir("retry");
+        let missing = dir.join("later");
+        let mut state = state_with_open_buffer(&missing);
+        state.finish_indexing(SatzState::initialize_index(missing.clone()), &missing);
+        assert!(state.indexing_complete);
+
+        std::fs::create_dir_all(&missing).unwrap();
+        std::fs::write(missing.join("c.md"), "# C\n").unwrap();
+        let outcome = state.finish_indexing(SatzState::initialize_index(missing.clone()), &missing);
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.doc_count, 1);
+        assert_eq!(doc_ids(&state), vec!["b.md", "c.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unusable_config_is_reported_with_the_index_and_defaults_are_used() {
+        let dir = scratch_dir("config");
+        std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+        std::fs::write(dir.join(".satz.toml"), "this is = = not toml").unwrap();
+        let mut state = SatzState::default();
+        let outcome = state.finish_indexing(SatzState::initialize_index(dir.clone()), &dir);
+        assert_eq!(outcome.failure, None);
+        assert!(outcome.config_error.is_some());
+        assert!(state.config_error.is_some());
+        assert_eq!(doc_ids(&state), vec!["a.md"]);
+        // A failed index with a broken config reports the config problem too.
+        let missing = dir.join("nope");
+        let outcome = state.finish_indexing(SatzState::initialize_index(missing.clone()), &missing);
+        assert!(outcome.failure.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- re-parsing an open document without holding the lock while parsing ----
+
+    fn open_state(text: &str) -> SatzState {
+        let mut state = SatzState::default();
+        state.vault_root = Some(PathBuf::from("/vault"));
+        state.open_document("file:///a.md", text, Path::new("/vault/a.md"), 1);
+        state
+    }
+
+    fn type_into(state: &mut SatzState, version: i32, new_text: &str) {
+        let doc = state.open_docs.get_mut("file:///a.md").unwrap();
+        doc.rope = Rope::from_str(new_text);
+        doc.version = version;
+    }
+
+    fn links_of_a(state: &SatzState) -> Vec<String> {
+        state
+            .index
+            .get_doc(&satz_core::DocId::new("a.md"))
+            .unwrap()
+            .links
+            .iter()
+            .map(|l| l.target_doc.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_reparse_job_carries_the_text_and_version_it_was_prepared_from() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        type_into(&mut state, 2, "# A\n\n[[two]] [[three]]\n");
+        let job = state
+            .prepare_reparse("file:///a.md")
+            .expect("an open document");
+        assert_eq!(job.version, 2);
+        assert_eq!(job.content, "# A\n\n[[two]] [[three]]\n");
+        assert_eq!(job.rel_path, PathBuf::from("a.md"));
+        assert!(state.prepare_reparse("file:///unknown.md").is_none());
+    }
+
+    #[test]
+    fn a_reparse_of_the_current_version_is_applied() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        type_into(&mut state, 2, "# A\n\n[[two]]\n");
+        let job = state.prepare_reparse("file:///a.md").unwrap();
+        // The parse happens with no lock and no state at all.
+        let parsed = satz_core::parse_document(&job.content, &job.rel_path);
+        assert!(state.apply_reparse("file:///a.md", job.version, parsed));
+        assert_eq!(links_of_a(&state), vec!["two".to_string()]);
+        assert!(state.open_docs["file:///a.md"].first_change_at.is_none());
+    }
+
+    #[test]
+    fn a_reparse_that_the_user_has_typed_past_is_dropped() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        type_into(&mut state, 2, "# A\n\n[[two]]\n");
+        let job = state.prepare_reparse("file:///a.md").unwrap();
+        let parsed = satz_core::parse_document(&job.content, &job.rel_path);
+
+        // While the parse ran (outside the lock) the user typed more.
+        type_into(&mut state, 3, "# A\n\n[[three]]\n");
+        state.peers_dirty = false;
+        assert!(!state.apply_reparse("file:///a.md", job.version, parsed));
+        assert_eq!(
+            links_of_a(&state),
+            vec!["one".to_string()],
+            "the index keeps what it had; the newer text has its own reparse queued"
+        );
+        assert!(!state.peers_dirty, "a dropped result changes nothing");
+    }
+
+    #[test]
+    fn peers_are_marked_only_when_a_reparse_is_applied_and_changes_what_they_see() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        state.peers_dirty = false;
+        // Same signature (the link to `one` stays): not dirty.
+        type_into(&mut state, 2, "# A\n\n[[one]] and more text\n");
+        let job = state.prepare_reparse("file:///a.md").unwrap();
+        let parsed = satz_core::parse_document(&job.content, &job.rel_path);
+        assert!(state.apply_reparse("file:///a.md", job.version, parsed));
+        assert!(!state.peers_dirty);
+        // A new heading is something other documents can link to: dirty.
+        type_into(&mut state, 3, "# A\n\n## New heading\n\n[[one]]\n");
+        let job = state.prepare_reparse("file:///a.md").unwrap();
+        let parsed = satz_core::parse_document(&job.content, &job.rel_path);
+        assert!(state.apply_reparse("file:///a.md", job.version, parsed));
+        assert!(state.peers_dirty);
+    }
+
+    #[test]
+    fn a_reparse_for_a_document_that_was_closed_meanwhile_is_dropped() {
+        let mut state = open_state("# A\n");
+        let job = state.prepare_reparse("file:///a.md").unwrap();
+        let parsed = satz_core::parse_document(&job.content, &job.rel_path);
+        state.close_document("file:///a.md");
+        assert!(!state.apply_reparse("file:///a.md", job.version, parsed));
+    }
+
+    #[test]
+    fn the_synchronous_reparse_still_works_for_save_and_format() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        type_into(&mut state, 5, "# A\n\n[[five]]\n");
+        state.reparse_open_document("file:///a.md");
+        assert_eq!(links_of_a(&state), vec!["five".to_string()]);
+        // Unknown documents are ignored.
+        state.reparse_open_document("file:///nope.md");
     }
 }

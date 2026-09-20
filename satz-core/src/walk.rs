@@ -16,6 +16,12 @@ pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".hg",
 ];
 
+/// Whether `path` names a note: a `.md` or `.markdown` file (any case).
+pub fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
+}
+
 pub fn is_ignored_entry(path: &Path, root: &Path) -> bool {
     let rel = path.strip_prefix(root).unwrap_or(path);
     for c in rel.components() {
@@ -37,8 +43,17 @@ pub fn walk_vault(vault_root: &Path) -> Result<Vec<Document>> {
     if !vault_root.exists() {
         bail!("vault root does not exist: {}", vault_root.display());
     }
+    walk_subtree(vault_root, vault_root)
+}
 
-    let walker = WalkBuilder::new(vault_root)
+/// Like `walk_vault`, restricted to the folder `dir` inside the vault: the same rules, and the
+/// documents' paths stay relative to `vault_root`. Used to index a folder that appeared or moved.
+pub fn walk_subtree(vault_root: &Path, dir: &Path) -> Result<Vec<Document>> {
+    if !dir.is_dir() {
+        bail!("folder does not exist: {}", dir.display());
+    }
+
+    let walker = WalkBuilder::new(dir)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
@@ -64,11 +79,7 @@ pub fn walk_vault(vault_root: &Path) -> Result<Vec<Document>> {
                 if is_ignored_entry(path, vault_root) {
                     continue;
                 }
-                if entry.file_type().is_some_and(|ft| ft.is_file())
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                {
+                if entry.file_type().is_some_and(|ft| ft.is_file()) && is_markdown_path(path) {
                     md_paths.push(path.to_path_buf());
                 }
             }
@@ -299,5 +310,42 @@ mod tests {
             Path::new("/home/.git/vault/a.md"),
             Path::new("/home/.git/vault")
         ));
+    }
+
+    #[test]
+    fn markdown_and_md_extensions_are_both_notes() {
+        let t = Tree::new("exts");
+        t.write("a.md", "# a\n");
+        t.write("b.markdown", "# b\n");
+        t.write("c.MARKDOWN", "# c\n");
+        t.write("d.mdx", "not a note\n");
+        t.write("e.txt", "not a note\n");
+        assert_eq!(t.walk(), vec!["a.md", "b.markdown", "c.MARKDOWN"]);
+        assert!(is_markdown_path(Path::new("x/y.MD")));
+        assert!(is_markdown_path(Path::new("y.markdown")));
+        assert!(!is_markdown_path(Path::new("y.mdx")));
+        assert!(!is_markdown_path(Path::new("md")));
+        assert!(!is_markdown_path(Path::new(".md")));
+    }
+
+    #[test]
+    fn a_subtree_is_walked_with_paths_relative_to_the_vault() {
+        let t = Tree::new("subtree");
+        t.write("top.md", "# top\n");
+        t.write("sub/one.md", "# one\n");
+        t.write("sub/deep/two.md", "# two\n");
+        t.write("sub/node_modules/skip.md", "# skip\n");
+        t.write("other/three.md", "# three\n");
+        let docs = walk_subtree(&t.0, &t.0.join("sub")).unwrap();
+        let mut found: Vec<String> = docs
+            .iter()
+            .map(|d| d.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["sub/deep/two.md", "sub/one.md"]);
+        // The whole vault is the subtree that starts at the root.
+        assert_eq!(walk_subtree(&t.0, &t.0).unwrap().len(), 4);
+        // A folder that does not exist is an error, like a missing vault.
+        assert!(walk_subtree(&t.0, &t.0.join("missing")).is_err());
     }
 }

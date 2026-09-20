@@ -213,3 +213,55 @@ fn replacing_a_document_with_itself_changes_nothing() {
         assert_eq!(observe(&index), before);
     }
 }
+
+/// Bulk removal and insertion (a whole folder at once) give exactly what one-by-one changes give.
+#[test]
+fn bulk_changes_match_changing_documents_one_by_one() {
+    let mut rng = Rng(0xDEAD_BEEF_1234_5678);
+    for _ in 0..40 {
+        let mut all: Vec<Document> = Vec::new();
+        for path in PATHS {
+            if rng.chance(70) {
+                all.push(random_document(&mut rng, path));
+            }
+        }
+        let mut one_by_one = Index::build(all.clone());
+        let mut bulk = Index::build(all.clone());
+
+        // Remove a random subset.
+        let gone: Vec<DocId> = all
+            .iter()
+            .filter(|_| rng.chance(50))
+            .map(|d| d.id.clone())
+            .collect();
+        for id in &gone {
+            one_by_one.remove_doc(id);
+        }
+        bulk.remove_docs(&gone);
+        assert_eq!(
+            observe(&bulk),
+            observe(&one_by_one),
+            "after removing {gone:?}"
+        );
+
+        // Add (or replace) a random batch, including ones that are already there.
+        let mut batch: Vec<Document> = Vec::new();
+        for path in PATHS {
+            if rng.chance(50) {
+                batch.push(random_document(&mut rng, path));
+            }
+        }
+        for doc in &batch {
+            one_by_one.replace_doc(doc.clone());
+        }
+        bulk.replace_docs(batch);
+        assert_eq!(observe(&bulk), observe(&one_by_one));
+    }
+    // Empty batches and unknown ids change nothing.
+    let mut idx = Index::build(vec![random_document(&mut Rng(1), "a.md")]);
+    let before = observe(&idx);
+    idx.remove_docs(&[DocId::new("nope.md")]);
+    idx.remove_docs(&[]);
+    idx.replace_docs(Vec::new());
+    assert_eq!(observe(&idx), before);
+}

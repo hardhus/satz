@@ -73,9 +73,9 @@ Find References and Document Highlight both resolve "what's under the cursor" wi
 
 Run the `satz.formatWorkspace` command (via `workspace/executeCommand`, or the "Format entire vault" source code action) to format every document in the vault in one shot, without leaving the editor:
 
-1. The server computes each document's formatted output — checking a small in-memory cache keyed by content hash first (`lsp.format_cache_capacity`), so a repeat call against a vault that hasn't changed since the last one does no reformatting work at all — and skips any document whose result is identical to its current content; unchanged files never appear in the edit.
+1. The server computes each document's formatted output (for an open document from its live editor buffer, not from the last reparsed copy, so text typed a moment ago is what gets formatted) — checking a small in-memory cache keyed by content hash first (`lsp.format_cache_capacity`), so a repeat call against a vault that hasn't changed since the last one does no reformatting work at all — and skips any document whose result is identical to its current content; unchanged files never appear in the edit.
 2. If anything needs to change, it sends one `workspace/applyEdit` request containing, per changed file, the *minimal* set of line-range `TextEdit`s (a line-based diff between the current and formatted text) rather than one edit replacing the whole document — scattered small changes stay small edits instead of one large blob.
-3. Once the client confirms the edit was applied, the server immediately updates its own in-memory copy (rope + index) of any *open* document among those changed, so diagnostics/hover/etc. reflect the new content right away rather than waiting for the client's own follow-up `textDocument/didChange`. Documents that aren't open are left for the client to persist — same as any other `workspace/applyEdit` — and the existing file watcher (see below) picks up the on-disk change normally.
+3. Open documents are not touched by the server itself: the client applies the edit to its own buffer and reports it with `textDocument/didChange` (changing the server's copy first would apply the same edit twice). When the client supports `workspace.workspaceEdit.documentChanges`, the edit is sent as versioned document edits: an open document names the version the edits were computed against, so the client refuses them if you typed in the meantime (the command then reports `formatted: 0` and can simply be run again) instead of applying them to text they do not fit. Documents that aren't open are left for the client to persist — same as any other `workspace/applyEdit` — and the existing file watcher (see below) picks up the on-disk change normally.
 
 Whether your editor exposes a convenient way to *trigger* `workspace/executeCommand` (a keybinding, a command palette entry) varies by client — this is a real LSP mechanism, not a satz-specific limitation, but the spec doesn't mandate any particular UI for it. If your client makes it awkward to discover, [`satz fmt --write`](cli.md#satz-fmt-path) from a terminal is the always-available equivalent.
 
@@ -91,16 +91,17 @@ The backlink CodeLens runs `satz.showBacklinks` with the note's URI as its only 
 
 A background file watcher (`notify`, polling every 500ms with a further 200ms debounce) keeps the in-memory index in sync without needing to restart the server:
 
+- A note is a `.md` or `.markdown` file (any case); the initial scan and the watcher agree on that.
 - Creating, modifying, or deleting a `.md` file outside the editor (e.g. `git checkout`, another tool writing to the vault) triggers a re-index of just that file — unless it's currently open in the client, in which case the editor's own buffer stays authoritative. Open documents are matched by their vault-relative, case-folded path (so a differently spelled path from the file system watcher still counts), and a briefly missing file (save-by-rename) never drops an open document from the index.
+- Deleting, renaming or moving a FOLDER is followed too: the notes that were in it leave the index (open documents stay, their buffer is authoritative), and a folder that appears or is moved in is scanned and its notes are indexed.
+- Watching starts before the first scan: what changes while the vault is being indexed is held back until the index is complete and then applied from what is on disk. If the first indexing fails (for example the folder does not exist) the server keeps working with the open documents, shows the reason, and the watcher still runs.
 - Editing and saving the vault root's `.satz.toml` on disk reloads the whole configuration live; the client is notified to refresh diagnostics afterward. A `.satz.toml` in a subfolder, or a file named `satz.toml`, is ignored.
 - If `.satz.toml` is invalid (at startup or after an edit) the editor shows a warning with the file name and line, and formatting (format-on-save, *Format Document*, the *Format entire vault* action and `satz.formatWorkspace`) is turned off until the file is valid again; see [When the file is invalid](configuration.md#when-the-file-is-invalid).
 - Whether diagnostics are then pushed or the client is asked to re-pull depends on whether the client advertised diagnostic pull support during `initialize`.
 
 ## Document sync and closing
 
-- Positions follow the LSP definition: only `
-`, `
-` and `` end a line (U+2028, VT, FF and the like do not), and a column past the end of a line means the end of that line, never the next one.
+- Positions follow the LSP definition: only `\n`, `\r\n` and `\r` end a line (U+2028, VT, FF and the like do not), and a column past the end of a line means the end of that line, never the next one.
 - A `didChange` carrying an older document version than the buffer already has is ignored.
 - Closing a document puts the index back to what is on disk (or drops the entry if there is no file), so unsaved edits that were discarded no longer shape links and diagnostics.
 - The other open documents' diagnostics are refreshed whenever an edit changes what they depend on: the note's title/aliases/name, the notes it links to (orphan status), or its headings and block ids (anchor warnings) — not on every keystroke.

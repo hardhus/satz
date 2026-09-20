@@ -46,9 +46,7 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
                             EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                         ) {
                             for path in paths {
-                                if (is_markdown_file(&path) || is_config_file(&path, &vault_root))
-                                    && !is_ignored_path(&path, &vault_root)
-                                {
+                                if is_relevant_path(&path, &vault_root) {
                                     tracing::debug!(?path, "watcher: queued relevant change");
                                     let _ = tx.send(path);
                                 }
@@ -66,24 +64,20 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
     // 2. Debounce and process events in tokio runtime
     tokio::spawn(async move {
         let debounce_duration = Duration::from_millis(200);
-        let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut pending = Debouncer::default();
 
         loop {
             tokio::select! {
                 Some(path) = rx.recv() => {
-                    pending.insert(path, Instant::now());
+                    pending.push(path, Instant::now());
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)), if !pending.is_empty() => {
                     let now = Instant::now();
-                    let ready_paths: Vec<PathBuf> = pending
-                        .iter()
-                        .filter(|(_, time)| now.duration_since(**time) >= debounce_duration)
-                        .map(|(path, _)| path.clone())
-                        .collect();
-
-                    for path in ready_paths {
-                        pending.remove(&path);
-                        process_file_event(&path, &vault_root, &state, &client).await;
+                    for path in pending.take_ready(now, debounce_duration) {
+                        // A change that arrives before the first index is complete waits for it.
+                        if process_file_event(&path, &vault_root, &state, &client).await {
+                            pending.push(path, Instant::now());
+                        }
                     }
                 }
             }
@@ -91,13 +85,51 @@ pub fn spawn_watcher(vault_root: PathBuf, state: Arc<RwLock<SatzState>>, client:
     });
 }
 
+/// Collects file system events and hands each path out once it has been quiet for a while, so a
+/// burst of events for one file (an editor saving) is one piece of work.
+#[derive(Default)]
+pub(crate) struct Debouncer {
+    pending: HashMap<PathBuf, Instant>,
+}
+
+impl Debouncer {
+    /// Records an event; a path that is already waiting starts its wait again.
+    pub(crate) fn push(&mut self, path: PathBuf, now: Instant) {
+        self.pending.insert(path, now);
+    }
+
+    /// Removes and returns (in path order) the paths whose last event is at least `window` old.
+    pub(crate) fn take_ready(&mut self, now: Instant, window: Duration) -> Vec<PathBuf> {
+        let mut ready: Vec<PathBuf> = self
+            .pending
+            .iter()
+            .filter(|(_, time)| now.duration_since(**time) >= window)
+            .map(|(path, _)| path.clone())
+            .collect();
+        ready.sort();
+        for path in &ready {
+            self.pending.remove(path);
+        }
+        ready
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// Applies one debounced event. `true`: the first indexing is not finished yet, so the event was
+/// not applied and must be queued again.
 async fn process_file_event(
     path: &Path,
     vault_root: &Path,
     state: &Arc<RwLock<SatzState>>,
     client: &Client,
-) {
+) -> bool {
     tracing::debug!(?path, "watcher: processing debounced event");
+    if !state.read().await.indexing_complete {
+        return true;
+    }
     if is_config_file(path, vault_root) {
         use tower_lsp_server::ls_types::MessageType;
 
@@ -129,8 +161,14 @@ async fn process_file_event(
             }
         }
     } else {
+        // Reading and parsing (a file, or a whole folder) happens before the lock is taken.
+        let (owned_path, owned_root) = (path.to_path_buf(), vault_root.to_path_buf());
+        let prepared =
+            tokio::task::spawn_blocking(move || prepare_fs_change(&owned_path, &owned_root))
+                .await
+                .unwrap_or(PreparedChange::Skip);
         let mut s = state.write().await;
-        apply_fs_change(&mut s, vault_root, path);
+        apply_prepared(&mut s, path, prepared);
     }
 
     let (supports_pull, uris) = {
@@ -148,6 +186,7 @@ async fn process_file_event(
             crate::backend::publish_for(client, state, &uri).await;
         }
     }
+    false
 }
 
 /// What an on-disk change did to the index.
@@ -156,38 +195,168 @@ pub(crate) enum FsChange {
     Removed,
     Reindexed,
     Skipped,
+    /// The initial indexing is not finished: the change is not applied and must be tried again.
+    Deferred,
 }
 
-/// Brings the index in line with a created/modified/deleted markdown file.
-pub(crate) fn apply_fs_change(state: &mut SatzState, vault_root: &Path, path: &Path) -> FsChange {
-    let rel_path = crate::state::SatzState::get_rel_path(path, Some(vault_root));
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-    let doc_id = satz_core::DocId::new(&rel_path_str);
+/// What the disk says about a changed path, read WITHOUT holding the state lock: reading and
+/// parsing a note (or a whole folder) is slow compared to updating the index.
+pub(crate) enum PreparedChange {
+    /// A note that exists and was read.
+    Doc(Box<satz_core::Document>),
+    /// A note that no longer exists.
+    RemoveDoc(satz_core::DocId),
+    /// A folder that exists: every note found in it. Notes the index holds for that folder but that
+    /// were not found any more are dropped.
+    Subtree {
+        prefix: String,
+        docs: Vec<satz_core::Document>,
+    },
+    /// A path that no longer exists and may have been a folder: its notes go.
+    RemovePrefix(String),
+    /// Nothing to do (not a note, unreadable, not a folder that matters).
+    Skip,
+}
 
-    // An open document is owned by the editor's buffer, not by the file: it stays indexed when
-    // its file is briefly missing (save-by-rename) and is not overwritten by what is on disk.
-    if state.is_open_path(path) {
-        return FsChange::Skipped;
+/// Reads what is on disk for `path` (a note, or a folder that appeared, moved or vanished).
+pub(crate) fn prepare_fs_change(path: &Path, vault_root: &Path) -> PreparedChange {
+    let rel_path = SatzState::get_rel_path(path, Some(vault_root));
+    let rel = rel_path.to_string_lossy().replace('\\', "/");
+
+    if path.is_dir() {
+        // Also a folder that happens to be named like a note (`x.md/`).
+        return match satz_core::walk::walk_subtree(vault_root, path) {
+            Ok(docs) => PreparedChange::Subtree { prefix: rel, docs },
+            Err(_) => PreparedChange::Skip,
+        };
+    }
+    if satz_core::walk::is_markdown_path(path) {
+        if !path.exists() {
+            return PreparedChange::RemoveDoc(satz_core::DocId::new(rel));
+        }
+        return match std::fs::read_to_string(path) {
+            Ok(content) => {
+                PreparedChange::Doc(Box::new(satz_core::parse_document(&content, &rel_path)))
+            }
+            Err(_) => PreparedChange::Skip,
+        };
     }
     if !path.exists() {
-        state.index.remove_doc(&doc_id);
-        tracing::info!("Watcher: removed deleted document {}", doc_id);
-        return FsChange::Removed;
+        // It cannot be told any more whether this was a folder: drop whatever the index holds under it.
+        return PreparedChange::RemovePrefix(rel);
     }
-    if let Ok(content) = std::fs::read_to_string(path) {
-        let new_doc = satz_core::parse_document(&content, &rel_path);
-        state.index.replace_doc(new_doc);
-        tracing::info!("Watcher: re-indexed {}", doc_id);
-        return FsChange::Reindexed;
-    }
-    FsChange::Skipped
+    PreparedChange::Skip
 }
 
-fn is_markdown_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
-        .unwrap_or(false)
+/// Whether `id` is `prefix` itself or lies inside the folder `prefix`, ignoring case and spelling
+/// of separators (the event path and the indexed path may be spelled differently).
+fn is_inside(id: &str, prefix: &str) -> bool {
+    let id = satz_core::fold_key(id);
+    let prefix = satz_core::fold_key(prefix.trim_end_matches('/'));
+    id == prefix || id.starts_with(&format!("{prefix}/"))
+}
+
+/// Puts a prepared change into the index. Open documents are owned by the editor's buffer, not by
+/// the file: they stay indexed when their file or folder disappears and are never overwritten by
+/// what is on disk.
+pub(crate) fn apply_prepared(
+    state: &mut SatzState,
+    path: &Path,
+    prepared: PreparedChange,
+) -> FsChange {
+    if !state.indexing_complete {
+        return FsChange::Deferred;
+    }
+    let is_open = |state: &SatzState, id: &satz_core::DocId| {
+        state.open_docs.values().any(|open| {
+            let rel = SatzState::get_rel_path(&open.path, state.vault_root.as_deref());
+            satz_core::fold_key(&rel.to_string_lossy().replace('\\', "/"))
+                == satz_core::fold_key(id.as_str())
+        })
+    };
+    match prepared {
+        PreparedChange::Skip => FsChange::Skipped,
+        PreparedChange::Doc(doc) => {
+            if state.is_open_path(path) {
+                return FsChange::Skipped;
+            }
+            tracing::info!("Watcher: re-indexed {}", doc.id);
+            state.index.replace_doc(*doc);
+            FsChange::Reindexed
+        }
+        PreparedChange::RemoveDoc(id) => {
+            if state.is_open_path(path) {
+                return FsChange::Skipped;
+            }
+            state.index.remove_doc(&id);
+            tracing::info!("Watcher: removed deleted document {}", id);
+            FsChange::Removed
+        }
+        PreparedChange::RemovePrefix(prefix) => {
+            let gone: Vec<satz_core::DocId> = state
+                .index
+                .documents()
+                .map(|d| d.id.clone())
+                .filter(|id| is_inside(id.as_str(), &prefix) && !is_open(state, id))
+                .collect();
+            state.index.remove_docs(&gone);
+            if gone.is_empty() {
+                FsChange::Skipped
+            } else {
+                tracing::info!(
+                    "Watcher: removed {} document(s) under {}",
+                    gone.len(),
+                    prefix
+                );
+                FsChange::Removed
+            }
+        }
+        PreparedChange::Subtree { prefix, docs } => {
+            let mut changed = false;
+            let found: std::collections::HashSet<String> = docs
+                .iter()
+                .map(|d| satz_core::fold_key(d.id.as_str()))
+                .collect();
+            let stale: Vec<satz_core::DocId> = state
+                .index
+                .documents()
+                .map(|d| d.id.clone())
+                .filter(|id| {
+                    is_inside(id.as_str(), &prefix)
+                        && !found.contains(&satz_core::fold_key(id.as_str()))
+                        && !is_open(state, id)
+                })
+                .collect();
+            changed |= !stale.is_empty();
+            state.index.remove_docs(&stale);
+            let fresh: Vec<satz_core::Document> = docs
+                .into_iter()
+                .filter(|doc| !is_open(state, &doc.id))
+                .collect();
+            changed |= !fresh.is_empty();
+            state.index.replace_docs(fresh);
+            if changed {
+                tracing::info!("Watcher: re-indexed folder {}", prefix);
+                FsChange::Reindexed
+            } else {
+                FsChange::Skipped
+            }
+        }
+    }
+}
+
+/// Brings the index in line with a created/modified/deleted note or folder (reads, then applies).
+#[cfg(test)]
+pub(crate) fn apply_fs_change(state: &mut SatzState, vault_root: &Path, path: &Path) -> FsChange {
+    let prepared = prepare_fs_change(path, vault_root);
+    apply_prepared(state, path, prepared)
+}
+
+/// Whether a file system event for `path` can change the index or the configuration: a note, the
+/// configuration file, or anything that might be a folder (deleting or moving one reports only the
+/// folder's own path), except paths inside ignored folders.
+fn is_relevant_path(path: &Path, vault_root: &Path) -> bool {
+    !is_ignored_path(path, vault_root)
 }
 
 /// What happened when the configuration was re-read after `.satz.toml` changed.
@@ -624,5 +793,343 @@ mod tests {
         ));
 
         assert_eq!(state.format_cache.get(1), Some("kept"));
+    }
+
+    // ---- folders: deleting, renaming or moving one changes many notes at once ----
+
+    fn write(dir: &Path, rel: &str, text: &str) -> PathBuf {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// Indexes every given file the way the watcher would on its first event.
+    fn index_files(state: &mut SatzState, dir: &Path, rels: &[&str]) {
+        for rel in rels {
+            apply_fs_change(state, dir, &dir.join(rel));
+        }
+    }
+
+    fn ids(state: &SatzState) -> Vec<String> {
+        let mut ids: Vec<String> = state
+            .index
+            .documents()
+            .map(|d| d.id.as_str().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn deleting_a_folder_removes_every_note_in_it_from_the_index() {
+        let dir = temp_dir("dir-delete");
+        write(&dir, "keep.md", "# keep\n");
+        write(&dir, "docs/a.md", "# a\n");
+        write(&dir, "docs/deep/b.md", "# b\n");
+        let mut state = state_in(&dir);
+        index_files(
+            &mut state,
+            &dir,
+            &["keep.md", "docs/a.md", "docs/deep/b.md"],
+        );
+        assert_eq!(ids(&state), vec!["docs/a.md", "docs/deep/b.md", "keep.md"]);
+
+        std::fs::remove_dir_all(dir.join("docs")).unwrap();
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("docs")),
+            FsChange::Removed
+        );
+        assert_eq!(ids(&state), vec!["keep.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renaming_a_folder_moves_its_notes_to_the_new_names() {
+        let dir = temp_dir("dir-rename");
+        write(&dir, "old/x.md", "# x\n");
+        write(&dir, "old/sub/y.md", "# y\n");
+        let mut state = state_in(&dir);
+        index_files(&mut state, &dir, &["old/x.md", "old/sub/y.md"]);
+
+        std::fs::rename(dir.join("old"), dir.join("new")).unwrap();
+        // The watcher reports both paths.
+        apply_fs_change(&mut state, &dir, &dir.join("old"));
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("new")),
+            FsChange::Reindexed
+        );
+        assert_eq!(ids(&state), vec!["new/sub/y.md", "new/x.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_moved_in_from_outside_brings_its_notes() {
+        let dir = temp_dir("dir-in");
+        let outside = temp_dir("dir-in-outside");
+        write(&outside, "pack/p.md", "# p\n[[q]]\n");
+        write(&outside, "pack/inner/q.md", "# q\n");
+        let mut state = state_in(&dir);
+
+        std::fs::rename(outside.join("pack"), dir.join("pack")).unwrap();
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("pack")),
+            FsChange::Reindexed
+        );
+        assert_eq!(ids(&state), vec!["pack/inner/q.md", "pack/p.md"]);
+        assert_eq!(targets(&state, "pack/p.md"), Some(vec!["q".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn an_open_note_stays_indexed_when_its_folder_disappears() {
+        let dir = temp_dir("dir-open");
+        write(&dir, "docs/a.md", "# a\n");
+        write(&dir, "docs/b.md", "# b\n");
+        let mut state = state_in(&dir);
+        index_files(&mut state, &dir, &["docs/a.md", "docs/b.md"]);
+        state.open_document(
+            "file:///a.md",
+            "# a\n\n[[buffer]]\n",
+            &dir.join("docs/a.md"),
+            1,
+        );
+
+        std::fs::remove_dir_all(dir.join("docs")).unwrap();
+        apply_fs_change(&mut state, &dir, &dir.join("docs"));
+        assert_eq!(ids(&state), vec!["docs/a.md"], "only the open buffer stays");
+        assert_eq!(targets(&state, "docs/a.md"), Some(vec!["buffer".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_event_matches_whole_path_components_only() {
+        let dir = temp_dir("dir-prefix");
+        write(&dir, "notes/a.md", "# a\n");
+        write(&dir, "notes2/b.md", "# b\n");
+        write(&dir, "notes.md", "# n\n");
+        write(&dir, "NOTES-old/c.md", "# c\n");
+        let mut state = state_in(&dir);
+        index_files(
+            &mut state,
+            &dir,
+            &["notes/a.md", "notes2/b.md", "notes.md", "NOTES-old/c.md"],
+        );
+
+        std::fs::remove_dir_all(dir.join("notes")).unwrap();
+        apply_fs_change(&mut state, &dir, &dir.join("notes"));
+        assert_eq!(
+            ids(&state),
+            vec!["NOTES-old/c.md", "notes.md", "notes2/b.md"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_and_a_note_with_the_same_stem_do_not_get_mixed_up() {
+        let dir = temp_dir("dir-stem");
+        write(&dir, "a.md", "# note a\n");
+        write(&dir, "a/inside.md", "# inside\n");
+        let mut state = state_in(&dir);
+        index_files(&mut state, &dir, &["a.md", "a/inside.md"]);
+
+        std::fs::remove_dir_all(dir.join("a")).unwrap();
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("a")),
+            FsChange::Removed
+        );
+        assert_eq!(ids(&state), vec!["a.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn events_that_change_nothing_are_skipped() {
+        let dir = temp_dir("dir-noop");
+        write(&dir, "a.md", "# a\n");
+        let picture = write(&dir, "images/pic.png", "not text");
+        let mut state = state_in(&dir);
+        index_files(&mut state, &dir, &["a.md"]);
+
+        // A file that is not a note, an empty folder, a folder that never held notes.
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &picture),
+            FsChange::Skipped
+        );
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("empty")),
+            FsChange::Skipped
+        );
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("never-existed")),
+            FsChange::Skipped
+        );
+        assert_eq!(ids(&state), vec!["a.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scan_of_a_folder_also_drops_notes_that_are_gone_from_it() {
+        let dir = temp_dir("dir-rescan");
+        write(&dir, "d/keep.md", "# keep\n");
+        write(&dir, "d/gone.md", "# gone\n");
+        let mut state = state_in(&dir);
+        index_files(&mut state, &dir, &["d/keep.md", "d/gone.md"]);
+
+        std::fs::remove_file(dir.join("d/gone.md")).unwrap();
+        write(&dir, "d/new.md", "# new\n");
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("d")),
+            FsChange::Reindexed
+        );
+        assert_eq!(ids(&state), vec!["d/keep.md", "d/new.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_markdown_extension_is_a_note_for_the_watcher_too() {
+        let dir = temp_dir("markdown-ext");
+        let path = write(&dir, "b.markdown", "# b\n");
+        let mut state = state_in(&dir);
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &path),
+            FsChange::Reindexed
+        );
+        assert_eq!(ids(&state), vec!["b.markdown"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_big_folder_is_fast() {
+        let dir = temp_dir("dir-big");
+        let mut state = state_in(&dir);
+        let mut docs: Vec<satz_core::Document> = (0..2000)
+            .map(|i| satz_core::parse_document("# n\n", Path::new(&format!("big/n{i}.md"))))
+            .collect();
+        docs.push(satz_core::parse_document("# k\n", Path::new("keep.md")));
+        state.index.replace_docs(docs);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("big")),
+            FsChange::Removed
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(ids(&state), vec!["keep.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_paths_that_can_matter_are_queued() {
+        let r = root();
+        for (rel, expected) in [
+            ("a.md", true),
+            ("sub/b.markdown", true),
+            (".satz.toml", true),
+            ("folder", true),
+            ("v1.2", true),
+            ("sub/folder", true),
+            ("image.png", true), // it might be a folder with a dot in its name: checked later
+            (".git/HEAD", false),
+            (".git", false),
+            ("node_modules/x.md", false),
+            ("a/node_modules", false),
+            (".obsidian/app.json", false),
+            (".hidden/note.md", false),
+        ] {
+            assert_eq!(is_relevant_path(&r.join(rel), &r), expected, "{rel:?}");
+        }
+    }
+
+    // ---- changes that arrive before the first index is complete ----
+
+    #[test]
+    fn a_change_during_the_first_indexing_is_deferred_and_applied_once_it_is_done() {
+        let dir = temp_dir("deferred");
+        let path = write(&dir, "new.md", "# new\n[[x]]\n");
+        let mut state = state_in(&dir);
+        state.indexing_complete = false;
+
+        assert_eq!(apply_fs_change(&mut state, &dir, &path), FsChange::Deferred);
+        assert_eq!(ids(&state), Vec::<String>::new(), "nothing was applied");
+
+        // The file changes again before indexing finishes; the retry reads the file as it is now.
+        std::fs::write(&path, "# new\n[[y]]\n").unwrap();
+        state.indexing_complete = true;
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &path),
+            FsChange::Reindexed
+        );
+        assert_eq!(targets(&state, "new.md"), Some(vec!["y".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_and_delete_events_are_deferred_too() {
+        let dir = temp_dir("deferred-dir");
+        write(&dir, "d/a.md", "# a\n");
+        let mut state = state_in(&dir);
+        state.indexing_complete = false;
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("d")),
+            FsChange::Deferred
+        );
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("gone.md")),
+            FsChange::Deferred
+        );
+        assert_eq!(
+            apply_fs_change(&mut state, &dir, &dir.join("gone")),
+            FsChange::Deferred
+        );
+        assert!(ids(&state).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the debounce window ----
+
+    #[test]
+    fn repeated_events_for_one_path_are_one_piece_of_work_after_the_last_one() {
+        let mut d = Debouncer::default();
+        let t0 = Instant::now();
+        let window = Duration::from_millis(200);
+        d.push(PathBuf::from("a.md"), t0);
+        d.push(PathBuf::from("a.md"), t0 + Duration::from_millis(100));
+        d.push(PathBuf::from("a.md"), t0 + Duration::from_millis(150));
+        // 200 ms after the FIRST event, but only 50 ms after the last: not ready.
+        assert!(
+            d.take_ready(t0 + Duration::from_millis(200), window)
+                .is_empty()
+        );
+        assert!(!d.is_empty());
+        let ready = d.take_ready(t0 + Duration::from_millis(350), window);
+        assert_eq!(ready, vec![PathBuf::from("a.md")]);
+        assert!(d.is_empty());
+        assert!(d.take_ready(t0 + Duration::from_secs(9), window).is_empty());
+    }
+
+    #[test]
+    fn paths_are_debounced_independently_and_come_out_in_a_stable_order() {
+        let mut d = Debouncer::default();
+        let t0 = Instant::now();
+        let window = Duration::from_millis(200);
+        d.push(PathBuf::from("b.md"), t0);
+        d.push(PathBuf::from("a.md"), t0);
+        d.push(PathBuf::from("c.md"), t0 + Duration::from_millis(180));
+        let ready = d.take_ready(t0 + Duration::from_millis(210), window);
+        assert_eq!(ready, vec![PathBuf::from("a.md"), PathBuf::from("b.md")]);
+        assert!(!d.is_empty(), "c.md is still waiting");
+        // A deferred path is queued again and waits a whole window.
+        d.push(PathBuf::from("a.md"), t0 + Duration::from_millis(210));
+        let later = d.take_ready(t0 + Duration::from_millis(400), window);
+        assert_eq!(later, vec![PathBuf::from("c.md")]);
+        assert_eq!(
+            d.take_ready(t0 + Duration::from_millis(500), window),
+            vec![PathBuf::from("a.md")]
+        );
     }
 }

@@ -27,9 +27,28 @@ pub fn byte_range_to_lsp(range: ByteRange, line_index: &LineIndex) -> lsp::Range
 }
 
 /// Converts a file URI string into a local filesystem `PathBuf`.
+///
+/// Only `file:` URIs name local files: `untitled:` (an unsaved buffer), `https:` and the like give
+/// `None` instead of a bogus relative path. On Windows a file URI with a host is a network share
+/// (`file://server/share/x.md` -> `\\server\share\x.md`); the host must not be dropped.
 pub fn uri_to_path(uri_str: &str) -> Option<PathBuf> {
     let uri: lsp::Uri = uri_str.parse().ok()?;
+    if !uri.scheme().as_str().eq_ignore_ascii_case("file") {
+        return None;
+    }
+    let host = uri
+        .authority()
+        .map(|a| a.host().to_string())
+        .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"));
     let path = uri.to_file_path().map(|p| p.into_owned())?;
+    if let Some(host) = host {
+        // A remote host is only reachable as a UNC path, and only on Windows.
+        if !cfg!(windows) {
+            return None;
+        }
+        let share_path = path.to_string_lossy().replace('/', "\\");
+        return Some(PathBuf::from(format!("\\\\{host}{share_path}")));
+    }
     Some(normalize_windows_drive_root(path))
 }
 
@@ -54,9 +73,46 @@ fn normalize_windows_drive_root(path: PathBuf) -> PathBuf {
     PathBuf::from(fixed)
 }
 
-/// Converts a filesystem `Path` into an `lsp::Uri`.
+/// Converts a filesystem `Path` into an `lsp::Uri`. A Windows network path
+/// (`\\server\share\x.md`) becomes `file://server/share/x.md`.
 pub fn path_to_uri(path: &Path) -> Option<lsp::Uri> {
+    let text = path.to_string_lossy();
+    if let Some(unc) = unc_parts(&text) {
+        let encoded: Vec<String> = unc
+            .1
+            .iter()
+            .map(|segment| percent_encode(segment))
+            .collect();
+        return format!("file://{}/{}", percent_encode(&unc.0), encoded.join("/"))
+            .parse()
+            .ok();
+    }
     lsp::Uri::from_file_path(path)
+}
+
+/// `(server, path segments)` of a Windows network path (`\\server\share\dir\x.md`, also the
+/// `\\?\UNC\server\share\...` spelling), `None` for any other path.
+fn unc_parts(path: &str) -> Option<(String, Vec<String>)> {
+    let rest = path
+        .strip_prefix("\\\\?\\UNC\\")
+        .or_else(|| path.strip_prefix("\\\\").filter(|r| !r.starts_with('?')))?;
+    let mut parts = rest.split(['\\', '/']).filter(|s| !s.is_empty());
+    let server = parts.next()?.to_string();
+    Some((server, parts.map(str::to_string).collect()))
+}
+
+/// Percent-encodes everything but URI path characters.
+fn percent_encode(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'@' | b':' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Converts line-based diff edits (`satz_core::formatter::diff::line_diff`) into minimal LSP
@@ -255,5 +311,87 @@ mod tests {
         assert_eq!(lsp_range.start, lsp::Position::new(0, 0));
         // total UTF-16 length: 1 ('a') + 1 ('ğ') + 2 ('😀') + 5 ('[[x]]') = 9
         assert_eq!(lsp_range.end, lsp::Position::new(0, 9));
+    }
+
+    // ---- file URIs as clients spell them ----
+
+    #[test]
+    fn a_plain_file_uri_becomes_a_path_and_back() {
+        let p = uri_to_path("file:///home/user/notes/a.md").unwrap();
+        assert!(
+            p.ends_with("notes/a.md") || p.ends_with("notes\\a.md"),
+            "{p:?}"
+        );
+        let with_space = uri_to_path("file:///home/user/my%20notes/a%20b.md").unwrap();
+        assert!(
+            with_space.to_string_lossy().contains("my notes"),
+            "{with_space:?}"
+        );
+        assert!(
+            with_space.to_string_lossy().contains("a b.md"),
+            "{with_space:?}"
+        );
+        let turkish = uri_to_path("file:///home/user/%C4%B1%C5%9F%C4%B1k/g%C3%BCn.md").unwrap();
+        assert!(turkish.to_string_lossy().contains("ışık"), "{turkish:?}");
+        assert!(turkish.to_string_lossy().contains("gün.md"), "{turkish:?}");
+        let emoji = uri_to_path("file:///home/user/%F0%9F%A6%80/x.md").unwrap();
+        assert!(emoji.to_string_lossy().contains('🦀'), "{emoji:?}");
+    }
+
+    #[test]
+    fn schemes_that_are_not_local_files_have_no_path() {
+        for uri in [
+            "untitled:Untitled-1",
+            "https://example.com/a.md",
+            "vscode-notebook-cell:/x/a.md#W0sZmlsZQ%3D%3D",
+            "",
+            "not a uri",
+            "file:",
+        ] {
+            assert_eq!(uri_to_path(uri), None, "{uri:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_and_network_share_uris_give_usable_paths() {
+        // The drive letter in either case, escaped colon (VS Code), and the drive root.
+        for uri in [
+            "file:///C:/notes/a.md",
+            "file:///c:/notes/a.md",
+            "file:///c%3A/notes/a.md",
+        ] {
+            let p = uri_to_path(uri).unwrap_or_else(|| panic!("{uri} has no path"));
+            let text = p.to_string_lossy().to_lowercase();
+            assert!(text.starts_with("c:"), "{uri} -> {p:?}");
+            assert!(
+                text.replace('/', "\\").ends_with("notes\\a.md"),
+                "{uri} -> {p:?}"
+            );
+        }
+        let root = uri_to_path("file:///m:/").unwrap();
+        assert!(root.has_root(), "{root:?}");
+        // A network share: `\\server\share\dir\a.md`.
+        let unc = uri_to_path("file://server/share/dir/a.md")
+            .expect("a UNC URI must give a path, not be ignored");
+        assert_eq!(
+            unc.to_string_lossy().replace('/', "\\"),
+            "\\\\server\\share\\dir\\a.md"
+        );
+        let spaced = uri_to_path("file://server/share/my%20dir/a.md").unwrap();
+        assert!(spaced.to_string_lossy().contains("my dir"), "{spaced:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_path_becomes_a_uri_with_the_server_as_host() {
+        let unc = PathBuf::from("\\\\server\\share\\dir\\a.md");
+        let uri = path_to_uri(&unc).expect("a UNC path has a URI");
+        assert!(
+            uri.as_str().starts_with("file://server/share/"),
+            "{}",
+            uri.as_str()
+        );
+        assert_eq!(uri_to_path(uri.as_str()).unwrap(), unc);
     }
 }

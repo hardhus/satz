@@ -1,6 +1,6 @@
 # Vault syntax reference
 
-satz parses plain Markdown files plus a small set of Obsidian-compatible conventions layered on top. This page is the exhaustive reference for what's recognized.
+satz parses plain Markdown files (`.md` or `.markdown`) plus a small set of Obsidian-compatible conventions layered on top. This page is the exhaustive reference for what's recognized.
 
 ## Wikilinks
 

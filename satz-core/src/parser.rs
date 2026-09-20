@@ -116,6 +116,16 @@ fn locate_fm_tag(source: &str, regions: &mut [TagKeyRegion], name: &str) -> Opti
     None
 }
 
+/// The hash of a document's text that `Document::content_hash` holds (the text without a leading
+/// byte order mark, as `parse_document` sees it). Equal for equal text, so it says whether a
+/// buffer is still the text something was computed from.
+pub fn content_hash(source: &str) -> u64 {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Parses a single Markdown source text into a complete `Document`.
 ///
 /// This is the primary single-file entry point in `satz-core`.
@@ -129,9 +139,7 @@ pub fn parse_document(source: &str, path: &Path) -> Document {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let line_index = LineIndex::new(source);
 
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    let content_hash = hasher.finish();
+    let content_hash = content_hash(source);
 
     let structure = structure::parse_structure(source);
 

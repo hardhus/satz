@@ -183,3 +183,30 @@ fn a_heading_without_text_and_a_document_of_only_frontmatter_are_fine() {
     assert_eq!(empty.title, "n");
     assert!(empty.headings.is_empty());
 }
+
+#[test]
+fn content_hash_is_the_hash_a_parsed_document_carries() {
+    for text in [
+        "",
+        "# A\n",
+        "---\ntitle: T\n---\nbody\n",
+        "Ünal 🦀\r\nx\r\n",
+        "\u{feff}# with bom\n",
+    ] {
+        assert_eq!(
+            satz_core::content_hash(text),
+            doc(text).content_hash,
+            "{text:?}"
+        );
+    }
+    assert_eq!(
+        satz_core::content_hash("same"),
+        satz_core::content_hash("same")
+    );
+    assert_ne!(satz_core::content_hash("a"), satz_core::content_hash("b"));
+    // A byte order mark is not content.
+    assert_eq!(
+        satz_core::content_hash("\u{feff}# x\n"),
+        satz_core::content_hash("# x\n")
+    );
+}

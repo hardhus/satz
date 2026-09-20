@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use tower_lsp_server::ls_types::{Location, TextEdit, Uri, WorkspaceEdit};
+use tower_lsp_server::ls_types::{
+    DocumentChanges, Location, OneOf, OptionalVersionedTextDocumentIdentifier, TextDocumentEdit,
+    TextEdit, Uri, WorkspaceEdit,
+};
 
 use crate::convert::{line_edits_to_text_edits, path_to_uri};
 use crate::state::SatzState;
@@ -93,6 +96,12 @@ pub struct FormatChange {
     pub uri: Uri,
     pub formatted: String,
     pub edits: Vec<TextEdit>,
+    /// Version of the open document the edits were computed against (`None`: a file on disk).
+    pub version: Option<i32>,
+    /// `content_hash` of the text the edits were computed against.
+    pub source_hash: u64,
+    /// The key of the open document in `SatzState::open_docs`, if it is open.
+    pub open_key: Option<String>,
 }
 
 /// Result of scanning the vault for formatting changes: the changes themselves (used to build
@@ -126,8 +135,16 @@ pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
     let mut cache_updates = Vec::new();
 
     for doc in state.index.documents() {
-        let source = doc.line_index.source();
-        let hash = doc.content_hash;
+        // An open document is formatted from its LIVE buffer: the index holds the text of the last
+        // (debounced) reparse, which the user may already have typed past.
+        let open = state.open_doc_for_path(&doc.path);
+        let live_text: Option<String> = open.map(|(_, open_doc)| open_doc.rope.to_string());
+        let live_index: Option<satz_core::LineIndex> =
+            live_text.as_deref().map(satz_core::LineIndex::new);
+        let (source, hash, line_index) = match (&live_text, &live_index) {
+            (Some(text), Some(index)) => (text.as_str(), satz_core::content_hash(text), index),
+            _ => (doc.line_index.source(), doc.content_hash, &doc.line_index),
+        };
         if state.format_cache.is_unchanged(hash) {
             continue; // known to be formatted already
         }
@@ -146,27 +163,57 @@ pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
             continue;
         }
 
-        let doc_path = match &state.vault_root {
-            Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-            _ => doc.path.clone(),
-        };
-        let Some(uri) = path_to_uri(&doc_path) else {
-            continue;
+        // The client is addressed with the URI it opened the document with.
+        let uri = match open.and_then(|(_, open_doc)| open_doc.uri.parse::<Uri>().ok()) {
+            Some(uri) => uri,
+            None => {
+                let doc_path = match &state.vault_root {
+                    Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
+                    _ => doc.path.clone(),
+                };
+                let Some(uri) = path_to_uri(&doc_path) else {
+                    continue;
+                };
+                uri
+            }
         };
 
         let line_edits = line_diff(source, &formatted);
-        let edits = line_edits_to_text_edits(&doc.line_index, &line_edits);
+        let edits = line_edits_to_text_edits(line_index, &line_edits);
 
         changes.push(FormatChange {
             uri,
             formatted,
             edits,
+            version: open.map(|(_, open_doc)| open_doc.version),
+            source_hash: hash,
+            open_key: open.map(|(key, _)| key.clone()),
         });
     }
 
     FormatWorkspaceResult {
         changes,
         cache_updates,
+    }
+}
+
+/// Like `build_workspace_edit`, as versioned document edits: an open document names the version its
+/// edits were computed against, so the client REJECTS them if the user has typed since, instead of
+// applying them to text they do not fit. Files on disk carry no version.
+pub fn build_workspace_edit_versioned(changes: &[FormatChange]) -> WorkspaceEdit {
+    let edits: Vec<TextDocumentEdit> = changes
+        .iter()
+        .map(|change| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                uri: change.uri.clone(),
+                version: change.version,
+            },
+            edits: change.edits.iter().cloned().map(OneOf::Left).collect(),
+        })
+        .collect();
+    WorkspaceEdit {
+        document_changes: Some(DocumentChanges::Edits(edits)),
+        ..Default::default()
     }
 }
 
@@ -504,5 +551,199 @@ mod tests {
                 "{command} is advertised but nothing handles it"
             );
         }
+    }
+
+    // ---- open documents: the live buffer is formatted, and the edit carries its version ----
+
+    fn root_dir() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from("C:\\")
+        } else {
+            std::path::PathBuf::from("/")
+        }
+    }
+
+    /// A vault with `a.md` open at `version` whose buffer is `buffer`, while the index still holds
+    /// `indexed` (the debounced reparse has not run yet).
+    fn open_state(indexed: &str, buffer: &str, version: i32) -> (SatzState, String) {
+        let mut state = SatzState {
+            vault_root: Some(root_dir()),
+            ..SatzState::default()
+        };
+        let uri = uri_for("a.md");
+        state.open_document(&uri, indexed, &root_dir().join("a.md"), 1);
+        let open = state.open_docs.get_mut(&uri).unwrap();
+        open.rope = ropey::Rope::from_str(buffer);
+        open.version = version;
+        (state, uri)
+    }
+
+    #[test]
+    fn an_open_document_is_formatted_from_its_live_buffer_not_the_stale_index() {
+        let (state, uri) = open_state(
+            "# A\n\nclean\n",
+            "# A\n\ntyped just now   \n\n\n\nmore   \n",
+            7,
+        );
+        let result = compute_format_changes(&state);
+        assert_eq!(result.changes.len(), 1);
+        let change = &result.changes[0];
+        assert_eq!(change.formatted, "# A\n\ntyped just now\n\nmore\n");
+        assert_eq!(change.version, Some(7));
+        assert_eq!(change.open_key.as_deref(), Some(uri.as_str()));
+        // The edits turn exactly the live text into the formatted text.
+        let live = "# A\n\ntyped just now   \n\n\n\nmore   \n";
+        assert_eq!(
+            crate::convert::apply_text_edits(live, &change.edits),
+            change.formatted
+        );
+    }
+
+    #[test]
+    fn an_open_document_that_is_already_formatted_produces_nothing_even_if_the_index_is_dirty() {
+        let (state, _) = open_state("dirty   \n\n\n\nindex", "# A\n\nclean\n", 4);
+        assert!(compute_format_changes(&state).changes.is_empty());
+    }
+
+    #[test]
+    fn a_closed_document_is_formatted_from_the_index_and_has_no_version() {
+        let dirty = parse_document("Line 1   \n\n\n\nLine 2   ", Path::new("dirty.md"));
+        let state = state_with(vec![dirty]);
+        let result = compute_format_changes(&state);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].version, None);
+        assert_eq!(result.changes[0].open_key, None);
+    }
+
+    #[test]
+    fn a_crlf_buffer_is_formatted_like_its_lf_twin_and_the_edits_fit_the_live_text() {
+        let live = "# A\r\n\r\ntyped   \r\n\r\n\r\n\r\nmore\r\n";
+        let (state, _) = open_state("# A\n", live, 2);
+        let change = &compute_format_changes(&state).changes[0];
+        assert_eq!(change.formatted, "# A\r\n\r\ntyped\r\n\r\nmore\r\n");
+        assert_eq!(
+            crate::convert::apply_text_edits(live, &change.edits),
+            change.formatted
+        );
+    }
+
+    #[test]
+    fn the_client_is_addressed_with_the_uri_it_opened_the_document_with() {
+        // The client spells a Windows drive differently from how a path turns back into a URI.
+        let client_uri = "file:///c%3A/notes/a.md".to_string();
+        let path = if cfg!(windows) {
+            std::path::PathBuf::from("C:\\notes\\a.md")
+        } else {
+            std::path::PathBuf::from("/notes/a.md")
+        };
+        let mut state = SatzState {
+            vault_root: path.parent().map(|p| p.to_path_buf()),
+            ..SatzState::default()
+        };
+        state.open_document(&client_uri, "dirty   \n\n\n\nx\n", &path, 3);
+        let change = &compute_format_changes(&state).changes[0];
+        assert_eq!(
+            change.uri.as_str(),
+            client_uri,
+            "the open document's own URI"
+        );
+        assert_eq!(change.open_key.as_deref(), Some(client_uri.as_str()));
+    }
+
+    #[test]
+    fn the_versioned_edit_names_the_version_of_open_documents_only() {
+        use tower_lsp_server::ls_types::{DocumentChanges, OneOf};
+        let (mut state, uri) = open_state("# A\n", "# A\n\n\n\ntext   \n", 9);
+        state.index.replace_doc(parse_document(
+            "Line 1   \n\n\n\nLine 2   ",
+            Path::new("closed.md"),
+        ));
+        let changes = compute_format_changes(&state).changes;
+        assert_eq!(changes.len(), 2);
+
+        let edit = build_workspace_edit_versioned(&changes);
+        assert!(edit.changes.is_none(), "only the versioned form is used");
+        let Some(DocumentChanges::Edits(edits)) = edit.document_changes else {
+            panic!("expected versioned text document edits");
+        };
+        assert_eq!(edits.len(), 2);
+        for e in &edits {
+            let is_open = e.text_document.uri.as_str() == uri;
+            assert_eq!(
+                e.text_document.version,
+                if is_open { Some(9) } else { None }
+            );
+            assert!(!e.edits.is_empty());
+            assert!(e.edits.iter().all(|edit| matches!(edit, OneOf::Left(_))));
+        }
+        // The same text edits as the unversioned form, file for file.
+        let plain = build_workspace_edit(&changes).changes.unwrap();
+        for e in &edits {
+            let plain_edits = &plain[&e.text_document.uri];
+            let versioned: Vec<_> = e
+                .edits
+                .iter()
+                .map(|o| match o {
+                    OneOf::Left(t) => t.clone(),
+                    OneOf::Right(a) => a.text_edit.clone(),
+                })
+                .collect();
+            assert_eq!(&versioned, plain_edits);
+        }
+    }
+
+    #[test]
+    fn the_cache_is_keyed_by_the_text_that_was_formatted() {
+        let (mut state, _) = open_state("# A\n", "# A\n\n\n\ntext   \n", 2);
+        let result = compute_format_changes(&state);
+        state.apply_format_cache_updates(result.cache_updates);
+        // The live buffer's hash is remembered (not pruned as "no document has this text").
+        let again = compute_format_changes(&state);
+        assert_eq!(again.changes.len(), 1);
+        assert!(again.cache_updates.is_empty(), "served from the cache");
+    }
+
+    #[test]
+    fn a_buffers_cache_entry_survives_the_next_pass() {
+        let (mut state, _) = open_state("# A\n", "# A\n\n\n\ntext   \n", 2);
+        for pass in 0..3 {
+            let result = compute_format_changes(&state);
+            assert_eq!(result.changes.len(), 1, "pass {pass}");
+            if pass > 0 {
+                assert!(
+                    result.cache_updates.is_empty(),
+                    "pass {pass} is served from the cache"
+                );
+            }
+            state.apply_format_cache_updates(result.cache_updates);
+        }
+        assert_eq!(state.format_cache.len(), 1);
+    }
+
+    #[test]
+    fn a_formatted_buffer_is_remembered_as_unchanged() {
+        let (mut state, _) = open_state("dirty   \n\n\n\nindex", "# A\n\nclean\n", 2);
+        let result = compute_format_changes(&state);
+        assert!(result.changes.is_empty());
+        state.apply_format_cache_updates(result.cache_updates);
+        let hash = satz_core::content_hash("# A\n\nclean\n");
+        assert!(state.format_cache.is_unchanged(hash));
+    }
+
+    #[test]
+    fn the_edit_is_meant_for_the_buffer_it_was_computed_from_not_for_formatted_text() {
+        // Why the server leaves an open buffer alone after `applyEdit`: the client reports the edit
+        // as a `didChange`, and the same edit applied to text that is already formatted is wrong.
+        let live = "# A\n\n\n\ntext   \n\n\nmore   \n";
+        let (state, _) = open_state("# A\n", live, 2);
+        let change = &compute_format_changes(&state).changes[0];
+        assert_eq!(
+            crate::convert::apply_text_edits(live, &change.edits),
+            change.formatted
+        );
+        assert_ne!(
+            crate::convert::apply_text_edits(&change.formatted, &change.edits),
+            change.formatted
+        );
     }
 }
