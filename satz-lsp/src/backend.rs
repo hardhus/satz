@@ -1869,13 +1869,18 @@ mod tests {
         assert!(!client_supports_semantic_tokens(
             &ClientCapabilities::default()
         ));
-        let mut caps = ClientCapabilities::default();
-        caps.text_document = Some(TextDocumentClientCapabilities::default());
-        assert!(!client_supports_semantic_tokens(&caps));
-        caps.text_document = Some(TextDocumentClientCapabilities {
-            semantic_tokens: Some(SemanticTokensClientCapabilities::default()),
+        let caps = ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities::default()),
             ..Default::default()
-        });
+        };
+        assert!(!client_supports_semantic_tokens(&caps));
+        let caps = ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
+                semantic_tokens: Some(SemanticTokensClientCapabilities::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         assert!(client_supports_semantic_tokens(&caps));
         // `refreshSupport` of the workspace part is a different thing and changes nothing here.
         let workspace_only = ClientCapabilities {
