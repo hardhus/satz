@@ -63,6 +63,71 @@ pub(crate) fn refresh_succeeded<T, E: std::fmt::Display>(
     }
 }
 
+/// How long a `semanticTokens/full` request may wait for the first indexing to finish.
+pub(crate) const FIRST_INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a refresh request may wait for the client's answer.
+pub(crate) const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits until the first indexing has finished (at most `limit`), and says how long it waited.
+///
+/// A note opened while the vault is still being indexed is coloured from an incomplete index (its
+/// links look unresolved). Answering the first colour request only once the index is complete makes
+/// that first answer right, so the colours no longer depend on the client acting on a refresh
+/// request afterwards. The state lock is never held while waiting.
+pub(crate) async fn wait_for_first_index(
+    state: &Arc<RwLock<SatzState>>,
+    limit: std::time::Duration,
+    every: std::time::Duration,
+) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    while !state.read().await.is_indexing_complete() {
+        if started.elapsed() >= limit {
+            break;
+        }
+        tokio::time::sleep(every).await;
+    }
+    started.elapsed()
+}
+
+/// How a refresh request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshOutcome {
+    Answered,
+    Failed,
+    TimedOut,
+}
+
+/// Sends a refresh request and waits for the answer, at most `limit`: a client that never answers
+/// must not hold back what comes after (the other refresh, for instance).
+pub(crate) async fn send_refresh<F, T, E>(
+    what: &str,
+    request: F,
+    limit: std::time::Duration,
+) -> RefreshOutcome
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let started = std::time::Instant::now();
+    tracing::debug!(request = what, "sending a refresh request");
+    match tokio::time::timeout(limit, request).await {
+        Ok(result) => {
+            let ok = refresh_succeeded(what, &result);
+            tracing::debug!(request = what, ok, took = ?started.elapsed(), "refresh request answered");
+            if ok {
+                RefreshOutcome::Answered
+            } else {
+                RefreshOutcome::Failed
+            }
+        }
+        Err(_) => {
+            tracing::debug!(request = what, after = ?limit, "refresh request not answered in time");
+            RefreshOutcome::TimedOut
+        }
+    }
+}
+
 /// Whether `workspace/diagnostic/refresh` is worth sending: to a client that pulls diagnostics.
 /// `refreshSupport` is not required: many clients answer the request (or ignore it harmlessly)
 /// without announcing it, and the refresh after the first indexing is what makes them fetch again.
@@ -83,16 +148,24 @@ pub(crate) fn semantic_tokens_refresh_wanted(_state: &SatzState) -> bool {
 /// Asks a pull-diagnostics client to fetch again.
 pub(crate) async fn refresh_diagnostics(client: &Client, state: &Arc<RwLock<SatzState>>) {
     if diagnostic_refresh_wanted(&*state.read().await) {
-        let result = client.send_request::<WorkspaceDiagnosticRefresh>(()).await;
-        refresh_succeeded("workspace/diagnostic/refresh", &result);
+        send_refresh(
+            "workspace/diagnostic/refresh",
+            client.send_request::<WorkspaceDiagnosticRefresh>(()),
+            REFRESH_TIMEOUT,
+        )
+        .await;
     }
 }
 
 /// Asks the client to fetch semantic tokens again.
 pub(crate) async fn refresh_semantic_tokens(client: &Client, state: &Arc<RwLock<SatzState>>) {
     if semantic_tokens_refresh_wanted(&*state.read().await) {
-        let result = client.send_request::<SemanticTokensRefresh>(()).await;
-        refresh_succeeded("workspace/semanticTokens/refresh", &result);
+        send_refresh(
+            "workspace/semanticTokens/refresh",
+            client.send_request::<SemanticTokensRefresh>(()),
+            REFRESH_TIMEOUT,
+        )
+        .await;
     }
 }
 
@@ -190,17 +263,25 @@ async fn run_reparse(
     publish_for(&client, &state_arc, &uri).await;
 
     let plan = refresh_after_reparse(peers.dirty, peers.supports_pull);
-    if plan.pull_diagnostics {
-        refresh_diagnostics(&client, &state_arc).await;
-    }
     if plan.push_peers {
         for other_uri in &peers.others {
             publish_for(&client, &state_arc, other_uri).await;
         }
     }
-    if plan.semantic_tokens {
-        refresh_semantic_tokens(&client, &state_arc).await;
-    }
+    // Neither refresh waits for the other: a client that never answers one must not keep the
+    // other from being sent.
+    tokio::join!(
+        async {
+            if plan.semantic_tokens {
+                refresh_semantic_tokens(&client, &state_arc).await;
+            }
+        },
+        async {
+            if plan.pull_diagnostics {
+                refresh_diagnostics(&client, &state_arc).await;
+            }
+        }
+    );
 }
 
 /// Which folder the server indexes, and which of the client's workspace folders it leaves out.
@@ -484,9 +565,7 @@ impl LanguageServer for Backend {
                     )
                 };
 
-                if supports_pull {
-                    refresh_diagnostics(&client, &state_arc).await;
-                } else {
+                if !supports_pull {
                     for uri in uris {
                         publish_for(&client, &state_arc, &uri).await;
                     }
@@ -494,10 +573,14 @@ impl LanguageServer for Backend {
 
                 // Any document opened before indexing finished had its links colored against a
                 // still-partial index (peers not yet indexed resolve as missing), so its semantic
-                // tokens may be stale/wrong now that the full index is in place. Unconditional
-                // (unlike the diagnostics push above, which branches on pull-vs-push support) --
-                // this is a separate capability a client simply ignores if it never declared support.
-                refresh_semantic_tokens(&client, &state_arc).await;
+                // tokens and diagnostics may be wrong now that the full index is in place. Both
+                // refreshes go out at once and neither waits for the other's answer: a client that
+                // never answers `workspace/diagnostic/refresh` must not keep the colours stale.
+                tokio::join!(refresh_semantic_tokens(&client, &state_arc), async {
+                    if supports_pull {
+                        refresh_diagnostics(&client, &state_arc).await;
+                    }
+                });
             });
         } else {
             // No workspace root at all: there is no vault to walk, so there is nothing for
@@ -745,10 +828,27 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
+        // Asked while the vault is still being indexed: wait for it (bounded), so the first colours
+        // are computed from the complete index and not from a partial one.
+        let waited = wait_for_first_index(
+            &self.state,
+            FIRST_INDEX_WAIT,
+            std::time::Duration::from_millis(25),
+        )
+        .await;
         let state = self.read_fresh().await;
-        Ok(crate::handlers::semantic_tokens::semantic_tokens_full(
-            params, &state,
-        ))
+        let answer = crate::handlers::semantic_tokens::semantic_tokens_full(params, &state);
+        if let Some(SemanticTokensResult::Tokens(tokens)) = &answer {
+            let unresolved = tokens.data.iter().filter(|t| t.token_type == 1).count();
+            tracing::debug!(
+                indexing_complete = state.is_indexing_complete(),
+                ?waited,
+                tokens = tokens.data.len(),
+                unresolved_links = unresolved,
+                "semantic_tokens_full"
+            );
+        }
+        Ok(answer)
     }
 
     async fn formatting(
@@ -1873,5 +1973,136 @@ mod tests {
         assert!(diagnostic_refresh_wanted(&state_with(true, true, true)));
         assert!(!diagnostic_refresh_wanted(&state_with(false, true, true)));
         assert!(!diagnostic_refresh_wanted(&SatzState::default()));
+    }
+
+    // ---- the first colours are right, and the refreshes do not wait for each other ----
+
+    fn quick() -> std::time::Duration {
+        std::time::Duration::from_millis(10)
+    }
+
+    #[tokio::test]
+    async fn nothing_is_waited_for_when_the_first_indexing_is_done() {
+        let (backend, _service) = shared_backend().await;
+        let started = std::time::Instant::now();
+        let waited =
+            wait_for_first_index(&backend.state, std::time::Duration::from_secs(5), quick()).await;
+        assert!(waited < std::time::Duration::from_millis(50), "{waited:?}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn the_wait_ends_when_the_indexing_finishes_and_gives_up_at_the_limit() {
+        let (backend, _service) = shared_backend().await;
+        backend.state.write().await.set_indexing_complete(false);
+        let state = backend.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            state.write().await.set_indexing_complete(true);
+        });
+        let waited =
+            wait_for_first_index(&backend.state, std::time::Duration::from_secs(5), quick()).await;
+        assert!(
+            waited >= std::time::Duration::from_millis(100)
+                && waited < std::time::Duration::from_secs(2),
+            "{waited:?}"
+        );
+        // Never finishing: the wait stops at the limit, it never hangs.
+        backend.state.write().await.set_indexing_complete(false);
+        let waited = wait_for_first_index(
+            &backend.state,
+            std::time::Duration::from_millis(150),
+            quick(),
+        )
+        .await;
+        assert!(
+            waited >= std::time::Duration::from_millis(140)
+                && waited < std::time::Duration::from_secs(2),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_answer_of_a_note_opened_during_indexing_has_its_links_resolved() {
+        // `a.md` links to `b`, which the index only learns about when the first indexing finishes.
+        // A client that asks for colours right after opening the note must get the finished ones.
+        let (backend, _service) = shared_backend().await;
+        {
+            let mut state = backend.state.write().await;
+            state.set_indexing_complete(false);
+            type_full(&mut state, "file:///a.md", 2, "# A\n\nsee [[b]] here\n");
+        }
+        let state = backend.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let mut state = state.write().await;
+            state.index.replace_doc(satz_core::parse_document(
+                "# B\n",
+                std::path::Path::new("b.md"),
+            ));
+            state.set_indexing_complete(true);
+        });
+        let answer = backend
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier {
+                    uri: "file:///a.md".parse().unwrap(),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        let Some(SemanticTokensResult::Tokens(tokens)) = answer else {
+            panic!("tokens expected");
+        };
+        let link_types: Vec<u32> = tokens
+            .data
+            .iter()
+            .map(|t| t.token_type)
+            .filter(|t| *t <= 1)
+            .collect();
+        assert_eq!(
+            link_types,
+            vec![0],
+            "one link token, resolved (0), not unresolved (1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_is_never_answered_times_out_and_does_not_hold_back_another() {
+        let started = std::time::Instant::now();
+        let never = send_refresh(
+            "a",
+            std::future::pending::<Result<(), String>>(),
+            std::time::Duration::from_millis(200),
+        );
+        let quick_one = async {
+            let outcome = send_refresh(
+                "b",
+                async { Ok::<(), String>(()) },
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            (outcome, started.elapsed())
+        };
+        let (never_outcome, (quick_outcome, quick_took)) = tokio::join!(never, quick_one);
+        assert_eq!(never_outcome, RefreshOutcome::TimedOut);
+        assert_eq!(quick_outcome, RefreshOutcome::Answered);
+        assert!(
+            quick_took < std::time::Duration::from_millis(100),
+            "{quick_took:?}"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(190));
+    }
+
+    #[tokio::test]
+    async fn an_error_answer_is_reported_as_failed_not_as_answered() {
+        let outcome = send_refresh(
+            "x",
+            async { Err::<(), _>("method not found") },
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(outcome, RefreshOutcome::Failed);
     }
 }
