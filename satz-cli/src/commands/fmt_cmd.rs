@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -40,6 +41,12 @@ struct FileResult {
 }
 
 pub fn run(args: FmtArgs) -> Result<Outcome> {
+    super::with_stdout(|out| run_with_output(args, out))
+}
+
+/// `run`, writing the file list and summary that go to stdout to `out` (the summary of files that
+/// need formatting and the write errors go to stderr).
+pub fn run_with_output(args: FmtArgs, out: &mut dyn Write) -> Result<Outcome> {
     let vault_root = super::vault_dir(&args.path)?;
 
     // A config that exists but can't be used must stop the run: formatting with defaults would
@@ -47,7 +54,10 @@ pub fn run(args: FmtArgs) -> Result<Outcome> {
     let config = super::load_config(&vault_root)?;
 
     if !config.formatter.enabled {
-        println!("Formatter is disabled (formatter.enabled = false in .satz.toml); nothing to do.");
+        writeln!(
+            out,
+            "Formatter is disabled (formatter.enabled = false in .satz.toml); nothing to do."
+        )?;
         return Ok(Outcome::Clean);
     }
 
@@ -105,7 +115,7 @@ pub fn run(args: FmtArgs) -> Result<Outcome> {
 
     if check_only {
         for r in results.iter().filter(|r| r.changed) {
-            println!("{}", r.rel_path.display());
+            writeln!(out, "{}", r.rel_path.display())?;
         }
 
         if changed_count > 0 {
@@ -118,18 +128,20 @@ pub fn run(args: FmtArgs) -> Result<Outcome> {
             return Ok(Outcome::NeedsFormatting);
         }
 
-        println!(
+        writeln!(
+            out,
             "✓ all {} file(s) already formatted ({:.0}ms)",
             clean_count,
             elapsed.as_millis()
-        );
+        )?;
     } else {
-        println!(
+        writeln!(
+            out,
             "✓ {} file(s) formatted, {} file(s) already clean ({:.0}ms)",
             changed_count,
             clean_count,
             elapsed.as_millis()
-        );
+        )?;
     }
 
     let failures: Vec<&FileResult> = results.iter().filter(|r| r.write_error.is_some()).collect();

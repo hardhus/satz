@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
@@ -12,6 +13,11 @@ pub struct ResolveArgs {
 }
 
 pub fn run(args: ResolveArgs) -> Result<()> {
+    super::with_stdout(|out| run_with_output(args, out))
+}
+
+/// `run`, writing the resolved path to `out`.
+pub fn run_with_output(args: ResolveArgs, out: &mut dyn Write) -> Result<()> {
     let index = super::load_index(&args.vault)?;
 
     // Strip [[ and ]] if present
@@ -42,12 +48,12 @@ pub fn run(args: ResolveArgs) -> Result<()> {
             .find(|h| h.slug == heading_text || h.text.eq_ignore_ascii_case(heading_text))
         {
             let pos = doc.line_index.byte_to_position(h.range.start);
-            println!("{}:{}", path.display(), pos.line + 1);
+            writeln!(out, "{}:{}", path.display(), pos.line + 1)?;
         } else {
-            println!("{}", path.display());
+            writeln!(out, "{}", path.display())?;
         }
     } else {
-        println!("{}", path.display());
+        writeln!(out, "{}", path.display())?;
     }
 
     Ok(())

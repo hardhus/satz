@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -26,6 +27,12 @@ pub struct GraphArgs {
 }
 
 pub fn run(args: GraphArgs) -> Result<()> {
+    super::with_stdout(|out| run_with_output(args, out))
+}
+
+/// `run`, writing the graph to `out` unless `--output` names a file (the summary of that goes to
+/// stderr).
+pub fn run_with_output(args: GraphArgs, out: &mut dyn Write) -> Result<()> {
     let index = super::load_index(&args.vault)?;
     let graph = VaultGraph::build(&index);
 
@@ -43,7 +50,7 @@ pub fn run(args: GraphArgs) -> Result<()> {
             graph.edge_count()
         );
     } else {
-        println!("{}", output_str);
+        writeln!(out, "{}", output_str)?;
     }
 
     Ok(())

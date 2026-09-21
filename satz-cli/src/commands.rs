@@ -6,9 +6,67 @@ pub mod list_cmd;
 pub mod resolve_cmd;
 pub mod stats_cmd;
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+
+/// A writer that takes a closed pipe in stride: once the reader is gone (`satz list | head`), the
+/// rest of the output goes nowhere and the command carries on to its own result and exit code.
+/// `println!` would panic there (exit code 101). Every other write error is passed on.
+pub(crate) struct QuietPipe<W: Write> {
+    inner: W,
+    closed: bool,
+}
+
+impl<W: Write> QuietPipe<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            closed: false,
+        }
+    }
+
+    /// Runs one write on the inner writer unless the pipe is closed already; a broken pipe closes
+    /// it and counts as written.
+    fn quietly<T>(
+        &mut self,
+        on_closed: T,
+        write: impl FnOnce(&mut W) -> io::Result<T>,
+    ) -> io::Result<T> {
+        if self.closed {
+            return Ok(on_closed);
+        }
+        match write(&mut self.inner) {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                self.closed = true;
+                Ok(on_closed)
+            }
+            other => other,
+        }
+    }
+}
+
+impl<W: Write> Write for QuietPipe<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.quietly(buf.len(), |inner| inner.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.quietly((), |inner| inner.flush())
+    }
+}
+
+/// Runs `body` with a writer for stdout that survives a reader that went away. The output stays
+/// line-buffered (std's), so it comes out in step with what a command writes to stderr.
+pub(crate) fn with_stdout<T>(body: impl FnOnce(&mut dyn Write) -> Result<T>) -> Result<T> {
+    let mut out = QuietPipe::new(io::stdout().lock());
+    let result = body(&mut out);
+    let flushed = out.flush();
+    let value = result?;
+    flushed?;
+    Ok(value)
+}
 
 /// Validates the vault directory and indexes every note in it: the loading step shared by `index`,
 /// `stats`, `list`, `resolve` and `graph`, so all of them report a bad vault path the same way.
@@ -106,6 +164,91 @@ mod tests {
                 "not idempotent for {input:?}"
             );
         }
+    }
+
+    /// Accepts `room` bytes, then fails every call with `kind`.
+    struct Failing {
+        kept: Vec<u8>,
+        room: usize,
+        kind: io::ErrorKind,
+    }
+
+    impl Write for Failing {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.kept.len() >= self.room {
+                return Err(io::Error::new(self.kind, "reader is gone"));
+            }
+            let n = buf.len().min(self.room - self.kept.len());
+            self.kept.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.kept.len() >= self.room {
+                return Err(io::Error::new(self.kind, "reader is gone"));
+            }
+            Ok(())
+        }
+    }
+
+    fn failing(room: usize, kind: io::ErrorKind) -> QuietPipe<Failing> {
+        QuietPipe::new(Failing {
+            kept: Vec::new(),
+            room,
+            kind,
+        })
+    }
+
+    #[test]
+    fn a_closed_pipe_swallows_the_rest_of_the_output_without_an_error() {
+        let mut out = failing(5, io::ErrorKind::BrokenPipe);
+        writeln!(out, "abc").unwrap(); // 4 bytes: fits
+        writeln!(out, "defgh").unwrap(); // room for one byte, then the pipe breaks
+        writeln!(out, "ijk").unwrap(); // closed: nothing reaches the inner writer, no error
+        out.flush().unwrap();
+        assert!(out.closed);
+        assert_eq!(
+            out.inner.kept, b"abc\nd",
+            "only what was written before it broke"
+        );
+    }
+
+    #[test]
+    fn any_other_write_error_is_passed_on() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::OutOfMemory,
+        ] {
+            let mut out = failing(0, kind);
+            let e = writeln!(out, "x").unwrap_err();
+            assert_eq!(e.kind(), kind, "a {kind:?} error must not be swallowed");
+            assert!(!out.closed, "{kind:?}");
+            assert_eq!(out.flush().unwrap_err().kind(), kind, "flush, {kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_pipe_that_broke_reports_every_byte_of_later_writes_as_written() {
+        let mut out = failing(0, io::ErrorKind::BrokenPipe);
+        assert_eq!(out.write(b"hello").unwrap(), 5);
+        assert_eq!(out.write(b"").unwrap(), 0);
+        assert_eq!(
+            out.write(b"more").unwrap(),
+            4,
+            "closed: all of it counts as written"
+        );
+        out.write_all(b"and write_all does not loop for ever")
+            .unwrap();
+        assert!(out.closed);
+    }
+
+    #[test]
+    fn what_the_body_of_with_stdout_fails_with_is_kept() {
+        let e = with_stdout::<()>(|_| bail!("the command's own error")).unwrap_err();
+        assert_eq!(e.to_string(), "the command's own error");
+        assert_eq!(with_stdout(|_| Ok(7)).unwrap(), 7);
     }
 
     fn temp(tag: &str) -> PathBuf {

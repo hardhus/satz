@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -18,6 +19,11 @@ pub struct DailyArgs {
 }
 
 pub fn run(args: DailyArgs) -> Result<()> {
+    super::with_stdout(|out| run_with_output(args, out))
+}
+
+/// `run`, writing the path of the daily note to `out`.
+pub fn run_with_output(args: DailyArgs, out: &mut dyn Write) -> Result<()> {
     let vault_root = super::vault_dir(&args.path)?;
 
     // A config that exists but can't be used is an error, never a silent fallback to defaults.
@@ -60,7 +66,7 @@ pub fn run(args: DailyArgs) -> Result<()> {
             .with_context(|| format!("Failed to write daily note at {}", target_file.display()))?;
     }
 
-    println!("{}", target_file.display());
+    writeln!(out, "{}", target_file.display())?;
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
@@ -13,20 +14,25 @@ pub struct StatsArgs {
 }
 
 pub fn run(args: StatsArgs) -> Result<()> {
+    super::with_stdout(|out| run_with_output(args, out))
+}
+
+/// `run`, writing what `satz stats` prints to `out`.
+pub fn run_with_output(args: StatsArgs, out: &mut dyn Write) -> Result<()> {
     let index = super::load_index(&args.vault)?;
     let stats = index.stats();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&stats)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&stats)?)?;
     } else {
-        println!("Vault Stats: {}", args.vault.display());
-        println!("  Documents:    {}", stats.doc_count);
-        println!("  Total links:  {}", stats.total_links);
-        println!("  Broken links: {}", stats.broken_links);
-        println!("  Unique tags:  {}", stats.unique_tags);
-        println!("  Orphan docs:  {}", stats.orphan_docs);
-        println!("  Headings:     {}", stats.total_headings);
-        println!("  ~Words:       {}", format_number(stats.total_words));
+        writeln!(out, "Vault Stats: {}", args.vault.display())?;
+        writeln!(out, "  Documents:    {}", stats.doc_count)?;
+        writeln!(out, "  Total links:  {}", stats.total_links)?;
+        writeln!(out, "  Broken links: {}", stats.broken_links)?;
+        writeln!(out, "  Unique tags:  {}", stats.unique_tags)?;
+        writeln!(out, "  Orphan docs:  {}", stats.orphan_docs)?;
+        writeln!(out, "  Headings:     {}", stats.total_headings)?;
+        writeln!(out, "  ~Words:       {}", format_number(stats.total_words))?;
     }
 
     Ok(())

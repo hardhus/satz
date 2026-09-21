@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::HashSet;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]
@@ -22,7 +23,14 @@ pub struct ListArgs {
 }
 
 pub fn run(args: ListArgs) -> Result<()> {
+    super::with_stdout(|out| run_with_output(args, out))
+}
+
+/// `run`, writing what `satz list` prints to `out`.
+pub fn run_with_output(args: ListArgs, out: &mut dyn Write) -> Result<()> {
     let index = super::load_index(&args.vault)?;
+    // Many lines can follow: they go out in blocks (nothing is written to stderr meanwhile).
+    let mut out = BufWriter::new(out);
 
     // The documents the filters leave; `--broken` looks only at those, like the plain listing.
     let mut results: Vec<_> = index.documents().collect();
@@ -68,15 +76,17 @@ pub fn run(args: ListArgs) -> Result<()> {
                     satz_core::LinkResolution::Resolved { .. } => continue,
                 };
 
-                println!(
+                writeln!(
+                    out,
                     "{}:{}\t{}\t— {}",
                     doc.path.display(),
                     line_no,
                     link_repr,
                     reason
-                );
+                )?;
             }
         }
+        out.flush()?;
         return Ok(());
     }
 
@@ -87,8 +97,9 @@ pub fn run(args: ListArgs) -> Result<()> {
     paths.sort();
 
     for p in paths {
-        println!("{}", p);
+        writeln!(out, "{}", p)?;
     }
+    out.flush()?;
 
     Ok(())
 }

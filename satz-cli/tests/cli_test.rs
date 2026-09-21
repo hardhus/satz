@@ -1112,3 +1112,239 @@ fn fmt_follows_the_vault_configuration() {
     assert!(off.status.success());
     assert_eq!(snapshot(v.path()), before);
 }
+
+// ---- a reader that goes away (`satz list | head`) ----
+
+/// Runs `satz` with its stdout piped and the reading end closed at once: whatever the command
+/// writes fails with a broken pipe (it indexes the vault first, which takes longer than closing).
+fn run_with_a_closed_stdout(args: &[&str]) -> std::process::Output {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_satz"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("satz binary should execute");
+    drop(child.stdout.take());
+    child.wait_with_output().expect("satz finishes")
+}
+
+#[test]
+fn commands_end_quietly_when_the_reader_of_stdout_has_gone_away() {
+    // (label, args with VAULT, exit code the command has on its own, vault with a note to format)
+    let cases: &[(&str, &[&str], i32, bool)] = &[
+        ("list", &["list", "-v", "VAULT"], 0, false),
+        (
+            "list --orphans",
+            &["list", "-v", "VAULT", "--orphans"],
+            0,
+            false,
+        ),
+        (
+            "list --tag",
+            &["list", "-v", "VAULT", "--tag", "x"],
+            0,
+            false,
+        ),
+        (
+            "list --broken",
+            &["list", "-v", "VAULT", "--broken"],
+            0,
+            false,
+        ),
+        ("stats", &["stats", "-v", "VAULT"], 0, false),
+        (
+            "stats --json",
+            &["stats", "-v", "VAULT", "--json"],
+            0,
+            false,
+        ),
+        ("index", &["index", "VAULT"], 0, false),
+        ("graph json", &["graph", "-v", "VAULT"], 0, false),
+        (
+            "graph dot",
+            &["graph", "-v", "VAULT", "-f", "dot"],
+            0,
+            false,
+        ),
+        ("resolve", &["resolve", "-v", "VAULT", "b"], 0, false),
+        ("daily", &["daily", "VAULT"], 0, false),
+        // The exit code is the command's own result, not the pipe's: a script that checks
+        // `fmt --check | head` with pipefail must still see "files need formatting".
+        (
+            "fmt --check, one file to format",
+            &["fmt", "VAULT", "--check"],
+            1,
+            true,
+        ),
+        (
+            "fmt --check, all clean",
+            &["fmt", "VAULT", "--check"],
+            0,
+            false,
+        ),
+        ("fmt", &["fmt", "VAULT"], 0, true),
+    ];
+    for (label, template, expected_code, with_dirty_note) in cases {
+        let v = small_vault("closed_pipe");
+        v.write("broken.md", "# Broken\n\n[[nothing-here]]\n");
+        if *with_dirty_note {
+            v.write("dirty.md", DIRTY);
+        }
+        let args: Vec<&str> = template
+            .iter()
+            .map(|a| if *a == "VAULT" { v.str() } else { *a })
+            .collect();
+
+        let o = run_with_a_closed_stdout(&args);
+
+        assert_eq!(
+            o.status.code(),
+            Some(*expected_code),
+            "{label}: stderr: {}",
+            err(&o)
+        );
+        assert!(
+            !err(&o).contains("panicked") && !err(&o).contains("failed printing"),
+            "{label}: stderr: {}",
+            err(&o)
+        );
+        // The work is done, only the report had no reader.
+        match *label {
+            "daily" => assert!(
+                v.path()
+                    .join("daily")
+                    .join(format!("{}.md", today()))
+                    .exists(),
+                "the daily note was still created"
+            ),
+            "fmt" => assert_eq!(
+                v.read("dirty.md"),
+                DIRTY_FORMATTED.as_bytes(),
+                "the note was still formatted"
+            ),
+            _ => {}
+        }
+    }
+}
+
+// ---- the commands as a library: the output goes to the writer that is given ----
+
+fn text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).expect("the output is UTF-8")
+}
+
+#[test]
+fn list_writes_to_the_given_writer() {
+    use satz_cli::commands::list_cmd::{ListArgs, run_with_output};
+    let v = small_vault("lib_list");
+    v.write("broken.md", "# Broken\n\nsee [[nothing-here]]\n");
+    let args = |tag: &[&str], orphans, broken| ListArgs {
+        vault: v.path().to_path_buf(),
+        tag: tag.iter().map(|t| t.to_string()).collect(),
+        orphans,
+        broken,
+    };
+
+    let mut plain = Vec::new();
+    run_with_output(args(&[], false, false), &mut plain).unwrap();
+    assert_eq!(text(plain), "a.md\nb.md\nbroken.md\nc.md\n");
+
+    let mut tagged = Vec::new();
+    run_with_output(args(&["x"], false, false), &mut tagged).unwrap();
+    assert_eq!(text(tagged), "a.md\nb.md\n");
+
+    let mut broken = Vec::new();
+    run_with_output(args(&[], false, true), &mut broken).unwrap();
+    assert_eq!(
+        text(broken),
+        "broken.md:3\t[[nothing-here]]\t— file not found\n"
+    );
+}
+
+#[test]
+fn stats_index_graph_and_resolve_write_to_the_given_writer() {
+    use satz_cli::commands::graph_cmd::{GraphArgs, GraphFormat};
+    use satz_cli::commands::index_cmd::IndexArgs;
+    use satz_cli::commands::resolve_cmd::ResolveArgs;
+    use satz_cli::commands::stats_cmd::StatsArgs;
+    let v = small_vault("lib_others");
+
+    let mut stats = Vec::new();
+    satz_cli::commands::stats_cmd::run_with_output(
+        StatsArgs {
+            vault: v.path().to_path_buf(),
+            json: true,
+        },
+        &mut stats,
+    )
+    .unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&text(stats)).expect("JSON");
+    assert_eq!(stats["doc_count"], 3);
+
+    let mut index = Vec::new();
+    satz_cli::commands::index_cmd::run_with_output(
+        IndexArgs {
+            path: v.path().to_path_buf(),
+        },
+        &mut index,
+    )
+    .unwrap();
+    let index = text(index);
+    assert!(index.starts_with("Indexing vault: "), "{index}");
+    assert!(index.contains("3 documents indexed"), "{index}");
+
+    for (format, marker) in [
+        (GraphFormat::Json, "\"nodes\""),
+        (GraphFormat::Dot, "digraph"),
+    ] {
+        let mut graph = Vec::new();
+        satz_cli::commands::graph_cmd::run_with_output(
+            GraphArgs {
+                vault: v.path().to_path_buf(),
+                format,
+                output: None,
+            },
+            &mut graph,
+        )
+        .unwrap();
+        let graph = text(graph);
+        assert!(graph.contains(marker), "{format:?}: {graph}");
+        assert!(graph.ends_with('\n'));
+    }
+
+    let mut resolved = Vec::new();
+    satz_cli::commands::resolve_cmd::run_with_output(
+        ResolveArgs {
+            vault: v.path().to_path_buf(),
+            target: "[[b]]".to_string(),
+        },
+        &mut resolved,
+    )
+    .unwrap();
+    assert!(text(resolved).trim_end().ends_with("b.md"));
+}
+
+#[test]
+fn fmt_check_writes_the_files_that_need_formatting_to_the_given_writer() {
+    use satz_cli::commands::fmt_cmd::{FmtArgs, Outcome, run_with_output};
+    let v = TempDir::new("lib_fmt");
+    v.write("dirty.md", DIRTY);
+    v.write("clean.md", DIRTY_FORMATTED);
+    let before = snapshot(v.path());
+
+    let mut listed = Vec::new();
+    let outcome = run_with_output(
+        FmtArgs {
+            path: v.path().to_path_buf(),
+            check: true,
+            write: false,
+        },
+        &mut listed,
+    )
+    .unwrap();
+
+    assert_eq!(outcome, Outcome::NeedsFormatting);
+    assert_eq!(text(listed), "dirty.md\n");
+    assert_eq!(snapshot(v.path()), before, "--check writes nothing");
+}
