@@ -1535,3 +1535,143 @@ fn graph_output_is_the_same_in_every_run_and_in_note_id_order() {
     assert_eq!(ids.len(), 36);
     assert_eq!(ids, sorted, "nodes come in note id order");
 }
+
+// ---- daily: the note is created in one step, never over something that is already there ----
+
+#[test]
+fn a_note_that_appears_while_daily_runs_is_never_overwritten() {
+    use satz_cli::commands::daily_cmd::{DailyArgs, run_with_output};
+    use std::io::Write as _;
+    use std::sync::Barrier;
+
+    // `daily` against a "user" who creates the very same note at about the same moment (an
+    // editor, a second `satz daily`, a sync tool). Whoever creates it first owns it: the other
+    // one must leave it alone. The user's wait before creating differs from round to round, so
+    // the moment sweeps across the whole time `daily` needs.
+    let (mut user_first, mut daily_first) = (0, 0);
+    for round in 0..300u32 {
+        let v = TempDir::new("daily_race");
+        let note = v.path().join("daily").join(format!("{}.md", today()));
+        let barrier = Barrier::new(2);
+
+        let (daily_result, user_created) = std::thread::scope(|s| {
+            let daily = s.spawn(|| {
+                barrier.wait();
+                run_with_output(
+                    DailyArgs {
+                        path: v.path().to_path_buf(),
+                        create: true,
+                    },
+                    &mut Vec::new(),
+                )
+            });
+            let user = s.spawn(|| {
+                barrier.wait();
+                for _ in 0..((round * 37 % 900) * (1 + round % 60)) {
+                    std::hint::spin_loop();
+                }
+                std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&note)
+                {
+                    Ok(mut file) => {
+                        file.write_all(b"USER CONTENT\n").unwrap();
+                        true
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(e) => panic!("round {round}: the user could not create the note: {e}"),
+                }
+            });
+            (daily.join().unwrap(), user.join().unwrap())
+        });
+
+        let content = std::fs::read_to_string(&note).unwrap();
+        assert!(
+            daily_result.is_ok(),
+            "round {round}: `daily` failed although the note simply appeared: {daily_result:?}"
+        );
+        if user_created {
+            user_first += 1;
+            assert_eq!(
+                content, "USER CONTENT\n",
+                "round {round}: the note the user created was overwritten"
+            );
+        } else {
+            daily_first += 1;
+            assert!(
+                content.contains(&today()) && !content.contains("USER CONTENT"),
+                "round {round}: `daily` created it first, the file is not its template: {content:?}"
+            );
+        }
+    }
+    eprintln!("daily race: the user was first in {user_first} rounds, `daily` in {daily_first}");
+}
+
+/// A symbolic link from `link` to `target`; `false` when this machine does not allow one.
+fn make_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    made.is_ok()
+}
+
+#[test]
+fn a_dangling_link_at_the_note_path_is_left_alone() {
+    // `Path::exists` follows a link, so a link to nothing counted as "no note yet" and the write
+    // went THROUGH it, creating a file wherever the link pointed -- outside the vault.
+    let v = TempDir::new("daily_dangling");
+    let outside = TempDir::new("daily_dangling_outside");
+    let target = outside.path().join("created-through-the-link.md");
+    std::fs::create_dir_all(v.path().join("daily")).unwrap();
+    let link = v.path().join("daily").join(format!("{}.md", today()));
+    if !make_symlink(&target, &link) {
+        println!("skipped: this machine does not allow creating symbolic links");
+        return;
+    }
+
+    let o = satz(&["daily", v.str()]);
+
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).trim().ends_with(&format!("{}.md", today())),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        !target.exists(),
+        "a file was created outside the vault, through the link"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link itself is left as it was"
+    );
+}
+
+#[test]
+fn daily_leaves_whatever_is_at_the_note_path_alone() {
+    // A folder with the note's name, and a read-only note: both are "already there".
+    let v = TempDir::new("daily_occupied");
+    let as_folder = v.path().join("daily").join(format!("{}.md", today()));
+    std::fs::create_dir_all(&as_folder).unwrap();
+    let before = snapshot(v.path());
+    let o = satz(&["daily", v.str()]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).trim().ends_with(&format!("{}.md", today())));
+    assert_eq!(snapshot(v.path()), before, "the folder is left as it was");
+
+    let v = TempDir::new("daily_readonly");
+    let rel = format!("daily/{}.md", today());
+    let path = v.write(&rel, "READ ONLY, keep it\n");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    let o = satz(&["daily", v.str()]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(v.read(&rel), b"READ ONLY, keep it\n");
+}

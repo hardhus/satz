@@ -117,7 +117,7 @@ satz daily .
 Behavior:
 1. Reads `.satz.toml` from `path` if present (see [`[daily_note]`](configuration.md#daily_note--used-by-satz-daily-cli-and-by-bugündünyarın-style-relative-links-lsp-hoverdefinitiondiagnostics)); otherwise uses defaults (`folder = "daily"`, `format = "%Y-%m-%d"`).
 2. Formats today's date with `daily_note.format`, appends `.md` if the formatted string doesn't already end with it.
-3. If `--create` is true (the default) and the file doesn't exist, creates `daily_note.folder` (and any parent directories) and writes an initial document generated from the filename-derived title and today's date.
+3. If `--create` is true (the default), creates `daily_note.folder` (and any parent directories) and, if nothing exists at the note's path, writes an initial document generated from the filename-derived title and today's date. Checking and creating are one step, so a note that appears while the command runs, or a file, folder or link that is already there, is never overwritten or written through.
 4. Prints the resulting absolute path to stdout.
 
 | Flag/Arg | Default | Meaning |
