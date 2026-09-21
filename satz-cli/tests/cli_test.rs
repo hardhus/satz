@@ -1348,3 +1348,146 @@ fn fmt_check_writes_the_files_that_need_formatting_to_the_given_writer() {
     assert_eq!(text(listed), "dirty.md\n");
     assert_eq!(snapshot(v.path()), before, "--check writes nothing");
 }
+
+// ---- resolve: what it prints, what it exits with, and that a library call comes back ----
+
+#[test]
+fn resolve_returns_to_the_embedding_program_when_the_target_is_unknown() {
+    use satz_cli::commands::resolve_cmd::{ResolveArgs, run_with_output};
+
+    // `process::exit` inside the call would end this test run, so the call is made by a child
+    // process: this same test, started again with the vault named in the environment.
+    if let Ok(vault) = std::env::var("SATZ_TEST_RESOLVE_CHILD") {
+        let mut sink = Vec::new();
+        let _ = run_with_output(
+            ResolveArgs {
+                vault: vault.into(),
+                target: "[[nothing-here]]".to_string(),
+            },
+            &mut sink,
+        );
+        println!("RETURNED");
+        return;
+    }
+
+    let v = small_vault("resolve_embedded");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "resolve_returns_to_the_embedding_program_when_the_target_is_unknown",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("SATZ_TEST_RESOLVE_CHILD", v.path())
+        .output()
+        .expect("the test binary can be started again");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        stdout.contains("RETURNED"),
+        "the call did not come back (exit {:?}): {stdout}{}",
+        child.status.code(),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+fn resolve_vault(tag: &str) -> TempDir {
+    let v = small_vault(tag);
+    v.write("h.md", "# H\n\n## Heading\n\ntext\n");
+    v
+}
+
+#[test]
+fn resolve_prints_the_path_of_what_it_found_and_nothing_else() {
+    let v = resolve_vault("resolve_found");
+    let b = format!("{}\n", v.path().join("b.md").display());
+    for target in ["b", "[[b]]", "[[ b ]]", "  [[b]]  "] {
+        let o = satz(&["resolve", "-v", v.str(), target]);
+        assert_eq!(o.status.code(), Some(0), "{target:?}: {}", err(&o));
+        assert_eq!(out(&o), b, "{target:?}");
+        assert_eq!(err(&o), "", "{target:?}");
+    }
+}
+
+#[test]
+fn resolve_adds_the_line_of_a_heading_it_finds_and_falls_back_to_the_path() {
+    let v = resolve_vault("resolve_heading");
+    let path = v.path().join("h.md");
+    let with_line = format!("{}:3\n", path.display());
+    let path_only = format!("{}\n", path.display());
+
+    for target in ["[[h#Heading]]", "h#Heading", "[[h# Heading ]]"] {
+        let o = satz(&["resolve", "-v", v.str(), target]);
+        assert_eq!(o.status.code(), Some(0), "{target:?}: {}", err(&o));
+        assert_eq!(out(&o), with_line, "{target:?}");
+    }
+    // A heading the note does not have: the note is still where the link points.
+    let o = satz(&["resolve", "-v", v.str(), "[[h#no-such-heading]]"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), path_only);
+    assert_eq!(err(&o), "");
+}
+
+#[test]
+fn resolve_of_an_unknown_target_exits_1_with_the_target_on_stderr_and_no_stdout() {
+    let v = resolve_vault("resolve_unknown");
+    // (target as given, the name reported: brackets and a `#heading` suffix are stripped)
+    for (target, reported) in [
+        ("[[nothing-here]]", "nothing-here"),
+        ("nothing-here", "nothing-here"),
+        ("[[nothing#h]]", "nothing"),
+        // Nothing to look up at all: not a match for some note, not a crash.
+        ("", ""),
+        ("   ", ""),
+        ("[[]]", ""),
+        ("#h", ""),
+        ("[[#h]]", ""),
+    ] {
+        let o = satz(&["resolve", "-v", v.str(), target]);
+        assert_eq!(o.status.code(), Some(1), "{target:?}: {}", err(&o));
+        assert_eq!(out(&o), "", "{target:?}: nothing on stdout");
+        assert_eq!(err(&o), format!("not found: {reported}\n"), "{target:?}");
+    }
+}
+
+#[test]
+fn resolve_reports_found_and_not_found_as_an_outcome_and_writes_only_what_it_found() {
+    use satz_cli::commands::resolve_cmd::{Outcome, ResolveArgs, run_with_output};
+    let v = resolve_vault("resolve_outcome");
+    let run = |target: &str| {
+        let mut written = Vec::new();
+        let outcome = run_with_output(
+            ResolveArgs {
+                vault: v.path().to_path_buf(),
+                target: target.to_string(),
+            },
+            &mut written,
+        )
+        .expect("a target that is not found is not an error");
+        (outcome, text(written))
+    };
+
+    let (outcome, written) = run("[[h#Heading]]");
+    assert_eq!(outcome, Outcome::Found);
+    assert_eq!(written, format!("{}:3\n", v.path().join("h.md").display()));
+
+    for target in ["[[nothing-here]]", "", "[[]]", "#h"] {
+        let (outcome, written) = run(target);
+        assert_eq!(outcome, Outcome::NotFound, "{target:?}");
+        assert_eq!(
+            written, "",
+            "{target:?}: nothing was found, nothing is written"
+        );
+    }
+
+    // A vault that cannot be read is still an error, not a "not found".
+    let missing = v.path().join("does-not-exist");
+    let e = run_with_output(
+        ResolveArgs {
+            vault: missing,
+            target: "b".to_string(),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("does not exist"), "{e}");
+}

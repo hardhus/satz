@@ -12,12 +12,22 @@ pub struct ResolveArgs {
     pub target: String,
 }
 
-pub fn run(args: ResolveArgs) -> Result<()> {
+/// How a `resolve` run ended, apart from errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The target points at a note: its path was written.
+    Found,
+    /// Nothing the target names exists. Not an error of the command: it says so on stderr and
+    /// the caller decides what that means (the `satz` binary exits with status 1).
+    NotFound,
+}
+
+pub fn run(args: ResolveArgs) -> Result<Outcome> {
     super::with_stdout(|out| run_with_output(args, out))
 }
 
 /// `run`, writing the resolved path to `out`.
-pub fn run_with_output(args: ResolveArgs, out: &mut dyn Write) -> Result<()> {
+pub fn run_with_output(args: ResolveArgs, out: &mut dyn Write) -> Result<Outcome> {
     let index = super::load_index(&args.vault)?;
 
     // Strip [[ and ]] if present
@@ -35,7 +45,7 @@ pub fn run_with_output(args: ResolveArgs, out: &mut dyn Write) -> Result<()> {
 
     let Some(doc_id) = index.resolve_link(doc_target) else {
         eprintln!("not found: {}", doc_target);
-        std::process::exit(1);
+        return Ok(Outcome::NotFound);
     };
 
     let doc = index.get_doc(doc_id).expect("doc must exist in index");
@@ -56,5 +66,5 @@ pub fn run_with_output(args: ResolveArgs, out: &mut dyn Write) -> Result<()> {
         writeln!(out, "{}", path.display())?;
     }
 
-    Ok(())
+    Ok(Outcome::Found)
 }

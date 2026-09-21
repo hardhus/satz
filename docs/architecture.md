@@ -43,7 +43,7 @@ Key types:
 
 ## `satz-cli`: using it as a library
 
-`satz-cli` builds both a binary (`satz`) and a library crate (`satz_cli`), specifically so a host application can embed the CLI's command implementations (`satz_cli::commands::*`) directly — calling `commands::stats_cmd::run(args)` in-process, for example — instead of shelling out to the `satz` binary and parsing its stdout. Each command also has `run_with_output(args, &mut writer)`, which writes what the command prints to the writer you give it (a `Vec<u8>`, for instance) instead of stdout; `run` writes to stdout and lets a reader that went away (`| head`) end the output quietly. The library exposes the same `Cli`/`Commands` clap types as the binary, so argument parsing behaves identically either way.
+`satz-cli` builds both a binary (`satz`) and a library crate (`satz_cli`), specifically so a host application can embed the CLI's command implementations (`satz_cli::commands::*`) directly — calling `commands::stats_cmd::run(args)` in-process, for example — instead of shelling out to the `satz` binary and parsing its stdout. Each command also has `run_with_output(args, &mut writer)`, which writes what the command prints to the writer you give it (a `Vec<u8>`, for instance) instead of stdout; `run` writes to stdout and lets a reader that went away (`| head`) end the output quietly. `resolve` does not end the process when the target is unknown: like `fmt` it returns an `Outcome` (`Found` / `NotFound`) and leaves the exit status to the caller. The library exposes the same `Cli`/`Commands` clap types as the binary, so argument parsing behaves identically either way.
 
 ## `satz-lsp`
 

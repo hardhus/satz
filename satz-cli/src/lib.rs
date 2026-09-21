@@ -47,7 +47,10 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Graph(args) => commands::graph_cmd::run(args).map(|()| ok),
         Commands::Index(args) => commands::index_cmd::run(args).map(|()| ok),
         Commands::List(args) => commands::list_cmd::run(args).map(|()| ok),
-        Commands::Resolve(args) => commands::resolve_cmd::run(args).map(|()| ok),
+        Commands::Resolve(args) => commands::resolve_cmd::run(args).map(|outcome| match outcome {
+            commands::resolve_cmd::Outcome::Found => ok,
+            commands::resolve_cmd::Outcome::NotFound => ExitCode::from(1),
+        }),
         Commands::Stats(args) => commands::stats_cmd::run(args).map(|()| ok),
     }
 }
