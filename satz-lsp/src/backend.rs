@@ -63,15 +63,6 @@ pub(crate) fn refresh_succeeded<T, E: std::fmt::Display>(
     }
 }
 
-/// Whether the client can request semantic tokens at all (`textDocument.semanticTokens`).
-pub fn client_supports_semantic_tokens(capabilities: &ClientCapabilities) -> bool {
-    capabilities
-        .text_document
-        .as_ref()
-        .and_then(|t| t.semantic_tokens.as_ref())
-        .is_some()
-}
-
 /// Whether `workspace/diagnostic/refresh` is worth sending: to a client that pulls diagnostics.
 /// `refreshSupport` is not required: many clients answer the request (or ignore it harmlessly)
 /// without announcing it, and the refresh after the first indexing is what makes them fetch again.
@@ -79,12 +70,14 @@ pub(crate) fn diagnostic_refresh_wanted(state: &SatzState) -> bool {
     state.client_supports_pull_diagnostics
 }
 
-/// Whether `workspace/semanticTokens/refresh` is worth sending: to a client that asks for semantic
-/// tokens. The colours of a note opened during the first indexing are computed from an incomplete
-/// index (links look unresolved); this request is what makes the client ask again once it is
-/// complete, so it must not depend on the client having announced `refreshSupport`.
-pub(crate) fn semantic_tokens_refresh_wanted(state: &SatzState) -> bool {
-    state.client_supports_semantic_tokens
+/// Whether `workspace/semanticTokens/refresh` is sent: always, to every client. The colours of a
+/// note opened during the first indexing are computed from an incomplete index (links look
+/// unresolved); this request is what makes the client ask again once it is complete. It must not
+/// depend on what the client announced (`refreshSupport`, or the semantic token capability): a
+/// client that announces neither but still answers it (Helix) would keep the wrong colours. A client
+/// that does not know the request just answers with an error, which is logged at debug level.
+pub(crate) fn semantic_tokens_refresh_wanted(_state: &SatzState) -> bool {
+    true
 }
 
 /// Asks a pull-diagnostics client to fetch again.
@@ -417,8 +410,6 @@ impl LanguageServer for Backend {
                 client_supports_diagnostic_refresh(&params.capabilities);
             state.client_supports_semantic_tokens_refresh =
                 client_supports_semantic_tokens_refresh(&params.capabilities);
-            state.client_supports_semantic_tokens =
-                client_supports_semantic_tokens(&params.capabilities);
         }
 
         tracing::debug!(?vault_root, "initialize: resolved vault root");
@@ -1830,75 +1821,57 @@ mod tests {
         assert!(answer.is_ok(), "completion waited for a re-parse");
     }
 
-    // ---- refreshes go to clients that use the feature, not only to ones that announce refreshSupport ----
+    // ---- the colour refresh does not depend on what the client announces ----
 
-    fn state_with(pull: bool, tokens: bool, diag_refresh: bool, tokens_refresh: bool) -> SatzState {
+    fn state_with(pull: bool, diag_refresh: bool, tokens_refresh: bool) -> SatzState {
         let mut state = SatzState::default();
         state.client_supports_pull_diagnostics = pull;
-        state.client_supports_semantic_tokens = tokens;
         state.client_supports_diagnostic_refresh = diag_refresh;
         state.client_supports_semantic_tokens_refresh = tokens_refresh;
         state
     }
 
     #[test]
-    fn a_client_that_uses_semantic_tokens_is_refreshed_even_without_announcing_it() {
-        // The first colours are computed while the vault is still being indexed; the refresh after
-        // indexing is what turns unresolved links into coloured ones.
-        assert!(semantic_tokens_refresh_wanted(&state_with(
-            false, true, false, false
-        )));
-        assert!(semantic_tokens_refresh_wanted(&state_with(
-            false, true, false, true
-        )));
-        assert!(!semantic_tokens_refresh_wanted(&state_with(
-            true, false, true, true
-        )));
-        assert!(!semantic_tokens_refresh_wanted(&SatzState::default()));
+    fn every_client_is_asked_to_fetch_semantic_tokens_again_whatever_it_announced() {
+        // A note opened during the first indexing is coloured from an incomplete index (its links
+        // look unresolved); this request after indexing is what fixes the colours. Before the
+        // clean-up it was sent unconditionally, and a client that does not announce
+        // `refreshSupport` (Helix) then never got it: the links stayed uncoloured on first open.
+        for pull in [false, true] {
+            for diag_refresh in [false, true] {
+                for tokens_refresh in [false, true] {
+                    assert!(
+                        semantic_tokens_refresh_wanted(&state_with(
+                            pull,
+                            diag_refresh,
+                            tokens_refresh
+                        )),
+                        "pull={pull} diag_refresh={diag_refresh} tokens_refresh={tokens_refresh}"
+                    );
+                }
+            }
+        }
+        assert!(
+            semantic_tokens_refresh_wanted(&SatzState::default()),
+            "a client that announced nothing"
+        );
+    }
+
+    #[test]
+    fn the_refresh_after_indexing_and_the_one_after_a_reparse_both_include_semantic_tokens() {
+        for peers_dirty in [false, true] {
+            for supports_pull in [false, true] {
+                assert!(refresh_after_reparse(peers_dirty, supports_pull).semantic_tokens);
+                assert!(plan_refresh(peers_dirty, supports_pull, true, true).semantic_tokens);
+            }
+        }
     }
 
     #[test]
     fn a_pull_client_is_refreshed_even_without_announcing_it_and_a_push_client_never() {
-        assert!(diagnostic_refresh_wanted(&state_with(
-            true, false, false, false
-        )));
-        assert!(diagnostic_refresh_wanted(&state_with(
-            true, true, true, true
-        )));
-        assert!(!diagnostic_refresh_wanted(&state_with(
-            false, true, true, true
-        )));
+        assert!(diagnostic_refresh_wanted(&state_with(true, false, false)));
+        assert!(diagnostic_refresh_wanted(&state_with(true, true, true)));
+        assert!(!diagnostic_refresh_wanted(&state_with(false, true, true)));
         assert!(!diagnostic_refresh_wanted(&SatzState::default()));
-    }
-
-    #[test]
-    fn semantic_token_support_is_read_from_the_text_document_capabilities() {
-        assert!(!client_supports_semantic_tokens(
-            &ClientCapabilities::default()
-        ));
-        let caps = ClientCapabilities {
-            text_document: Some(TextDocumentClientCapabilities::default()),
-            ..Default::default()
-        };
-        assert!(!client_supports_semantic_tokens(&caps));
-        let caps = ClientCapabilities {
-            text_document: Some(TextDocumentClientCapabilities {
-                semantic_tokens: Some(SemanticTokensClientCapabilities::default()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(client_supports_semantic_tokens(&caps));
-        // `refreshSupport` of the workspace part is a different thing and changes nothing here.
-        let workspace_only = ClientCapabilities {
-            workspace: Some(WorkspaceClientCapabilities {
-                semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
-                    refresh_support: Some(true),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(!client_supports_semantic_tokens(&workspace_only));
     }
 }
