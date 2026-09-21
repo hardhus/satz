@@ -19,6 +19,10 @@ pub struct OpenDocument {
     /// The buffer version the index was last parsed from. Different from `version` = the index is
     /// behind the buffer (stale).
     pub indexed_version: i32,
+    /// The index was brought up to date by a request (`refresh_stale_open_documents`), not by the
+    /// debounced reparse task: the diagnostics and refreshes that follow a reparse have not been
+    /// sent yet. The task takes this over when it wakes and finds nothing left to parse.
+    pub announce_pending: bool,
 }
 
 impl std::fmt::Debug for OpenDocument {
@@ -51,6 +55,7 @@ impl OpenDocument {
             first_change_at: None,
             pending_task: None,
             indexed_version: version,
+            announce_pending: false,
         }
     }
 
@@ -682,8 +687,19 @@ impl SatzState {
             .collect();
         for uri in &stale {
             self.reparse_open_document(uri);
+            if let Some(open) = self.open_docs.get_mut(uri) {
+                open.announce_pending = true;
+            }
         }
         stale.len()
+    }
+
+    /// Whether the index of `uri` was refreshed by a request and its follow-up notifications are
+    /// still owed; clears the debt. See `OpenDocument::announce_pending`.
+    pub fn take_announce_pending(&mut self, uri: &str) -> bool {
+        self.open_docs
+            .get_mut(uri)
+            .is_some_and(|open| std::mem::take(&mut open.announce_pending))
     }
 
     /// Takes what is needed to re-parse an open document: its text, path and version. Quick (a copy
@@ -714,6 +730,9 @@ impl SatzState {
         }
         open_doc.first_change_at = None;
         open_doc.indexed_version = version;
+        // Whoever applies a parse announces it (the debounced task, save) -- or, for a request's
+        // refresh, marks the debt again right after.
+        open_doc.announce_pending = false;
 
         let doc_id = new_doc.id.clone();
         tracing::trace!(%uri, ?doc_id, "apply_reparse");
@@ -1743,6 +1762,46 @@ mod tests {
         );
         // A reparse task that fires later finds nothing to do either.
         assert!(state.prepare_reparse("file:///a.md").is_none());
+    }
+
+    #[test]
+    fn a_refresh_by_a_request_leaves_its_notifications_owed_exactly_once() {
+        let mut state = open_state("# A\n\n[[one]]\n");
+        assert!(
+            !state.take_announce_pending("file:///a.md"),
+            "a document nobody refreshed owes nothing"
+        );
+
+        edit_buffer(&mut state, 2, "# A\n\n[[two]]\n");
+        assert!(
+            !state.take_announce_pending("file:///a.md"),
+            "typing alone is the debounced task's business"
+        );
+        assert_eq!(state.refresh_stale_open_documents(), 1);
+        assert!(state.take_announce_pending("file:///a.md"), "now owed");
+        assert!(
+            !state.take_announce_pending("file:///a.md"),
+            "taken: sent once"
+        );
+
+        assert_eq!(state.refresh_stale_open_documents(), 0);
+        assert!(
+            !state.take_announce_pending("file:///a.md"),
+            "a refresh that found nothing to parse owes nothing"
+        );
+        assert!(!state.take_announce_pending("file:///nope.md"));
+    }
+
+    #[test]
+    fn whoever_applies_a_parse_next_takes_over_the_notifications() {
+        // A request refreshed the buffer (debt), then the user typed on: the debounced task that
+        // parses the newer text announces for both, so nothing is owed any more.
+        let mut state = open_state("# A\n\n[[one]]\n");
+        edit_buffer(&mut state, 2, "# A\n\n[[two]]\n");
+        state.refresh_stale_open_documents();
+        edit_buffer(&mut state, 3, "# A\n\n[[three]]\n");
+        state.reparse_open_document("file:///a.md");
+        assert!(!state.take_announce_pending("file:///a.md"));
     }
 
     #[test]

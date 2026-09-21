@@ -215,6 +215,16 @@ async fn run_reparse(
     tokio::time::sleep(delay).await;
 
     let Some(job) = ({ state_arc.read().await.prepare_reparse(&uri) }) else {
+        // Nothing to parse. If a request brought the index up to date first (`read_fresh`), the
+        // notifications that follow a reparse are still owed: they are sent from here.
+        let peers = {
+            let mut state = state_arc.write().await;
+            if !state.take_announce_pending(&uri) {
+                return;
+            }
+            state.take_peer_refresh(&uri, true)
+        };
+        announce_reparse(&client, &state_arc, &uri, peers).await;
         return;
     };
     let version = job.version;
@@ -236,12 +246,23 @@ async fn run_reparse(
         return; // the buffer changed while parsing; the task of that change takes over
     }
 
-    publish_for(&client, &state_arc, &uri).await;
+    announce_reparse(&client, &state_arc, &uri, peers).await;
+}
+
+/// What follows a reparse that reached the index: the document's own diagnostics, the other open
+/// documents' when they depend on it, and the refresh requests to pull clients.
+async fn announce_reparse(
+    client: &Client,
+    state_arc: &Arc<RwLock<SatzState>>,
+    uri: &str,
+    peers: crate::state::PeerRefresh,
+) {
+    publish_for(client, state_arc, uri).await;
 
     let plan = refresh_after_reparse(peers.dirty, peers.supports_pull);
     if plan.push_peers {
         for other_uri in &peers.others {
-            publish_for(&client, &state_arc, other_uri).await;
+            publish_for(client, state_arc, other_uri).await;
         }
     }
     // Neither refresh waits for the other: a client that never answers one must not keep the
@@ -249,12 +270,12 @@ async fn run_reparse(
     tokio::join!(
         async {
             if plan.semantic_tokens {
-                refresh_semantic_tokens(&client, &state_arc).await;
+                refresh_semantic_tokens(client, state_arc).await;
             }
         },
         async {
             if plan.pull_diagnostics {
-                refresh_diagnostics(&client, &state_arc).await;
+                refresh_diagnostics(client, state_arc).await;
             }
         }
     );
@@ -436,13 +457,13 @@ impl Backend {
                 return state;
             }
         }
-        {
-            let mut state = self.state.write().await;
-            state.refresh_stale_open_documents();
-            // Midnight passed (or the daily settings changed): `[[bugün]]` means another note now.
-            state.sync_daily(today);
-        }
-        self.state.read().await
+        let mut state = self.state.write().await;
+        state.refresh_stale_open_documents();
+        // Midnight passed (or the daily settings changed): `[[bugün]]` means another note now.
+        state.sync_daily(today);
+        // Downgraded, not released and re-acquired: a `did_change` slipping in between would make
+        // the state the caller reads stale again.
+        state.downgrade()
     }
 
     pub fn new(client: Client, log_reload_handle: LogReloadHandle) -> Self {
@@ -1646,6 +1667,245 @@ mod tests {
             })
             .await;
         assert!(!backend.state.read().await.has_stale_open_documents());
+    }
+
+    /// `a.md` and `p.md` (which links to `a`) are open, with a debounce short enough to fire
+    /// inside a test.
+    async fn backend_with_a_peer_and_a_short_debounce()
+    -> (Arc<Backend>, tower_lsp_server::LspService<Backend>) {
+        let (backend, service) = shared_backend().await;
+        backend
+            .did_open(open_params("file:///p.md", 1, "# P\n\n[[a]]\n"))
+            .await;
+        {
+            let mut state = backend.state.write().await;
+            state.config.lsp.reparse_debounce_ms = 40;
+            state.config.lsp.reparse_max_wait_ms = 40;
+        }
+        (backend, service)
+    }
+
+    #[tokio::test]
+    async fn a_request_before_the_debounce_leaves_the_peer_flag_to_the_debounced_task() {
+        // The request reparses the stale buffer itself (`read_fresh`); the debounced task then
+        // finds nothing to parse. It must still tell the other open documents that what they
+        // depend on (here: the title `a` is linked by) changed -- and consume the flag.
+        let (backend, _service) = backend_with_a_peer_and_a_short_debounce().await;
+        backend
+            .did_change(change_params("file:///a.md", 2, "# Renamed\n"))
+            .await;
+        let _ = backend
+            .hover(HoverParams {
+                text_document_position_params: position_params("file:///a.md", 0, 3),
+                work_done_progress_params: Default::default(),
+            })
+            .await;
+        assert!(
+            backend.state.read().await.peers_dirty(),
+            "the request's own reparse changed what peers depend on"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        assert!(
+            !backend.state.read().await.peers_dirty(),
+            "the debounced task must have told the peers and consumed the flag"
+        );
+    }
+
+    // ---- what the client actually receives (a real JSON-RPC connection over an in-memory pipe) ----
+
+    async fn write_frame(
+        out: &mut (impl tokio::io::AsyncWrite + Unpin),
+        message: serde_json::Value,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let body = message.to_string();
+        let frame = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+        out.write_all(frame.as_bytes()).await.unwrap();
+    }
+
+    async fn read_frame(
+        input: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    ) -> Option<serde_json::Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            if input.read_line(&mut line).await.ok()? == 0 {
+                return None;
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length:") {
+                length = value.trim().parse::<usize>().ok();
+            }
+        }
+        let mut body = vec![0; length?];
+        input.read_exact(&mut body).await.ok()?;
+        serde_json::from_slice(&body).ok()
+    }
+
+    /// Everything the server sends for `quiet` without a pause: `(method, uri of the document)`.
+    async fn sent_meanwhile(
+        input: &mut (impl tokio::io::AsyncBufRead + Unpin),
+        quiet: std::time::Duration,
+    ) -> Vec<(String, Option<String>)> {
+        let mut seen = Vec::new();
+        while let Ok(Some(frame)) = tokio::time::timeout(quiet, read_frame(input)).await {
+            if let Some(method) = frame["method"].as_str() {
+                let uri = frame["params"]["uri"].as_str().map(str::to_string);
+                seen.push((method.to_string(), uri));
+            }
+        }
+        seen
+    }
+
+    /// `shared_backend`'s setup (a.md open, indexing done) but with a connected push client
+    /// (it announced no pull-diagnostics support) whose incoming messages can be read.
+    async fn connected_backend() -> (
+        Arc<Backend>,
+        tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) {
+        let client_slot = std::sync::Mutex::new(None);
+        let (_layer, handle): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
+        let (service, socket) = tower_lsp_server::LspService::new(|client| {
+            *client_slot.lock().unwrap() = Some(client.clone());
+            Backend::new(client, handle)
+        });
+        let client = client_slot.lock().unwrap().take().unwrap();
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        tokio::spawn(async move {
+            tower_lsp_server::Server::new(server_read, server_write, socket)
+                .serve(service)
+                .await;
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut client_read = tokio::io::BufReader::new(client_read);
+
+        // The handshake: a client is only sent anything once it has initialized the server.
+        write_frame(
+            &mut client_write,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"processId": null, "rootUri": null, "capabilities": {}}}),
+        )
+        .await;
+        loop {
+            let frame = read_frame(&mut client_read)
+                .await
+                .expect("initialize answer");
+            if frame["id"] == 1 {
+                break;
+            }
+        }
+        write_frame(
+            &mut client_write,
+            serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        )
+        .await;
+        // `client_write` stays open for as long as the test (leaked: a closed pipe would end the
+        // server).
+        std::mem::forget(client_write);
+
+        let (_layer2, handle2): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
+        let backend = Arc::new(Backend::new(client, handle2));
+        {
+            let mut state = backend.state.write().await;
+            state.set_vault_root(Some(root()));
+            state.set_indexing_complete(true);
+            state.open_document("file:///a.md", "# A\n", &root().join("a.md"), 1);
+        }
+        (backend, client_read)
+    }
+
+    #[tokio::test]
+    async fn a_request_before_the_debounce_still_gets_its_diagnostics_and_refreshes_sent() {
+        let (backend, mut from_server) = connected_backend().await;
+        backend
+            .did_open(open_params("file:///p.md", 1, "# P\n\n[[a]]\n"))
+            .await;
+        {
+            let mut state = backend.state.write().await;
+            state.config.lsp.reparse_debounce_ms = 40;
+            state.config.lsp.reparse_max_wait_ms = 40;
+        }
+        // What the handshake and the opening sent is not what is asserted below.
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+
+        backend
+            .did_change(change_params("file:///a.md", 2, "# Renamed\n"))
+            .await;
+        let _ = backend
+            .hover(HoverParams {
+                text_document_position_params: position_params("file:///a.md", 0, 3),
+                work_done_progress_params: Default::default(),
+            })
+            .await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(400)).await;
+
+        let published = |uri: &str| {
+            sent.iter().any(|(method, target)| {
+                method == "textDocument/publishDiagnostics" && target.as_deref() == Some(uri)
+            })
+        };
+        assert!(
+            published("file:///a.md"),
+            "the edited note's own diagnostics: {sent:?}"
+        );
+        assert!(
+            published("file:///p.md"),
+            "the open note that links to the renamed one: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|(method, _)| method == "workspace/semanticTokens/refresh"),
+            "the client is asked for fresh colours: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_request_the_debounced_task_announces_once() {
+        // The ordinary path, which must not change: typing, the debounce fires, one round of
+        // notifications (no duplicate from the request-refresh debt).
+        let (backend, mut from_server) = connected_backend().await;
+        backend
+            .did_open(open_params("file:///p.md", 1, "# P\n\n[[a]]\n"))
+            .await;
+        {
+            let mut state = backend.state.write().await;
+            state.config.lsp.reparse_debounce_ms = 40;
+            state.config.lsp.reparse_max_wait_ms = 40;
+        }
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+
+        backend
+            .did_change(change_params("file:///a.md", 2, "# Renamed\n"))
+            .await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(400)).await;
+
+        let count = |method: &str, uri: Option<&str>| {
+            sent.iter()
+                .filter(|(m, u)| m == method && (uri.is_none() || u.as_deref() == uri))
+                .count()
+        };
+        assert_eq!(
+            count("textDocument/publishDiagnostics", Some("file:///a.md")),
+            1,
+            "{sent:?}"
+        );
+        assert_eq!(
+            count("textDocument/publishDiagnostics", Some("file:///p.md")),
+            1,
+            "{sent:?}"
+        );
+        assert_eq!(
+            count("workspace/semanticTokens/refresh", None),
+            1,
+            "{sent:?}"
+        );
     }
 
     #[tokio::test]
