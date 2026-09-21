@@ -13,7 +13,7 @@ pub struct DailyArgs {
 
     /// Whether to create the daily note file if it doesn't already exist (`--create false` only
     /// prints the path)
-    #[arg(short, long, default_value_t = true, action = ArgAction::Set)]
+    #[arg(short, long, default_value_t = true, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub create: bool,
 }
 

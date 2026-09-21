@@ -148,6 +148,36 @@ fn compute_calls() -> usize {
     COMPUTE_CALLS.with(|c| c.get())
 }
 
+/// Whether a fragment that is not a heading is still a real anchor: `#top` (every viewer knows it)
+/// or an HTML `id`/`name` that the note itself defines (`<a id="x">`, `<h2 id='x'>`).
+fn names_a_non_heading_anchor(target: &Document, fragment: Option<&str>) -> bool {
+    let Some(fragment) = fragment.map(str::trim).filter(|f| !f.is_empty()) else {
+        return false;
+    };
+    if fragment.eq_ignore_ascii_case("top") {
+        return true;
+    }
+    let source = target.line_index.source();
+    ["id", "name"].iter().any(|attribute| {
+        ['"', '\'']
+            .iter()
+            .any(|quote| source.contains(&format!("{attribute}={quote}{fragment}{quote}")))
+    })
+}
+
+/// Whether a frontmatter block has a line that starts like a YAML key (`title:`, `my-key: value`).
+fn looks_like_yaml_keys(block: &str) -> bool {
+    block.lines().any(|line| {
+        let line = line.trim_start();
+        line.split_once(':').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
+        })
+    })
+}
+
 /// Computes all language server diagnostics for a single document.
 pub fn compute_diagnostics(
     doc: &Document,
@@ -188,6 +218,14 @@ pub fn compute_diagnostics(
                             ..Default::default()
                         });
                     }
+                    // `[t](#top)`, `[t](note.md#custom-id)`: a Markdown link's fragment may also name
+                    // a viewer's own anchor (`#top`) or an HTML id the note defines itself.
+                    satz_core::LinkResolution::AnchorMissing { doc: target }
+                        if link.kind == LinkKind::Markdown
+                            && names_a_non_heading_anchor(
+                                target,
+                                link.target_heading.as_deref(),
+                            ) => {}
                     satz_core::LinkResolution::AnchorMissing { .. } => {
                         let message = if let Some(h) = &link.target_heading {
                             if link.target_doc.is_empty() {
@@ -255,7 +293,11 @@ pub fn compute_diagnostics(
 
     // 1b. A frontmatter block that cannot be read: its title, aliases and tags are ignored, which
     // would otherwise be invisible.
-    if let (Some(error), Some(range)) = (&doc.frontmatter_error, doc.frontmatter_range) {
+    // A pair of horizontal rules around ordinary text (`---`, words, `---`) is read as a block too,
+    // but nobody meant it as frontmatter: only a block with a `key:` line is worth a warning.
+    if let (Some(error), Some(range)) = (&doc.frontmatter_error, doc.frontmatter_range)
+        && looks_like_yaml_keys(&doc.line_index.source()[range.start..range.end])
+    {
         diagnostics.push(lsp::Diagnostic {
             range: byte_range_to_lsp(range, &doc.line_index),
             severity: Some(lsp::DiagnosticSeverity::WARNING),
@@ -930,5 +972,93 @@ mod tests {
                 .iter()
                 .all(|r| matches!(r, lsp::WorkspaceDocumentDiagnosticReport::Unchanged(_)))
         );
+    }
+
+    // ---- Markdown links are only checked for their note, not for `#fragment`s that are not headings ----
+
+    fn codes_of(files: &[(&str, &str)], note: &str) -> Vec<String> {
+        let state = ready_state(files);
+        let doc = state.index.get_doc_by_path(Path::new(note)).unwrap();
+        compute_diagnostics(doc, &state.index, &state.config)
+            .into_iter()
+            .filter_map(|d| match d.code {
+                Some(lsp::NumberOrString::String(c)) if c != "orphan-note" => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_markdown_link_to_an_html_anchor_or_top_is_not_a_broken_heading() {
+        let files = [
+            (
+                "a.md",
+                "# A\n\n[top](#top) and [x](b.md#custom-id) and [y](#own-id)\n\n<a id=\"own-id\"></a>\n",
+            ),
+            ("b.md", "# B\n\n<h2 id='custom-id'>Styled</h2>\n"),
+        ];
+        assert_eq!(codes_of(&files, "a.md"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_markdown_link_to_a_fragment_that_is_neither_a_heading_nor_an_anchor_is_still_reported() {
+        let files = [
+            ("a.md", "# A\n\n[x](b.md#nope) and [y](#nothing)\n"),
+            ("b.md", "# B\n\n<a id=\"other\"></a>\n"),
+        ];
+        assert_eq!(
+            codes_of(&files, "a.md"),
+            vec!["broken-heading", "broken-heading"]
+        );
+    }
+
+    #[test]
+    fn a_markdown_link_to_a_missing_note_is_still_broken() {
+        let files = [("a.md", "# A\n\n[x](missing.md#top) and [y](nope.md)\n")];
+        assert_eq!(codes_of(&files, "a.md"), vec!["broken-link", "broken-link"]);
+    }
+
+    #[test]
+    fn a_wikilink_to_a_missing_heading_is_still_reported() {
+        let files = [
+            ("a.md", "# A\n\n[[b#Nope]] and [[#Also nope]]\n"),
+            ("b.md", "# B\n"),
+        ];
+        assert_eq!(
+            codes_of(&files, "a.md"),
+            vec!["broken-heading", "broken-heading"]
+        );
+    }
+
+    // ---- a `---` ... `---` pair around ordinary text is horizontal rules, not broken frontmatter ----
+
+    #[test]
+    fn prose_between_two_horizontal_rules_at_the_top_is_not_reported_as_frontmatter() {
+        for text in [
+            "---\nJust some words\nand more words\n---\n\n# Title\n",
+            "---\n\n---\n# Empty block\n",
+            "---\n* a\n* b\n---\nbody\n",
+        ] {
+            assert_eq!(
+                codes_of(&[("a.md", text)], "a.md"),
+                Vec::<String>::new(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontmatter_that_looks_like_yaml_but_is_broken_is_still_reported() {
+        for text in [
+            "---\ntitle: [unclosed\ntags: x\n---\n# T\n",
+            "---\ntitle: a: b: c\n---\n# T\n",
+            "---\nkey: value\n  bad indent: [\n---\n# T\n",
+        ] {
+            assert_eq!(
+                codes_of(&[("a.md", text)], "a.md"),
+                vec!["invalid-frontmatter"],
+                "{text:?}"
+            );
+        }
     }
 }

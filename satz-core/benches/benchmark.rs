@@ -151,5 +151,62 @@ fn main() {
         wrapped.len()
     );
 
+    // 9. Editing one note of a 5000-note vault: an edit that keeps the note's title, aliases and
+    //    file name (ordinary typing) against one that changes its title (typing in the H1).
+    let big_docs: Vec<_> = (0..5000)
+        .map(|i| {
+            let content = format!(
+                "---
+title: Note {i}
+aliases: [N{i}]
+---
+
+# Note {i}
+
+Link to [[Note {}]] and [[Note {}]] and [[N{}]].
+",
+                (i + 1) % 5000,
+                (i + 7) % 5000,
+                (i + 13) % 5000
+            );
+            parse_document(
+                &content,
+                &PathBuf::from(format!("folder_{}/note_{i}.md", i % 50)),
+            )
+        })
+        .collect();
+    let mut big_index = Index::build(big_docs);
+    let same_identity = "---
+title: Note 42
+aliases: [N42]
+---
+
+# Note 42
+
+Link to [[Note 43]] and more words.
+";
+    let t8 = Instant::now();
+    for round in 0..20 {
+        let text = format!("{same_identity}{round}");
+        big_index.replace_doc(black_box(parse_document(
+            &text,
+            &PathBuf::from("folder_42/note_42.md"),
+        )));
+    }
+    let typing_time = t8.elapsed() / 20;
+    let t9 = Instant::now();
+    for round in 0..20 {
+        let text = same_identity.replace("Note 42", &format!("Note 42 v{round}"));
+        big_index.replace_doc(black_box(parse_document(
+            &text,
+            &PathBuf::from("folder_42/note_42.md"),
+        )));
+    }
+    let retitle_time = t9.elapsed() / 20;
+    println!(
+        "9. One edit in a 5,000-note vault: ordinary typing {:?}, title changed {:?} (per replace_doc, parse included)",
+        typing_time, retitle_time
+    );
+
     println!("============================================================");
 }

@@ -503,4 +503,40 @@ mod tests {
             }
         }
     }
+
+    // ---- a table whose rows end in an empty extra cell is still aligned ----
+
+    #[test]
+    fn empty_extra_cells_at_the_end_of_a_row_do_not_stop_the_table_being_aligned() {
+        assert_eq!(
+            formatted("| a | b |\n|---|---|\n| 1 | 2 | |\n| longer | 4 |  |\n"),
+            "| a      | b   |\n|--------|-----|\n| 1      | 2   |\n| longer | 4   |\n"
+        );
+        // A header with more cells than the delimiter row is not a table at all (GFM), so it stays.
+        let not_a_table = "| a | b | |\n|---|---|\n| 1 | 2 |\n";
+        assert_eq!(formatted(not_a_table), not_a_table);
+        // The same in a block quote.
+        assert_eq!(
+            formatted("> | a | b |\n> |---|---|\n> | 1 | 2 | |\n"),
+            "> | a   | b   |\n> |-----|-----|\n> | 1   | 2   |\n"
+        );
+    }
+
+    #[test]
+    fn a_row_with_a_real_extra_cell_still_leaves_the_table_exactly_as_written() {
+        for text in [
+            "| a | b |\n|---|---|\n| 1 | 2 | 3 |\n",
+            "| a | b |\n|---|---|\n| 1 | 2 | | 3 |\n",
+            "| a | b |\n|---|---|\n| 1 | 2 | x | |\n",
+        ] {
+            assert_eq!(formatted(text), text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_with_empty_extra_cells_is_stable_after_one_pass() {
+        let once = formatted("| a | b |\n|---|---|\n| 1 | 2 | |\n");
+        assert_eq!(formatted(&once), once);
+        assert!(!once.contains("| |"), "{once:?}");
+    }
 }

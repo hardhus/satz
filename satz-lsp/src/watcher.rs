@@ -209,6 +209,11 @@ async fn process_file_event(
             }
         }
     } else {
+        // An existing folder the index already holds notes of says nothing new (saving a note makes
+        // some systems report its folder as modified too): its notes have their own events.
+        if path.is_dir() && !folder_event_is_news(&*state.read().await, path, vault_root) {
+            return false;
+        }
         // Reading and parsing (a file, or a whole folder) happens before the lock is taken.
         let (owned_path, owned_root) = (path.to_path_buf(), vault_root.to_path_buf());
         let prepared =
@@ -303,6 +308,19 @@ pub(crate) fn prepare_fs_change(path: &Path, vault_root: &Path) -> PreparedChang
         return PreparedChange::RemovePrefix(rel);
     }
     PreparedChange::Skip
+}
+
+/// Whether an event for an existing folder can tell the index anything: only when it holds notes the
+/// index does not know yet (a folder created, moved in or copied in). Editors saving a note also
+/// make the OS report the folder as modified; re-reading every note in it for that is wasted work.
+pub(crate) fn folder_event_is_news(state: &SatzState, folder: &Path, vault_root: &Path) -> bool {
+    let rel = SatzState::get_rel_path(folder, Some(vault_root))
+        .to_string_lossy()
+        .replace('\\', "/");
+    !state
+        .index
+        .documents()
+        .any(|doc| is_inside(doc.id.as_str(), &rel))
 }
 
 /// Whether `id` is `prefix` itself or lies inside the folder `prefix`, ignoring case and spelling
@@ -1337,6 +1355,89 @@ today = [\"heute\"]
         assert!(matches!(
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn saving_one_note_forwards_no_folder_event_that_would_rescan_the_whole_folder() {
+        let v = TempVault::new("save-events");
+        let sub = v.0.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..3 {
+            std::fs::write(sub.join(format!("n{i}.md")), "# n\n").unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = WatcherHandle::default();
+        let thread = spawn_notify_thread(v.0.clone(), tx, handle.clone());
+        std::thread::sleep(Duration::from_millis(400));
+
+        // What an editor's save does: write the file (and here also once more, as some do).
+        std::fs::write(sub.join("n1.md"), "# n changed\n").unwrap();
+        std::fs::write(sub.join("n1.md"), "# n changed again\n").unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+
+        handle.stop();
+        wait_until("the thread to end", || thread.is_finished());
+        let mut seen = Vec::new();
+        while let Ok(path) = rx.try_recv() {
+            seen.push(path);
+        }
+        assert!(
+            seen.iter().any(|p| p.ends_with("n1.md")),
+            "the save was seen: {seen:?}"
+        );
+        // Some platforms report the folder as modified too (Windows does). Whatever is reported, a
+        // folder whose notes the index already holds must not be scanned again.
+        let mut state = SatzState::with_vault_root(v.0.clone());
+        state.index = satz_core::Index::build(
+            (0..3)
+                .map(|i| satz_core::parse_document("# n\n", Path::new(&format!("sub/n{i}.md"))))
+                .collect(),
+        );
+        for path in seen.iter().filter(|p| p.is_dir()) {
+            assert!(
+                !folder_event_is_news(&state, path, &v.0),
+                "a save reported the folder {path:?}, which would re-read all its notes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_event_is_news_only_when_the_index_lacks_notes_of_that_folder() {
+        let v = TempVault::new("folder-news");
+        let known = v.0.join("known");
+        let fresh = v.0.join("fresh");
+        std::fs::create_dir_all(&known).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let mut state = SatzState::with_vault_root(v.0.clone());
+        state.index = satz_core::Index::build(vec![
+            satz_core::parse_document("# a\n", Path::new("known/a.md")),
+            satz_core::parse_document("# b\n", Path::new("known/deeper/b.md")),
+            satz_core::parse_document("# c\n", Path::new("knownish/c.md")),
+        ]);
+        assert!(
+            !folder_event_is_news(&state, &known, &v.0),
+            "notes of it are indexed"
+        );
+        assert!(
+            folder_event_is_news(&state, &fresh, &v.0),
+            "nothing of it is indexed"
+        );
+        // Spelling of the event path does not matter (case, separators).
+        let upper = v.0.join("KNOWN");
+        assert!(!folder_event_is_news(&state, &upper, &v.0));
+        // A folder that only has a similarly named sibling in the index is still new.
+        let mut only_sibling = SatzState::with_vault_root(v.0.clone());
+        only_sibling.index = satz_core::Index::build(vec![satz_core::parse_document(
+            "# c\n",
+            Path::new("knownish/c.md"),
+        )]);
+        assert!(folder_event_is_news(&only_sibling, &known, &v.0));
+        // An empty index: every folder is news.
+        assert!(folder_event_is_news(
+            &SatzState::with_vault_root(v.0.clone()),
+            &known,
+            &v.0
         ));
     }
 }

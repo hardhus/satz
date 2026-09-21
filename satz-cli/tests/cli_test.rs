@@ -652,20 +652,24 @@ fn daily_create_false_prints_the_path_and_creates_nothing() {
 }
 
 #[test]
-fn daily_create_without_a_value_is_a_usage_error() {
-    let v = TempDir::new("daily_novalue");
-    let before = snapshot(v.path());
+fn daily_create_as_a_bare_flag_means_true_as_it_always_did() {
+    for flag in ["--create", "-c"] {
+        let v = TempDir::new("daily_bareflag");
 
-    let o = satz(&["daily", v.str(), "--create"]);
+        let o = satz(&["daily", v.str(), flag]);
 
-    assert_eq!(
-        o.status.code(),
-        Some(2),
-        "clap usage errors exit 2: {}",
-        err(&o)
-    );
-    assert!(err(&o).contains("--create"));
-    assert_eq!(snapshot(v.path()), before);
+        assert!(o.status.success(), "{flag}: {}", err(&o));
+        let printed = std::path::PathBuf::from(out(&o).trim());
+        assert!(
+            printed.exists(),
+            "{flag}: the note was created at {printed:?}"
+        );
+    }
+    // A value still works next to it, and the bare flag can come last or first.
+    let v = TempDir::new("daily_bareflag_false");
+    let o = satz(&["daily", v.str(), "--create", "false"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!std::path::PathBuf::from(out(&o).trim()).exists());
 }
 
 #[test]

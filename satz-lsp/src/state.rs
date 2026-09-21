@@ -39,7 +39,10 @@ impl OpenDocument {
         content: impl Into<String>,
         version: i32,
     ) -> Self {
-        let rope = Rope::from_str(&content.into());
+        // A byte order mark belongs to the file, not to the text: the parser leaves it out of the
+        // indexed text, so the live buffer must too, or line 0 would be three bytes off between them.
+        let content = content.into();
+        let rope = Rope::from_str(content.strip_prefix('\u{feff}').unwrap_or(&content));
         Self {
             uri: uri.into(),
             path,
@@ -2088,5 +2091,37 @@ mod tests {
             "a header and one line each: {message}"
         );
         assert_eq!(config_warnings_message(&[]), "");
+    }
+
+    // ---- a byte order mark at the start of the text ----
+
+    #[test]
+    fn a_byte_order_mark_is_not_part_of_the_open_buffer_so_buffer_and_index_agree() {
+        let mut state = SatzState::with_vault_root("/vault");
+        state.open_document(
+            "file:///a.md",
+            "\u{feff}# T\n\n[[b]] here\n",
+            Path::new("/vault/a.md"),
+            1,
+        );
+        let open = &state.open_docs["file:///a.md"];
+        let buffer = open.rope.to_string();
+        let indexed = state.index.get_doc(&satz_core::DocId::new("a.md")).unwrap();
+        assert_eq!(buffer, "# T\n\n[[b]] here\n");
+        assert_eq!(
+            buffer,
+            indexed.line_index.source(),
+            "the live text and the parsed text are the same text"
+        );
+        assert!(!state.has_stale_open_documents());
+    }
+
+    #[test]
+    fn a_buffer_without_a_mark_and_one_that_is_only_a_mark_are_handled() {
+        let mut state = SatzState::with_vault_root("/vault");
+        state.open_document("file:///a.md", "# T\n", Path::new("/vault/a.md"), 1);
+        assert_eq!(state.open_docs["file:///a.md"].rope.to_string(), "# T\n");
+        state.open_document("file:///b.md", "\u{feff}", Path::new("/vault/b.md"), 1);
+        assert_eq!(state.open_docs["file:///b.md"].rope.to_string(), "");
     }
 }

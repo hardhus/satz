@@ -61,7 +61,12 @@ pub fn parse_table_block(source: &str, range: ByteRange) -> Option<TableBlock> {
     let col_count = alignments.len();
 
     let mut dropped_cells = 0usize;
-    let mut normalize = |cells: Vec<String>| {
+    let mut normalize = |mut cells: Vec<String>| {
+        // Empty cells past the last column (`| 1 | 2 | |`) hold nothing: dropping them loses no text
+        // and GFM ignores them anyway. Only extra cells with content make the table unsafe to redo.
+        while cells.len() > col_count && cells.last().is_some_and(|c| c.is_empty()) {
+            cells.pop();
+        }
         dropped_cells += cells.len().saturating_sub(col_count);
         normalize_row(cells, col_count)
     };

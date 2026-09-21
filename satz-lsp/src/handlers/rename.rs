@@ -509,7 +509,13 @@ fn names_file(target: &str, old_rel_path: &std::path::Path) -> bool {
         .file_stem()
         .map(|s| satz_core::fold_key(&s.to_string_lossy()))
         .unwrap_or_default();
-    wanted == full || wanted == stem || full.ends_with(&format!("/{wanted}"))
+    // A wrong or shorter folder part still reaches the note by its file name (`[[wrong/a]]` finds
+    // `sub/a.md` the way `[[a]]` does), and such a link stops working when the file is renamed.
+    let last_component = wanted.rsplit('/').next().unwrap_or(&wanted);
+    wanted == full
+        || wanted == stem
+        || full.ends_with(&format!("/{wanted}"))
+        || (!stem.is_empty() && last_component == stem)
 }
 
 /// Per-file edits in a stable order: files by URI, edits by position.
@@ -1582,5 +1588,39 @@ mod tests {
         let applied = v.rename("a.md", 0, 20, "z").unwrap();
         // The alias keeps working (it names no file); the link that names the file follows it.
         assert_eq!(applied.texts["a.md"], "[[today]] and [[z]]\n");
+    }
+
+    // ---- a link that finds the note by its file name in a wrong folder is renamed too ----
+
+    #[test]
+    fn a_link_that_reaches_the_note_through_its_file_name_in_another_folder_is_renamed() {
+        let v = vault(&[
+            ("sub/a.md", "# A\n"),
+            (
+                "b.md",
+                "One [[wrong/a]] two [[a]] three [[sub/a]] four [[nowhere/deeper/a.md]]\n",
+            ),
+        ]);
+        let applied = v.rename("b.md", 0, 22, "z").unwrap();
+        assert_eq!(
+            applied.texts["b.md"],
+            "One [[wrong/z]] two [[z]] three [[sub/z]] four [[nowhere/deeper/z.md]]\n"
+        );
+    }
+
+    #[test]
+    fn links_that_reach_the_note_by_title_or_alias_are_left_alone_by_a_note_rename() {
+        let v = vault(&[
+            (
+                "sub/a.md",
+                "---\ntitle: The A\naliases: [Alpha]\n---\n# A\n",
+            ),
+            ("b.md", "[[The A]] [[Alpha]] [[other/The A]] [[a]]\n"),
+        ]);
+        let applied = v.rename("b.md", 0, 38, "z").unwrap();
+        assert_eq!(
+            applied.texts["b.md"],
+            "[[The A]] [[Alpha]] [[other/The A]] [[z]]\n"
+        );
     }
 }
