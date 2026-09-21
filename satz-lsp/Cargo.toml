@@ -19,3 +19,7 @@ tokio.workspace = true
 tower-lsp-server.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[[bench]]
+name = "benchmark"
+harness = false
