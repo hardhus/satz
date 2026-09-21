@@ -63,32 +63,8 @@ pub(crate) fn refresh_succeeded<T, E: std::fmt::Display>(
     }
 }
 
-/// How long a `semanticTokens/full` request may wait for the first indexing to finish.
-pub(crate) const FIRST_INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// How long a refresh request may wait for the client's answer.
 pub(crate) const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Waits until the first indexing has finished (at most `limit`), and says how long it waited.
-///
-/// A note opened while the vault is still being indexed is coloured from an incomplete index (its
-/// links look unresolved). Answering the first colour request only once the index is complete makes
-/// that first answer right, so the colours no longer depend on the client acting on a refresh
-/// request afterwards. The state lock is never held while waiting.
-pub(crate) async fn wait_for_first_index(
-    state: &Arc<RwLock<SatzState>>,
-    limit: std::time::Duration,
-    every: std::time::Duration,
-) -> std::time::Duration {
-    let started = std::time::Instant::now();
-    while !state.read().await.is_indexing_complete() {
-        if started.elapsed() >= limit {
-            break;
-        }
-        tokio::time::sleep(every).await;
-    }
-    started.elapsed()
-}
 
 /// How a refresh request ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,13 +290,82 @@ pub(crate) fn pick_workspace_root(folders: &[String], root_uri: Option<&str>) ->
     }
 }
 
+/// Tells the user what the first indexing came to: how many notes, or why it failed, and every
+/// problem `.satz.toml` had (an unusable file, settings that were ignored).
+async fn announce_indexing(client: &Client, outcome: &crate::state::IndexingOutcome) {
+    if let Some(failure) = &outcome.failure {
+        // The server keeps working for the documents that are open; the reason is shown.
+        tracing::error!(error = %failure, "walk_vault: failed");
+        let message = format!("satz: indexing failed: {failure}");
+        client.log_message(MessageType::ERROR, &message).await;
+        client.show_message(MessageType::ERROR, message).await;
+    } else {
+        tracing::info!(doc_count = outcome.doc_count, "walk_vault: succeeded");
+        client
+            .log_message(
+                MessageType::INFO,
+                format!("satz: indexed {} documents", outcome.doc_count),
+            )
+            .await;
+    }
+
+    // A `.satz.toml` that exists but can't be used must be visible: falling back to defaults
+    // silently would look like the settings were ignored.
+    if let Some(error) = &outcome.config_error {
+        let message = crate::state::config_error_message(error, "default");
+        client.log_message(MessageType::WARNING, &message).await;
+        client.show_message(MessageType::WARNING, message).await;
+    }
+    // Settings that were ignored (an unknown key, a value outside its choices): the rest of the
+    // file applies, so this is the only place the user learns of them.
+    if !outcome.config_warnings.is_empty() {
+        let message = crate::state::config_warnings_message(&outcome.config_warnings);
+        client.log_message(MessageType::WARNING, &message).await;
+        client.show_message(MessageType::WARNING, message).await;
+    }
+}
+
+/// After an indexing that finished while documents were already open: their diagnostics (and, for a
+/// client that asks for them, their colours) were computed from a partial index, so they are
+/// published or refreshed again. Both refreshes go out at once and neither waits for the other's
+/// answer.
+async fn refresh_after_first_index(client: &Client, state_arc: &Arc<RwLock<SatzState>>) {
+    let (supports_pull, uris) = {
+        let s = state_arc.read().await;
+        (
+            s.client_supports_pull_diagnostics,
+            s.open_docs.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+    if !supports_pull {
+        for uri in uris {
+            publish_for(client, state_arc, &uri).await;
+        }
+    }
+    tokio::join!(refresh_semantic_tokens(client, state_arc), async {
+        if supports_pull {
+            refresh_diagnostics(client, state_arc).await;
+        }
+    });
+}
+
 pub struct Backend {
     pub client: Client,
     pub state: Arc<RwLock<SatzState>>,
     log_reload_handle: LogReloadHandle,
     /// The running file watcher, if any: a new one replaces (stops) the old, `shutdown` stops it.
     watcher: Arc<std::sync::Mutex<Option<crate::watcher::WatcherHandle>>>,
+    /// How long `initialize` waits for the first indexing before it answers anyway.
+    initialize_wait: std::time::Duration,
+    /// The first indexing itself (replaceable in tests).
+    index_job: fn(PathBuf) -> anyhow::Result<SatzState>,
+    /// What the first indexing came to, kept until `initialized` may announce it.
+    pending_announcement: Arc<std::sync::Mutex<Option<crate::state::IndexingOutcome>>>,
 }
+
+/// How long `initialize` waits for the first indexing (a vault that is slower to read than this is
+/// indexed in the background, as before).
+pub(crate) const INITIALIZE_INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Computes diagnostics for the specified open document URI and sends them to the client.
 pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>, uri: &str) {
@@ -406,6 +451,9 @@ impl Backend {
             state: Arc::new(RwLock::new(SatzState::default())),
             log_reload_handle,
             watcher: Default::default(),
+            initialize_wait: INITIALIZE_INDEX_WAIT,
+            index_job: SatzState::initialize_index,
+            pending_announcement: Default::default(),
         }
     }
 
@@ -496,92 +544,56 @@ impl LanguageServer for Backend {
         tracing::debug!(?vault_root, "initialize: resolved vault root");
 
         if let Some(root) = vault_root {
-            let state_arc = self.state.clone();
-            let client = self.client.clone();
-            let root_clone = root.clone();
-            let watcher_slot = self.watcher.clone();
+            tracing::debug!(vault_root = ?root, "walk_vault: starting");
+            // Watching starts BEFORE the walk: what changes while it runs is held back until the
+            // index is complete and is then applied from what is on disk.
+            let handle = crate::watcher::spawn_watcher(
+                root.clone(),
+                self.state.clone(),
+                self.client.clone(),
+            );
+            if let Some(old) = self.watcher.lock().unwrap().replace(handle) {
+                old.stop();
+            }
 
-            tokio::task::spawn(async move {
-                tracing::debug!(vault_root = ?root_clone, "walk_vault: starting");
-                // Watching starts BEFORE the walk: what changes while it runs is held back until
-                // the index is complete and is then applied from what is on disk.
-                let handle = crate::watcher::spawn_watcher(
-                    root_clone.clone(),
-                    state_arc.clone(),
-                    client.clone(),
-                );
-                if let Some(old) = watcher_slot.lock().unwrap().replace(handle) {
-                    old.stop();
+            // The first indexing is waited for (up to `initialize_wait`) BEFORE the answer to
+            // `initialize` goes out. The client sends `didOpen` and its first requests only after
+            // that answer, so they all meet a complete index: an editor that asks for the links of
+            // the note it opens (Helix's `documentLink`) gets them, where an index that was still
+            // empty answered `[]` and the client only asked again after the next edit.
+            let job = self.index_job;
+            let root_for_job = root.clone();
+            let mut indexing = tokio::task::spawn_blocking(move || job(root_for_job));
+            match tokio::time::timeout(self.initialize_wait, &mut indexing).await {
+                Ok(joined) => {
+                    let result = joined.unwrap_or_else(|e| {
+                        Err(anyhow::anyhow!("the indexing task panicked: {e}"))
+                    });
+                    let outcome = self.state.write().await.finish_indexing(result, &root);
+                    // Nothing has been opened yet, so there is nothing to refresh; the server may
+                    // not send requests before it has answered, so what happened is announced
+                    // once `initialized` arrives.
+                    *self.pending_announcement.lock().unwrap() = Some(outcome);
                 }
-
-                let root_for_blocking = root_clone.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    SatzState::initialize_index(root_for_blocking)
-                })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("the indexing task panicked: {e}")));
-
-                let outcome = {
-                    let mut current_state = state_arc.write().await;
-                    current_state.finish_indexing(result, &root_clone)
-                };
-
-                if let Some(failure) = &outcome.failure {
-                    // The server keeps working for the documents that are open; the reason is shown.
-                    tracing::error!(error = %failure, "walk_vault: failed");
-                    let message = format!("satz: indexing failed: {failure}");
-                    client.log_message(MessageType::ERROR, &message).await;
-                    client.show_message(MessageType::ERROR, message).await;
-                } else {
-                    tracing::info!(doc_count = outcome.doc_count, "walk_vault: succeeded");
-                    client
-                        .log_message(
-                            MessageType::INFO,
-                            format!("satz: indexed {} documents", outcome.doc_count),
-                        )
-                        .await;
+                Err(_) => {
+                    // A vault that takes longer than that (or a stalled disk): answer now and
+                    // finish in the background; documents opened meanwhile are refreshed after.
+                    tracing::debug!(
+                        waited = ?self.initialize_wait,
+                        "initialize: the first indexing is still running; answering anyway"
+                    );
+                    let state_arc = self.state.clone();
+                    let client = self.client.clone();
+                    tokio::task::spawn(async move {
+                        let result = indexing.await.unwrap_or_else(|e| {
+                            Err(anyhow::anyhow!("the indexing task panicked: {e}"))
+                        });
+                        let outcome = state_arc.write().await.finish_indexing(result, &root);
+                        announce_indexing(&client, &outcome).await;
+                        refresh_after_first_index(&client, &state_arc).await;
+                    });
                 }
-
-                // A `.satz.toml` that exists but can't be used must be visible: falling back to
-                // defaults silently would look like the settings were ignored.
-                if let Some(error) = outcome.config_error {
-                    let message = crate::state::config_error_message(&error, "default");
-                    client.log_message(MessageType::WARNING, &message).await;
-                    client.show_message(MessageType::WARNING, message).await;
-                }
-                // Settings that were ignored (an unknown key, a value outside its choices): the rest
-                // of the file applies, so this is the only place the user learns of them.
-                if !outcome.config_warnings.is_empty() {
-                    let message = crate::state::config_warnings_message(&outcome.config_warnings);
-                    client.log_message(MessageType::WARNING, &message).await;
-                    client.show_message(MessageType::WARNING, message).await;
-                }
-
-                let (supports_pull, uris) = {
-                    let s = state_arc.read().await;
-                    (
-                        s.client_supports_pull_diagnostics,
-                        s.open_docs.keys().cloned().collect::<Vec<_>>(),
-                    )
-                };
-
-                if !supports_pull {
-                    for uri in uris {
-                        publish_for(&client, &state_arc, &uri).await;
-                    }
-                }
-
-                // Any document opened before indexing finished had its links colored against a
-                // still-partial index (peers not yet indexed resolve as missing), so its semantic
-                // tokens and diagnostics may be wrong now that the full index is in place. Both
-                // refreshes go out at once and neither waits for the other's answer: a client that
-                // never answers `workspace/diagnostic/refresh` must not keep the colours stale.
-                tokio::join!(refresh_semantic_tokens(&client, &state_arc), async {
-                    if supports_pull {
-                        refresh_diagnostics(&client, &state_arc).await;
-                    }
-                });
-            });
+            }
         } else {
             // No workspace root at all: there is no vault to walk, so there is nothing for
             // `indexing_complete` to wait on — diagnostics can run immediately.
@@ -604,6 +616,10 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "satz-lsp initialized")
             .await;
+        let outcome = self.pending_announcement.lock().unwrap().take();
+        if let Some(outcome) = outcome {
+            announce_indexing(&self.client, &outcome).await;
+        }
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
@@ -828,21 +844,12 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
-        // Asked while the vault is still being indexed: wait for it (bounded), so the first colours
-        // are computed from the complete index and not from a partial one.
-        let waited = wait_for_first_index(
-            &self.state,
-            FIRST_INDEX_WAIT,
-            std::time::Duration::from_millis(25),
-        )
-        .await;
         let state = self.read_fresh().await;
         let answer = crate::handlers::semantic_tokens::semantic_tokens_full(params, &state);
         if let Some(SemanticTokensResult::Tokens(tokens)) = &answer {
             let unresolved = tokens.data.iter().filter(|t| t.token_type == 1).count();
             tracing::debug!(
                 indexing_complete = state.is_indexing_complete(),
-                ?waited,
                 tokens = tokens.data.len(),
                 unresolved_links = unresolved,
                 "semantic_tokens_full"
@@ -1977,97 +1984,6 @@ mod tests {
 
     // ---- the first colours are right, and the refreshes do not wait for each other ----
 
-    fn quick() -> std::time::Duration {
-        std::time::Duration::from_millis(10)
-    }
-
-    #[tokio::test]
-    async fn nothing_is_waited_for_when_the_first_indexing_is_done() {
-        let (backend, _service) = shared_backend().await;
-        let started = std::time::Instant::now();
-        let waited =
-            wait_for_first_index(&backend.state, std::time::Duration::from_secs(5), quick()).await;
-        assert!(waited < std::time::Duration::from_millis(50), "{waited:?}");
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
-    }
-
-    #[tokio::test]
-    async fn the_wait_ends_when_the_indexing_finishes_and_gives_up_at_the_limit() {
-        let (backend, _service) = shared_backend().await;
-        backend.state.write().await.set_indexing_complete(false);
-        let state = backend.state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            state.write().await.set_indexing_complete(true);
-        });
-        let waited =
-            wait_for_first_index(&backend.state, std::time::Duration::from_secs(5), quick()).await;
-        assert!(
-            waited >= std::time::Duration::from_millis(100)
-                && waited < std::time::Duration::from_secs(2),
-            "{waited:?}"
-        );
-        // Never finishing: the wait stops at the limit, it never hangs.
-        backend.state.write().await.set_indexing_complete(false);
-        let waited = wait_for_first_index(
-            &backend.state,
-            std::time::Duration::from_millis(150),
-            quick(),
-        )
-        .await;
-        assert!(
-            waited >= std::time::Duration::from_millis(140)
-                && waited < std::time::Duration::from_secs(2),
-            "{waited:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_first_answer_of_a_note_opened_during_indexing_has_its_links_resolved() {
-        // `a.md` links to `b`, which the index only learns about when the first indexing finishes.
-        // A client that asks for colours right after opening the note must get the finished ones.
-        let (backend, _service) = shared_backend().await;
-        {
-            let mut state = backend.state.write().await;
-            state.set_indexing_complete(false);
-            type_full(&mut state, "file:///a.md", 2, "# A\n\nsee [[b]] here\n");
-        }
-        let state = backend.state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let mut state = state.write().await;
-            state.index.replace_doc(satz_core::parse_document(
-                "# B\n",
-                std::path::Path::new("b.md"),
-            ));
-            state.set_indexing_complete(true);
-        });
-        let answer = backend
-            .semantic_tokens_full(SemanticTokensParams {
-                text_document: TextDocumentIdentifier {
-                    uri: "file:///a.md".parse().unwrap(),
-                },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
-            })
-            .await
-            .unwrap();
-        let Some(SemanticTokensResult::Tokens(tokens)) = answer else {
-            panic!("tokens expected");
-        };
-        let link_types: Vec<u32> = tokens
-            .data
-            .iter()
-            .map(|t| t.token_type)
-            .filter(|t| *t <= 1)
-            .collect();
-        assert_eq!(
-            link_types,
-            vec![0],
-            "one link token, resolved (0), not unresolved (1)"
-        );
-    }
-
     #[tokio::test]
     async fn a_refresh_that_is_never_answered_times_out_and_does_not_hold_back_another() {
         let started = std::time::Instant::now();
@@ -2104,5 +2020,196 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, RefreshOutcome::Failed);
+    }
+
+    // ---- initialize waits for the first indexing, so the first request already sees every note ----
+
+    async fn fresh_backend(
+        job: fn(PathBuf) -> anyhow::Result<SatzState>,
+        wait: std::time::Duration,
+    ) -> (Backend, tower_lsp_server::LspService<Backend>) {
+        let client_slot = std::sync::Mutex::new(None);
+        let (_layer, handle): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            *client_slot.lock().unwrap() = Some(client.clone());
+            Backend::new(client, handle)
+        });
+        let client = client_slot.lock().unwrap().take().unwrap();
+        let (_layer2, handle2): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
+        let mut backend = Backend::new(client, handle2);
+        backend.index_job = job;
+        backend.initialize_wait = wait;
+        (backend, service)
+    }
+
+    struct VaultDir(PathBuf);
+    impl VaultDir {
+        fn new(tag: &str, files: &[(&str, &str)]) -> Self {
+            let dir = std::env::temp_dir().join(format!("satz_init_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for (rel, text) in files {
+                let path = dir.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for VaultDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn init_params(root: Option<&std::path::Path>) -> InitializeParams {
+        InitializeParams {
+            workspace_folders: root.map(|r| {
+                vec![WorkspaceFolder {
+                    uri: crate::convert::path_to_uri(r).unwrap(),
+                    name: "vault".to_string(),
+                }]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn slow_job(root: PathBuf) -> anyhow::Result<SatzState> {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        SatzState::initialize_index(root)
+    }
+
+    fn failing_job(_root: PathBuf) -> anyhow::Result<SatzState> {
+        anyhow::bail!("the vault folder cannot be read")
+    }
+
+    #[tokio::test]
+    async fn the_first_document_link_after_initialize_already_has_every_link() {
+        // What Helix does: `initialize`, then `didOpen`, then `documentLink` at once. With the
+        // index still empty at that moment the answer used to be `[]`, and Helix only asks again
+        // after the next edit: the links of the first note stayed uncoloured.
+        let vault = VaultDir::new(
+            "links",
+            &[
+                ("tlp/a.md", "# A\n\nsee [[tlp/b]] and [[c#Head]]\n"),
+                ("tlp/b.md", "# B\n"),
+                ("c.md", "# C\n\n## Head\n"),
+            ],
+        );
+        let (backend, _service) = fresh_backend(slow_job, std::time::Duration::from_secs(10)).await;
+        backend
+            .initialize(init_params(Some(&vault.0)))
+            .await
+            .unwrap();
+        assert!(backend.state.read().await.is_indexing_complete());
+        assert_eq!(backend.state.read().await.index.doc_count(), 3);
+
+        let uri = crate::convert::path_to_uri(&vault.0.join("tlp/a.md")).unwrap();
+        backend
+            .did_open(open_params(
+                uri.as_str(),
+                0,
+                "# A\n\nsee [[tlp/b]] and [[c#Head]]\n",
+            ))
+            .await;
+        let links = backend
+            .document_link(DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("links");
+        let targets: Vec<String> = links
+            .iter()
+            .map(|l| l.target.as_ref().unwrap().as_str().to_string())
+            .collect();
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert!(
+            targets[0].ends_with("tlp/b.md") && targets[1].ends_with("c.md"),
+            "{targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_indexing_slower_than_the_limit_does_not_hold_initialize_up() {
+        let vault = VaultDir::new("slow", &[("a.md", "# A\n"), ("b.md", "# B\n")]);
+        let (backend, _service) =
+            fresh_backend(slow_job, std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        backend
+            .initialize(init_params(Some(&vault.0)))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            !backend.state.read().await.is_indexing_complete(),
+            "still indexing"
+        );
+        // The indexing finishes in the background and the state becomes complete.
+        for _ in 0..100 {
+            if backend.state.read().await.is_indexing_complete() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(backend.state.read().await.is_indexing_complete());
+        assert_eq!(backend.state.read().await.index.doc_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_result_of_the_first_indexing_is_announced_once_by_initialized() {
+        let vault = VaultDir::new("announce", &[("a.md", "# A\n")]);
+        std::fs::write(vault.0.join(".satz.toml"), "[nonsense]\nx = 1\n").unwrap();
+        let (backend, _service) = fresh_backend(slow_job, std::time::Duration::from_secs(10)).await;
+        backend
+            .initialize(init_params(Some(&vault.0)))
+            .await
+            .unwrap();
+        {
+            let pending = backend.pending_announcement.lock().unwrap();
+            let outcome = pending.as_ref().expect("kept for `initialized`");
+            assert_eq!(outcome.doc_count, 1);
+            assert_eq!(outcome.config_warnings.len(), 1);
+        }
+        backend.initialized(InitializedParams {}).await;
+        assert!(
+            backend.pending_announcement.lock().unwrap().is_none(),
+            "announced and cleared"
+        );
+        backend.initialized(InitializedParams {}).await; // a second one has nothing left to say
+        assert!(backend.pending_announcement.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_indexing_that_fails_still_answers_initialize_and_leaves_a_working_server() {
+        let vault = VaultDir::new("fail", &[("a.md", "# A\n")]);
+        let (backend, _service) =
+            fresh_backend(failing_job, std::time::Duration::from_secs(10)).await;
+        backend
+            .initialize(init_params(Some(&vault.0)))
+            .await
+            .unwrap();
+        assert!(
+            backend.state.read().await.is_indexing_complete(),
+            "nothing left to wait for"
+        );
+        let pending = backend.pending_announcement.lock().unwrap();
+        assert!(pending.as_ref().unwrap().failure.is_some());
+    }
+
+    #[tokio::test]
+    async fn without_a_vault_folder_initialize_does_not_wait_at_all() {
+        let (backend, _service) = fresh_backend(slow_job, std::time::Duration::from_secs(10)).await;
+        let started = std::time::Instant::now();
+        backend.initialize(init_params(None)).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(backend.state.read().await.is_indexing_complete());
+        assert!(backend.pending_announcement.lock().unwrap().is_none());
     }
 }

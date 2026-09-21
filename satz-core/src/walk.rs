@@ -36,6 +36,29 @@ pub fn is_ignored_entry(path: &Path, root: &Path) -> bool {
     false
 }
 
+/// How many threads read and parse the notes of a vault on a machine with `cores` cores. Reading a
+/// note waits on the disk (a network or encrypted drive takes milliseconds per file), so far more
+/// threads than cores keep the disk busy; between 8 and 64.
+pub(crate) fn io_threads_for(cores: usize) -> usize {
+    cores.saturating_mul(4).clamp(8, 64)
+}
+
+/// The pool that reads and parses notes: sized for waiting on the disk (see `io_threads_for`), made
+/// once. `None` if the threads could not be started; the caller then uses rayon's global pool.
+fn io_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(io_threads_for(cores))
+            .thread_name(|i| format!("satz-io-{i}"))
+            .build()
+            .map_err(|e| tracing::warn!("cannot start the note reading threads: {e}"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Traverses the given `vault_root` path respecting `.gitignore` rules and parses all `.md` files in parallel.
 ///
 /// Returns a list of `Document`s. Files with read errors or invalid encoding are logged as warnings and skipped.
@@ -70,6 +93,7 @@ pub fn walk_subtree(vault_root: &Path, dir: &Path) -> Result<Vec<Document>> {
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 
+    let discovery_started = std::time::Instant::now();
     let mut md_paths: Vec<PathBuf> = Vec::new();
 
     for result in walker {
@@ -97,19 +121,35 @@ pub fn walk_subtree(vault_root: &Path, dir: &Path) -> Result<Vec<Document>> {
             .replace('\\', "/")
     });
 
-    let docs: Vec<Document> = md_paths
-        .par_iter()
-        .filter_map(|path| match std::fs::read_to_string(path) {
-            Ok(source) => {
-                let rel_path = path.strip_prefix(vault_root).unwrap_or(path);
-                Some(parse_document_owned(source, rel_path))
-            }
-            Err(e) => {
-                tracing::warn!("failed to read markdown file {}: {}", path.display(), e);
-                None
-            }
-        })
-        .collect();
+    let discovered = md_paths.len();
+    let discovery_time = discovery_started.elapsed();
+
+    let read_started = std::time::Instant::now();
+    let read_all = || -> Vec<Document> {
+        md_paths
+            .par_iter()
+            .filter_map(|path| match std::fs::read_to_string(path) {
+                Ok(source) => {
+                    let rel_path = path.strip_prefix(vault_root).unwrap_or(path);
+                    Some(parse_document_owned(source, rel_path))
+                }
+                Err(e) => {
+                    tracing::warn!("failed to read markdown file {}: {}", path.display(), e);
+                    None
+                }
+            })
+            .collect()
+    };
+    let docs = match io_pool() {
+        Some(pool) => pool.install(read_all),
+        None => read_all(),
+    };
+    tracing::debug!(
+        notes = discovered,
+        discovery = ?discovery_time,
+        read_and_parse = ?read_started.elapsed(),
+        "walk: found the notes, then read and parsed them"
+    );
 
     Ok(docs)
 }
@@ -117,6 +157,21 @@ pub fn walk_subtree(vault_root: &Path, dir: &Path) -> Result<Vec<Document>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_on_the_disk_gets_more_threads_than_cores_within_sane_bounds() {
+        assert_eq!(
+            io_threads_for(0),
+            8,
+            "an unknown core count still gets the minimum"
+        );
+        assert_eq!(io_threads_for(1), 8);
+        assert_eq!(io_threads_for(2), 8);
+        assert_eq!(io_threads_for(4), 16);
+        assert_eq!(io_threads_for(12), 48);
+        assert_eq!(io_threads_for(16), 64);
+        assert_eq!(io_threads_for(128), 64, "never more than 64");
+    }
 
     #[test]
     fn test_walk_nonexistent_path() {
@@ -347,5 +402,48 @@ mod tests {
         assert_eq!(walk_subtree(&t.0, &t.0).unwrap().len(), 4);
         // A folder that does not exist is an error, like a missing vault.
         assert!(walk_subtree(&t.0, &t.0.join("missing")).is_err());
+    }
+
+    #[test]
+    fn many_notes_are_read_in_a_fixed_order_with_their_content_intact() {
+        let tree = Tree::new("io-pool");
+        for i in 0..300 {
+            let path = tree.0.join(format!("d{}/n{i:03}.md", i % 7));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!("# Note {i}\n\nlink [[n{:03}]]\n", (i + 1) % 300),
+            )
+            .unwrap();
+        }
+        std::fs::write(tree.0.join("bad.md"), [0xff, 0xfe, 0x00, 0x9f]).unwrap(); // not UTF-8
+        let first = walk_vault(&tree.0).unwrap();
+        assert_eq!(
+            first.len(),
+            300,
+            "the unreadable note is skipped, the rest is all there"
+        );
+        let ids: Vec<&str> = first.iter().map(|d| d.id.as_str()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "in the order of their paths");
+        for doc in &first {
+            let n: usize = doc.title.trim_start_matches("Note ").parse().unwrap();
+            assert_eq!(doc.links.len(), 1, "{}: {n}", doc.id);
+        }
+        let second = walk_vault(&tree.0).unwrap();
+        assert_eq!(
+            first.iter().map(|d| d.content_hash).collect::<Vec<_>>(),
+            second.iter().map(|d| d.content_hash).collect::<Vec<_>>(),
+            "the same every time"
+        );
+    }
+
+    #[test]
+    fn an_empty_vault_and_a_single_note_work_with_the_reading_pool() {
+        let tree = Tree::new("io-pool-small");
+        assert!(walk_vault(&tree.0).unwrap().is_empty());
+        std::fs::write(tree.0.join("only.md"), "# Only\n").unwrap();
+        assert_eq!(walk_vault(&tree.0).unwrap().len(), 1);
     }
 }
