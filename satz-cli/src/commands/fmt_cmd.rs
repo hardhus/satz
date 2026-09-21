@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::Args;
 use rayon::prelude::*;
-use satz_core::walk_vault;
+use satz_core::walk_vault_with;
 
 #[derive(Args, Debug)]
 pub struct FmtArgs {
@@ -62,7 +62,7 @@ pub fn run_with_output(args: FmtArgs, out: &mut dyn Write) -> Result<Outcome> {
     }
 
     let t0 = Instant::now();
-    let docs = walk_vault(&vault_root)?;
+    let docs = walk_vault_with(&vault_root, config.gitignore_mode())?;
     let check_only = args.check;
 
     let mut results: Vec<FileResult> = docs

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ropey::Rope;
-use satz_core::{Index, VaultConfig, walk_vault};
+use satz_core::{Index, VaultConfig, walk_vault_with};
 use tower_lsp_server::ls_types::TextDocumentContentChangeEvent;
 
 use std::time::Instant;
@@ -490,7 +490,7 @@ impl SatzState {
             "initialize_index: loaded .satz.toml (or default)"
         );
 
-        let docs = walk_vault(&vault_root)?;
+        let docs = walk_vault_with(&vault_root, config.gitignore_mode())?;
         tracing::debug!(
             doc_count = docs.len(),
             "initialize_index: walk_vault returned docs"
@@ -1047,6 +1047,46 @@ mod tests {
         assert_eq!(state.config_error, None);
         assert_eq!(state.config.hover.preview_lines, 3);
         assert!(state.formatting_allowed());
+    }
+
+    #[test]
+    fn initialize_index_reads_the_vault_with_the_gitignore_setting_of_its_config() {
+        // A folder that is no git repository, with a `.gitignore` naming one note.
+        let v = TempVault::new("gitignore_mode");
+        std::fs::write(
+            v.0.join("secret.md"),
+            "# Secret
+",
+        )
+        .unwrap();
+        std::fs::write(
+            v.0.join(".gitignore"),
+            "secret.md
+",
+        )
+        .unwrap();
+        let notes = |state: &SatzState| {
+            let mut ids: Vec<String> = state
+                .index
+                .documents()
+                .map(|d| d.id.as_str().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        // The default reads every note (there is no repository).
+        let state = SatzState::initialize_index(v.0.clone()).unwrap();
+        assert_eq!(notes(&state), vec!["a.md", "secret.md"]);
+
+        v.config(
+            "[vault]
+gitignore = \"always\"
+",
+        );
+        let state = SatzState::initialize_index(v.0.clone()).unwrap();
+        assert_eq!(state.config_error, None);
+        assert_eq!(notes(&state), vec!["a.md"]);
     }
 
     #[test]

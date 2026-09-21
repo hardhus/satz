@@ -1675,3 +1675,102 @@ fn daily_leaves_whatever_is_at_the_note_path_alone() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(v.read(&rel), b"READ ONLY, keep it\n");
 }
+
+// ---- `[vault] gitignore`: which notes the commands see ----
+
+/// A folder that is no git repository, with a `.gitignore` that names one of two notes and an
+/// unformatted note the `.gitignore` also names.
+fn vault_with_a_gitignore(tag: &str) -> TempDir {
+    let v = TempDir::new(tag);
+    v.write("keep.md", "# Keep\n");
+    v.write("secret.md", "# Secret\n");
+    v.write("ignored-and-dirty.md", DIRTY);
+    v.write(".gitignore", "secret.md\nignored-and-dirty.md\n");
+    v
+}
+
+#[test]
+fn a_gitignore_outside_a_repository_counts_only_when_the_vault_says_so() {
+    let v = vault_with_a_gitignore("gitignore_setting");
+    let listed = |v: &TempDir| sorted_lines(&satz(&["list", "-v", v.str()]));
+    let all = vec!["ignored-and-dirty.md", "keep.md", "secret.md"];
+
+    // Not a repository: the default reads every note, as it always did.
+    assert_eq!(listed(&v), all);
+    v.write(".satz.toml", "[vault]\ngitignore = \"in-repo\"\n");
+    assert_eq!(listed(&v), all, "\"in-repo\" is the default spelled out");
+
+    v.write(".satz.toml", "[vault]\ngitignore = \"always\"\n");
+    assert_eq!(listed(&v), vec!["keep.md"]);
+
+    // Every command that reads the vault sees the same notes.
+    let stats = satz(&["stats", "-v", v.str(), "--json"]);
+    let stats: serde_json::Value = serde_json::from_str(&out(&stats)).unwrap();
+    assert_eq!(stats["doc_count"], 1);
+    let index = satz(&["index", v.str()]);
+    assert!(
+        out(&index).contains("1 documents indexed"),
+        "{}",
+        out(&index)
+    );
+    let graph = satz(&["graph", "-v", v.str()]);
+    let graph: serde_json::Value = serde_json::from_str(&out(&graph)).unwrap();
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 1);
+    assert!(!satz(&["resolve", "-v", v.str(), "secret"]).status.success());
+    assert!(satz(&["resolve", "-v", v.str(), "keep"]).status.success());
+
+    // `fmt` leaves the ignored, unformatted note alone -- and says nothing about it.
+    let fmt = satz(&["fmt", v.str(), "--check"]);
+    assert_eq!(fmt.status.code(), Some(0), "{}", err(&fmt));
+    assert_eq!(v.read("ignored-and-dirty.md"), DIRTY.as_bytes());
+
+    // Back to the default: the note is a note again.
+    v.write(".satz.toml", "");
+    assert_eq!(listed(&v), all);
+    assert_eq!(
+        satz(&["fmt", v.str(), "--check"]).status.code(),
+        Some(1),
+        "the dirty note is seen (and reported) again"
+    );
+}
+
+#[test]
+fn a_mistake_in_the_vault_section_is_a_warning_and_the_default_applies() {
+    for (config, named) in [
+        ("[vault]\ngitgnore = \"always\"\n", "vault.gitgnore"),
+        ("[vault]\ngitignore = \"sometimes\"\n", "vault.gitignore"),
+    ] {
+        let v = vault_with_a_gitignore("gitignore_mistake");
+        v.write(".satz.toml", config);
+
+        let o = satz(&["list", "-v", v.str()]);
+
+        assert_eq!(o.status.code(), Some(0), "{config:?}: {}", err(&o));
+        assert!(err(&o).contains("warning:"), "{config:?}: {}", err(&o));
+        assert!(err(&o).contains(named), "{config:?}: {}", err(&o));
+        assert_eq!(
+            sorted_lines(&o),
+            vec!["ignored-and-dirty.md", "keep.md", "secret.md"],
+            "{config:?}: the mistake changed nothing"
+        );
+    }
+}
+
+#[test]
+fn a_broken_satz_toml_is_an_error_for_the_commands_that_only_read_too() {
+    // The file decides which notes they see, so they do not carry on with a guess.
+    let v = vault_with_a_gitignore("gitignore_broken");
+    v.write(".satz.toml", "[vault\ngitignore = \n");
+    for args in [
+        vec!["index", v.str()],
+        vec!["stats", "-v", v.str()],
+        vec!["list", "-v", v.str()],
+        vec!["resolve", "-v", v.str(), "keep"],
+        vec!["graph", "-v", v.str()],
+    ] {
+        let o = satz(&args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", err(&o));
+        assert!(err(&o).contains(".satz.toml"), "{args:?}: {}", err(&o));
+        assert_eq!(out(&o), "", "{args:?}: nothing is printed for a guess");
+    }
+}

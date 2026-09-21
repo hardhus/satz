@@ -4,6 +4,7 @@ pub struct VaultConfig {
     /// RESERVED: accepted so existing files keep loading, but currently has no effect (every
     /// document is identified by its vault-relative path).
     pub id_scheme: IdSchemeConfig,
+    pub vault: VaultScanConfig,
     pub daily_note: DailyNoteConfig,
     pub frontmatter: FrontmatterConfig,
     pub lsp: LspConfig,
@@ -270,6 +271,26 @@ pub enum IdSchemeConfig {
     Hierarchical,
 }
 
+/// The values `vault.gitignore` may have (see `VaultScanConfig`).
+const GITIGNORE_CHOICES: &[&str] = &["in-repo", "always"];
+
+/// How the vault's folder is read (`[vault]`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VaultScanConfig {
+    /// Whether a `.gitignore` counts in a vault that is not inside a git repository: `"in-repo"`
+    /// (the default: only inside a repository, as it always was) or `"always"`.
+    pub gitignore: String,
+}
+
+impl Default for VaultScanConfig {
+    fn default() -> Self {
+        Self {
+            gitignore: "in-repo".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DailyNoteConfig {
@@ -329,6 +350,15 @@ pub struct FrontmatterConfig {
 pub const CONFIG_FILE_NAME: &str = ".satz.toml";
 
 impl VaultConfig {
+    /// How the vault is walked with respect to `.gitignore` files (`[vault] gitignore`).
+    pub fn gitignore_mode(&self) -> crate::walk::GitignoreMode {
+        match self.vault.gitignore.as_str() {
+            "always" => crate::walk::GitignoreMode::Always,
+            // "in-repo", and anything a config that skipped validation might hold.
+            _ => crate::walk::GitignoreMode::InRepo,
+        }
+    }
+
     /// Parses and validates a configuration. Unknown keys are errors (every config struct is
     /// `deny_unknown_fields`), so a typo like `enabled` for `enable` is reported instead of
     /// silently ignored.
@@ -376,6 +406,12 @@ impl VaultConfig {
                 *value = default.to_string();
             }
         };
+        fix(
+            "vault.gitignore",
+            &mut self.vault.gitignore,
+            GITIGNORE_CHOICES,
+            &defaults.vault.gitignore,
+        );
         let f = &mut self.formatter;
         let d = &defaults.formatter;
         fix(
@@ -427,6 +463,8 @@ impl VaultConfig {
                 self.daily_note.format
             ));
         }
+
+        one_of("vault.gitignore", &self.vault.gitignore, GITIGNORE_CHOICES)?;
 
         let f = &self.formatter;
         one_of(
@@ -713,6 +751,7 @@ link_width_mode = "display"
         "lsp.semantic_tokens",
         "hover",
         "diagnostics",
+        "vault",
         "daily_note",
         "daily_note.aliases",
         "frontmatter",
@@ -1042,6 +1081,56 @@ link_width_mode = "display"
 
     fn lenient(toml: &str) -> (VaultConfig, Vec<String>) {
         VaultConfig::from_toml_lenient(toml).unwrap_or_else(|e| panic!("should load: {e}"))
+    }
+
+    #[test]
+    fn the_vault_gitignore_setting_defaults_to_the_repository_only_mode_and_can_be_switched() {
+        use crate::walk::GitignoreMode;
+        let default = VaultConfig::default();
+        assert_eq!(default.vault.gitignore, "in-repo");
+        assert_eq!(default.gitignore_mode(), GitignoreMode::InRepo);
+        assert_eq!(
+            VaultConfig::from_toml("").unwrap().gitignore_mode(),
+            GitignoreMode::InRepo,
+            "a file that does not mention it keeps the default"
+        );
+
+        let always = VaultConfig::from_toml("[vault]\ngitignore = \"always\"\n").unwrap();
+        assert_eq!(always.gitignore_mode(), GitignoreMode::Always);
+        let in_repo = VaultConfig::from_toml("[vault]\ngitignore = \"in-repo\"\n").unwrap();
+        assert_eq!(in_repo, default);
+    }
+
+    #[test]
+    fn a_wrong_vault_gitignore_value_is_an_error_naming_the_key_and_the_choices() {
+        for bad in ["\"sometimes\"", "\"Always\"", "\"\"", "\"in_repo\""] {
+            let msg = err_of(&format!("[vault]\ngitignore = {bad}\n"));
+            assert!(msg.contains("vault.gitignore"), "{bad}: {msg}");
+            assert!(
+                msg.contains("in-repo") && msg.contains("always"),
+                "{bad}: names the choices: {msg}"
+            );
+        }
+        // Not a string at all: a plain type error.
+        assert!(VaultConfig::from_toml("[vault]\ngitignore = true\n").is_err());
+    }
+
+    #[test]
+    fn a_wrong_vault_gitignore_value_is_a_warning_and_the_default_when_read_leniently() {
+        let (cfg, warnings) =
+            lenient("[vault]\ngitignore = \"sometimes\"\n\n[formatter]\nline_width = 90\n");
+        assert_eq!(cfg.vault.gitignore, "in-repo");
+        assert_eq!(cfg.formatter.line_width, 90, "the rest applies");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("vault.gitignore"), "{warnings:?}");
+        assert!(warnings[0].contains("in-repo"), "{warnings:?}");
+
+        // A misspelled key is dropped with a warning naming the real one.
+        let (cfg, warnings) = lenient("[vault]\ngitgnore = \"always\"\n");
+        assert_eq!(cfg.vault.gitignore, "in-repo", "the typo changed nothing");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("vault.gitgnore"), "{warnings:?}");
+        assert!(warnings[0].contains("gitignore"), "{warnings:?}");
     }
 
     #[test]

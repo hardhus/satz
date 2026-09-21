@@ -173,10 +173,12 @@ async fn process_file_event(
     if is_config_file(path, vault_root) {
         use tower_lsp_server::ls_types::MessageType;
 
-        let (outcome, warnings) = {
+        let (outcome, warnings, restart_notice) = {
             let mut s = state.write().await;
+            let before = s.config.gitignore_mode();
             let outcome = reload_config(&mut s, vault_root);
-            (outcome, s.config_warnings.clone())
+            let notice = gitignore_change_notice(before, s.config.gitignore_mode());
+            (outcome, s.config_warnings.clone(), notice)
         };
         match outcome {
             ReloadOutcome::Reloaded => {
@@ -208,6 +210,11 @@ async fn process_file_event(
                 client.show_message(MessageType::WARNING, message).await;
             }
         }
+        // The vault was read once, at startup, with the old setting.
+        if let Some(notice) = restart_notice {
+            client.log_message(MessageType::INFO, &notice).await;
+            client.show_message(MessageType::INFO, notice).await;
+        }
     } else {
         // An existing folder the index already holds notes of says nothing new (saving a note makes
         // some systems report its folder as modified too): its notes have their own events.
@@ -216,10 +223,12 @@ async fn process_file_event(
         }
         // Reading and parsing (a file, or a whole folder) happens before the lock is taken.
         let (owned_path, owned_root) = (path.to_path_buf(), vault_root.to_path_buf());
-        let prepared =
-            tokio::task::spawn_blocking(move || prepare_fs_change(&owned_path, &owned_root))
-                .await
-                .unwrap_or(PreparedChange::Skip);
+        let gitignore = state.read().await.config.gitignore_mode();
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_fs_change(&owned_path, &owned_root, gitignore)
+        })
+        .await
+        .unwrap_or(PreparedChange::Skip);
         let mut s = state.write().await;
         let change = apply_prepared(&mut s, path, prepared);
         if !fs_change_needs_refresh(&change) {
@@ -281,13 +290,17 @@ pub(crate) enum PreparedChange {
 }
 
 /// Reads what is on disk for `path` (a note, or a folder that appeared, moved or vanished).
-pub(crate) fn prepare_fs_change(path: &Path, vault_root: &Path) -> PreparedChange {
+pub(crate) fn prepare_fs_change(
+    path: &Path,
+    vault_root: &Path,
+    gitignore: satz_core::GitignoreMode,
+) -> PreparedChange {
     let rel_path = SatzState::get_rel_path(path, Some(vault_root));
     let rel = rel_path.to_string_lossy().replace('\\', "/");
 
     if path.is_dir() {
         // Also a folder that happens to be named like a note (`x.md/`).
-        return match satz_core::walk::walk_subtree(vault_root, path) {
+        return match satz_core::walk::walk_subtree_with(vault_root, path, gitignore) {
             Ok(docs) => PreparedChange::Subtree { prefix: rel, docs },
             Err(_) => PreparedChange::Skip,
         };
@@ -423,7 +436,7 @@ pub(crate) fn apply_prepared(
 /// Brings the index in line with a created/modified/deleted note or folder (reads, then applies).
 #[cfg(test)]
 pub(crate) fn apply_fs_change(state: &mut SatzState, vault_root: &Path, path: &Path) -> FsChange {
-    let prepared = prepare_fs_change(path, vault_root);
+    let prepared = prepare_fs_change(path, vault_root, state.config.gitignore_mode());
     apply_prepared(state, path, prepared)
 }
 
@@ -475,6 +488,20 @@ pub fn reload_config(state: &mut SatzState, vault_root: &Path) -> ReloadOutcome 
             ReloadOutcome::Failed(message)
         }
     }
+}
+
+/// What to tell the user when a reloaded `.satz.toml` changes `vault.gitignore`: the notes the
+/// server holds were read with the old setting, and re-reading the vault is not done on a reload,
+/// so it takes a restart. `None` when the setting is the same.
+pub(crate) fn gitignore_change_notice(
+    before: satz_core::GitignoreMode,
+    after: satz_core::GitignoreMode,
+) -> Option<String> {
+    (before != after).then(|| {
+        "satz: vault.gitignore changed in .satz.toml; restart the language server to read the vault \
+         with it"
+            .to_string()
+    })
 }
 
 /// True only for the vault ROOT's `.satz.toml` -- the one file the server reads at startup. A
@@ -983,6 +1010,52 @@ mod tests {
         );
         assert_eq!(ids(&state), vec!["new/sub/y.md", "new/x.md"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_that_appears_is_read_with_the_gitignore_setting_of_the_config() {
+        // No repository here; a `.gitignore` names one note of the folder.
+        let dir = temp_dir("dir-gitignore-mode");
+        write(
+            &dir,
+            ".gitignore",
+            "secret.md
+",
+        );
+        write(
+            &dir,
+            "pack/p.md",
+            "# p
+",
+        );
+        write(
+            &dir,
+            "pack/secret.md",
+            "# secret
+",
+        );
+
+        let mut state = state_in(&dir);
+        apply_fs_change(&mut state, &dir, &dir.join("pack"));
+        assert_eq!(ids(&state), vec!["pack/p.md", "pack/secret.md"]);
+
+        let mut state = state_in(&dir);
+        state.config.vault.gitignore = "always".to_string();
+        apply_fs_change(&mut state, &dir, &dir.join("pack"));
+        assert_eq!(ids(&state), vec!["pack/p.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_of_the_gitignore_setting_asks_for_a_restart_and_nothing_else_does() {
+        use satz_core::GitignoreMode::{Always, InRepo};
+        assert_eq!(gitignore_change_notice(InRepo, InRepo), None);
+        assert_eq!(gitignore_change_notice(Always, Always), None);
+        for (before, after) in [(InRepo, Always), (Always, InRepo)] {
+            let notice = gitignore_change_notice(before, after).expect("a change is announced");
+            assert!(notice.contains("vault.gitignore"), "{notice}");
+            assert!(notice.contains("restart"), "{notice}");
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub use parser::{content_hash, parse_document, parse_document_owned};
 pub use slug::{fold_key, slugify};
 pub use template::{generate_document_template, generate_frontmatter_block};
 pub use text::{LineIndex, Position};
-pub use walk::walk_vault;
+pub use walk::{GitignoreMode, walk_vault, walk_vault_with};
 
 #[cfg(test)]
 mod tests {

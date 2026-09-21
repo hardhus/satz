@@ -59,21 +59,49 @@ fn io_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Traverses the given `vault_root` path and parses all `.md` files in parallel. `.ignore` files
-/// are respected always, `.gitignore` files (and git's global ignore file) only when the vault is
-/// inside a git repository.
+/// Whether the git ignore rules (`.gitignore` files, git's global ignore file) count in a vault that
+/// is not inside a git repository (`.satz.toml`: `[vault] gitignore`). `.ignore` files are read
+/// either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GitignoreMode {
+    /// Only inside a git repository (a `.git` folder in the vault or above it): a `.gitignore` in a
+    /// folder that is no repository has no effect. What the walk always did, and the default:
+    /// notes never disappear because of a `.gitignore` nobody meant for them.
+    #[default]
+    InRepo,
+    /// Also when there is no repository. The rules of `.gitignore` files ABOVE the vault apply too,
+    /// as they would inside a repository.
+    Always,
+}
+
+/// Traverses the given `vault_root` path and parses all `.md` files in parallel, with the default
+/// `GitignoreMode` (see there).
 ///
 /// Returns a list of `Document`s. Files with read errors or invalid encoding are logged as warnings and skipped.
 pub fn walk_vault(vault_root: &Path) -> Result<Vec<Document>> {
+    walk_vault_with(vault_root, GitignoreMode::default())
+}
+
+/// `walk_vault` with the given `GitignoreMode`.
+pub fn walk_vault_with(vault_root: &Path, gitignore: GitignoreMode) -> Result<Vec<Document>> {
     if !vault_root.exists() {
         bail!("vault root does not exist: {}", vault_root.display());
     }
-    walk_subtree(vault_root, vault_root)
+    walk_subtree_with(vault_root, vault_root, gitignore)
 }
 
 /// Like `walk_vault`, restricted to the folder `dir` inside the vault: the same rules, and the
 /// documents' paths stay relative to `vault_root`. Used to index a folder that appeared or moved.
 pub fn walk_subtree(vault_root: &Path, dir: &Path) -> Result<Vec<Document>> {
+    walk_subtree_with(vault_root, dir, GitignoreMode::default())
+}
+
+/// `walk_subtree` with the given `GitignoreMode`.
+pub fn walk_subtree_with(
+    vault_root: &Path,
+    dir: &Path,
+    gitignore: GitignoreMode,
+) -> Result<Vec<Document>> {
     if !dir.is_dir() {
         bail!("folder does not exist: {}", dir.display());
     }
@@ -82,6 +110,7 @@ pub fn walk_subtree(vault_root: &Path, dir: &Path) -> Result<Vec<Document>> {
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
+        .require_git(gitignore == GitignoreMode::InRepo)
         .follow_links(false)
         // Ignored folders (`.git`, `node_modules`, ...) are not entered at all, instead of being
         // walked completely and filtered out afterwards. The vault root itself is never pruned.
@@ -293,6 +322,128 @@ mod tests {
         dot_ignore.write("secret.md", "# secret\n");
         dot_ignore.write(".ignore", "secret.md\n");
         assert_eq!(dot_ignore.walk(), vec!["keep.md"]);
+    }
+
+    /// Relative paths of the notes under `root` (a vault that may sit inside a bigger tree).
+    fn walk_at(root: &Path, mode: GitignoreMode) -> Vec<String> {
+        walk_vault_with(root, mode)
+            .unwrap()
+            .iter()
+            .map(|d| d.path.to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
+    #[test]
+    fn the_default_mode_is_the_one_that_needs_a_repository() {
+        assert_eq!(GitignoreMode::default(), GitignoreMode::InRepo);
+        let t = Tree::new("mode_default");
+        t.write("keep.md", "# keep\n");
+        t.write("secret.md", "# secret\n");
+        t.write(".gitignore", "secret.md\n");
+        assert_eq!(
+            walk_at(&t.0, GitignoreMode::InRepo),
+            t.walk(),
+            "`walk_vault` is `walk_vault_with` the default mode"
+        );
+        assert_eq!(t.walk(), vec!["keep.md", "secret.md"]);
+    }
+
+    #[test]
+    fn always_applies_a_gitignore_without_a_repository() {
+        let t = Tree::new("mode_always");
+        t.write("keep.md", "# keep\n");
+        t.write("secret.md", "# secret\n");
+        t.write(".gitignore", "secret.md\n");
+        assert_eq!(walk_at(&t.0, GitignoreMode::Always), vec!["keep.md"]);
+        assert_eq!(
+            walk_at(&t.0, GitignoreMode::InRepo),
+            vec!["keep.md", "secret.md"]
+        );
+    }
+
+    #[test]
+    fn a_gitignore_in_a_folder_counts_only_below_that_folder() {
+        let t = Tree::new("mode_nested");
+        t.write("x.md", "# x at the root\n");
+        t.write("sub/x.md", "# x in sub\n");
+        t.write("sub/keep.md", "# keep\n");
+        t.write("sub/.gitignore", "x.md\n");
+        assert_eq!(
+            walk_at(&t.0, GitignoreMode::Always),
+            vec!["sub/keep.md", "x.md"]
+        );
+    }
+
+    #[test]
+    fn always_also_applies_the_gitignore_of_a_folder_above_the_vault() {
+        // The rule the vault's owner may never have meant for it -- why this is not the default.
+        let t = Tree::new("mode_above");
+        t.write(".gitignore", "secret.md\n");
+        t.write("vault/keep.md", "# keep\n");
+        t.write("vault/secret.md", "# secret\n");
+        let vault = t.0.join("vault");
+        assert_eq!(walk_at(&vault, GitignoreMode::Always), vec!["keep.md"]);
+        assert_eq!(
+            walk_at(&vault, GitignoreMode::InRepo),
+            vec!["keep.md", "secret.md"]
+        );
+    }
+
+    #[test]
+    fn inside_a_git_repository_both_modes_give_the_same_notes() {
+        // A repository at the vault itself, and one above it.
+        let own = Tree::new("mode_repo_own");
+        own.write(".git/HEAD", "ref: refs/heads/main\n");
+        own.write(".gitignore", "secret.md\n");
+        own.write("keep.md", "# keep\n");
+        own.write("secret.md", "# secret\n");
+        assert_eq!(walk_at(&own.0, GitignoreMode::InRepo), vec!["keep.md"]);
+        assert_eq!(walk_at(&own.0, GitignoreMode::Always), vec!["keep.md"]);
+
+        let above = Tree::new("mode_repo_above");
+        above.write(".git/HEAD", "ref: refs/heads/main\n");
+        above.write(".gitignore", "secret.md\n");
+        above.write("vault/keep.md", "# keep\n");
+        above.write("vault/secret.md", "# secret\n");
+        let vault = above.0.join("vault");
+        assert_eq!(walk_at(&vault, GitignoreMode::InRepo), vec!["keep.md"]);
+        assert_eq!(walk_at(&vault, GitignoreMode::Always), vec!["keep.md"]);
+    }
+
+    #[test]
+    fn a_folder_walked_on_its_own_follows_the_mode_too() {
+        let t = Tree::new("mode_subtree");
+        t.write(".gitignore", "secret.md\n");
+        t.write("sub/ok.md", "# ok\n");
+        t.write("sub/secret.md", "# secret\n");
+        let sub = t.0.join("sub");
+        let names = |mode| -> Vec<String> {
+            walk_subtree_with(&t.0, &sub, mode)
+                .unwrap()
+                .iter()
+                .map(|d| d.path.to_string_lossy().replace('\\', "/"))
+                .collect()
+        };
+        assert_eq!(names(GitignoreMode::Always), vec!["sub/ok.md"]);
+        assert_eq!(
+            names(GitignoreMode::InRepo),
+            vec!["sub/ok.md", "sub/secret.md"]
+        );
+        assert_eq!(
+            walk_subtree(&t.0, &sub).unwrap().len(),
+            2,
+            "`walk_subtree` uses the default mode"
+        );
+    }
+
+    #[test]
+    fn an_ignore_file_counts_in_both_modes() {
+        let t = Tree::new("mode_dot_ignore");
+        t.write("keep.md", "# keep\n");
+        t.write("secret.md", "# secret\n");
+        t.write(".ignore", "secret.md\n");
+        assert_eq!(walk_at(&t.0, GitignoreMode::InRepo), vec!["keep.md"]);
+        assert_eq!(walk_at(&t.0, GitignoreMode::Always), vec!["keep.md"]);
     }
 
     #[test]

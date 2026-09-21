@@ -70,9 +70,16 @@ pub(crate) fn with_stdout<T>(body: impl FnOnce(&mut dyn Write) -> Result<T>) -> 
 
 /// Validates the vault directory and indexes every note in it: the loading step shared by `index`,
 /// `stats`, `list`, `resolve` and `graph`, so all of them report a bad vault path the same way.
+///
+/// `.satz.toml` is read first: its `[vault]` section decides which files the walk sees, so a file
+/// that cannot be used is an error here too (as for `fmt` and `daily`), never a silent fallback.
 pub(crate) fn load_index(path: &Path) -> Result<satz_core::Index> {
     let root = vault_dir(path)?;
-    Ok(satz_core::Index::build(satz_core::walk_vault(&root)?))
+    let config = load_config(&root)?;
+    Ok(satz_core::Index::build(satz_core::walk_vault_with(
+        &root,
+        config.gitignore_mode(),
+    )?))
 }
 
 /// Resolves the `path` argument of a command that works on a vault (`fmt`, `daily`).

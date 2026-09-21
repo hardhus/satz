@@ -2,7 +2,7 @@
 
 satz reads an optional `.satz.toml` file from the **vault root** (the directory you point the CLI or LSP at). If the file is missing, or a field is omitted, built-in defaults are used — you never need a config file to get started.
 
-- The CLI (`satz fmt`, `satz daily`) reads `.satz.toml` once, synchronously, before running.
+- The CLI (every command that reads the vault: `index`, `stats`, `list`, `resolve`, `graph`, `fmt`, `daily`) reads `.satz.toml` once, synchronously, before running.
 - The LSP server (`satz-lsp`) reads it once at startup and then **hot-reloads** it: editing and saving `.satz.toml` while the server is running re-parses it and applies the new values immediately, no restart needed. Deleting the file returns to the defaults.
 - Only the `.satz.toml` in the **vault root** is read. A `.satz.toml` in a subfolder, or a file named `satz.toml`, is ignored.
 
@@ -17,7 +17,7 @@ Broken TOML, a value of the wrong type or out of range, or a file that can't be 
 
 | Where | Mistakes in names/values (warnings) | Broken file (error) |
 |---|---|---|
-| `satz fmt`, `satz daily` | `warning: ...` lines on stderr, one per ignored setting; the command runs with the rest of the file (exit status unaffected). | Error on stderr, exit status `1`, **no file is changed or created**. |
+| `satz fmt`, `satz daily`, `satz index`, `satz stats`, `satz list`, `satz resolve`, `satz graph` | `warning: ...` lines on stderr, one per ignored setting; the command runs with the rest of the file (exit status unaffected). | Error on stderr, exit status `1`, **no file is changed or created**. (The read-only commands read the file too, because `[vault]` decides which notes they see.) |
 | `satz-lsp` at startup | One warning message in the editor listing every ignored setting; the rest applies and formatting stays on. | The vault is still indexed with the default settings, a warning message is shown, and **formatting is turned off** (format-on-save, *Format Document*, *Format entire vault*) until the file is valid. |
 | `satz-lsp` on hot-reload | The same warning message after every save that still has mistakes; the rest applies. | The previous settings stay in effect, the same warning is shown, and formatting is turned off until the file is valid. Fixing and saving the file turns it back on automatically. |
 
@@ -26,6 +26,9 @@ Broken TOML, a value of the wrong type or out of range, or a file that can't be 
 ```toml
 id_scheme = "path"
 turkish_i_folding = false
+
+[vault]
+gitignore = "in-repo"
 
 [daily_note]
 folder = "daily"
@@ -104,6 +107,16 @@ This is exactly the built-in default configuration, spelled out (a test keeps it
 |---|---|---|---|
 | `id_scheme` | `"path"` \| `"hierarchical"` | `"path"` | **Reserved, not yet enforced.** Intended to select how document identity/resolution works; currently every document's identity is always derived from its vault-relative path regardless of this setting. Safe to leave unset. |
 | `turkish_i_folding` | bool | `false` | **Reserved, not yet wired up.** The underlying folding function (`fold_key_ext`) supports an extra mode that folds ASCII `I`/`ı` together with `İ`/`i` for case-insensitive title/alias/tag lookups, but nothing in the indexer or LSP currently reads this field to enable it — folding always behaves as if this were `false`. Safe to leave unset. |
+
+### `[vault]` — how the vault's folder is read
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `gitignore` | `"in-repo"` \| `"always"` | `"in-repo"` | Whether a `.gitignore` counts in a vault that is **not** inside a git repository. `"in-repo"`: git's ignore rules (`.gitignore` files and your global git ignore file) apply only when the vault is inside a repository (a `.git` folder in the vault or above it), which is how the walk always behaved. `"always"`: they apply in any case. `.ignore` files are read either way, and the folders listed in the CLI notes (`.git`, `.obsidian`, …) are always skipped. |
+
+Why the default is `"in-repo"`: a `.gitignore` in a folder that is no repository is more often a leftover than an intention, and hiding notes because of one would silently break links, orphan checks and diagnostics. With `"always"`, mind that the `.gitignore` files of the folders **above** the vault apply too (a `.gitignore` in your home folder, for instance), exactly as they would inside a repository.
+
+The CLI reads the setting on every run. The language server reads the vault once at startup, so after changing `gitignore` **restart the language server** (it says so when it sees the change).
 
 ### `[daily_note]` — used by `satz daily` (CLI) and by `[[bugün]]`/`[[dün]]`/`[[yarın]]`-style relative links (LSP hover/definition/diagnostics)
 
