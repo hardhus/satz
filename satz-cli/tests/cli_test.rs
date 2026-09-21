@@ -404,19 +404,54 @@ fn fmt_invalid_toml_fails_and_leaves_files_untouched() {
 }
 
 #[test]
-fn fmt_unknown_config_key_fails_and_leaves_files_untouched() {
+fn fmt_unknown_config_key_warns_and_still_formats_with_the_rest_of_the_config() {
     let v = TempDir::new("fmt_unknownkey");
-    // A typo (`enabled` instead of `enable`) used to be silently ignored.
-    v.write(".satz.toml", "[formatter.wrap]\nenabled = true\n");
-    v.write("note.md", DIRTY);
+    // A typo (`enabled` instead of `enable`): named in a warning, the rest of the file applies.
+    v.write(
+        ".satz.toml",
+        "[formatter.wrap]\nenabled = true\n[formatter.lists]\nmarker = \"*\"\n",
+    );
+    v.write("note.md", "- one\n- two\n");
     let before = snapshot(v.path());
 
     let o = satz(&["fmt", v.str()]);
 
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     let e = err(&o);
-    assert!(e.contains("enabled"), "should name the unknown key: {e}");
-    assert_eq!(snapshot(v.path()), before);
+    assert!(e.contains("warning"), "{e}");
+    assert!(
+        e.contains("formatter.wrap.enabled"),
+        "should name the unknown key: {e}"
+    );
+    assert_ne!(snapshot(v.path()), before, "the file was formatted");
+    assert_eq!(
+        v.read("note.md"),
+        b"* one\n* two\n",
+        "the valid marker setting applied"
+    );
+}
+
+#[test]
+fn fmt_check_reports_only_formatting_differences_even_with_config_warnings() {
+    let v = TempDir::new("fmt_check_warn");
+    v.write(".satz.toml", "[nonsense]\nx = 1\n");
+    v.write("clean.md", "# Clean\n\nText.\n");
+    let o = satz(&["fmt", "--check", v.str()]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("nonsense"), "{}", err(&o));
+    v.write("dirty.md", DIRTY);
+    let o = satz(&["fmt", "--check", v.str()]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+}
+
+#[test]
+fn a_config_without_mistakes_prints_no_warning() {
+    let v = TempDir::new("fmt_no_warning");
+    v.write(".satz.toml", "[formatter]\nline_width = 100\n");
+    v.write("note.md", "# T\n\nText.\n");
+    let o = satz(&["fmt", v.str()]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!err(&o).contains("warning"), "{}", err(&o));
 }
 
 #[test]
@@ -670,36 +705,47 @@ fn daily_invalid_config_errors_and_creates_nothing() {
 }
 
 #[test]
-fn daily_unknown_config_key_errors_and_creates_nothing() {
+fn daily_unknown_config_key_warns_and_uses_the_rest_of_the_config() {
     let v = TempDir::new("daily_unknownkey");
-    v.write(".satz.toml", "[daily_note]\nfolders = \"journal\"\n");
-    let before = snapshot(v.path());
+    v.write(
+        ".satz.toml",
+        "[daily_note]\nfolders = \"journal\"\nfolder = \"mine\"\n",
+    );
 
     let o = satz(&["daily", v.str()]);
 
-    assert_eq!(o.status.code(), Some(1));
-    assert!(err(&o).contains("folders"), "{}", err(&o));
-    assert_eq!(snapshot(v.path()), before);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("daily_note.folders"), "{}", err(&o));
+    let printed = std::path::PathBuf::from(out(&o).trim());
+    assert!(
+        printed.to_string_lossy().contains("mine"),
+        "the valid folder applied: {printed:?}"
+    );
+    assert!(printed.exists());
 }
 
 #[test]
-fn daily_invalid_date_format_is_an_error_not_a_panic() {
+fn daily_invalid_date_format_warns_and_uses_the_default_format_never_panics() {
     for bad in ["%Q", "%", "%Y%"] {
         let v = TempDir::new("daily_badfmt");
         v.write(".satz.toml", &format!("[daily_note]\nformat = \"{bad}\"\n"));
-        let before = snapshot(v.path());
 
         let o = satz(&["daily", v.str()]);
 
-        // A panic would exit with 101; a reported error exits with 1.
-        assert_eq!(o.status.code(), Some(1), "{bad:?}: {}", err(&o));
+        // A panic would exit with 101.
+        assert_eq!(o.status.code(), Some(0), "{bad:?}: {}", err(&o));
         assert!(!err(&o).contains("panicked"), "{bad:?}: {}", err(&o));
         assert!(
             err(&o).contains("daily_note.format"),
             "{bad:?}: {}",
             err(&o)
         );
-        assert_eq!(snapshot(v.path()), before, "{bad:?}");
+        let printed = std::path::PathBuf::from(out(&o).trim());
+        let name = printed.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.len() == "2026-01-01.md".len() && name.ends_with(".md"),
+            "the default %Y-%m-%d: {name}"
+        );
     }
 }
 

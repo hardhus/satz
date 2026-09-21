@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::Local;
 use clap::{ArgAction, Args};
-use satz_core::config::VaultConfig;
 
 #[derive(Args, Debug)]
 pub struct DailyArgs {
@@ -22,7 +21,7 @@ pub fn run(args: DailyArgs) -> Result<()> {
     let vault_root = super::vault_dir(&args.path)?;
 
     // A config that exists but can't be used is an error, never a silent fallback to defaults.
-    let config = VaultConfig::load(&vault_root)?;
+    let config = super::load_config(&vault_root)?;
 
     let now = Local::now();
     let formatted_date = now.format(&config.daily_note.format).to_string();

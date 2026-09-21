@@ -5,7 +5,6 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::Args;
 use rayon::prelude::*;
-use satz_core::config::VaultConfig;
 use satz_core::walk_vault;
 
 #[derive(Args, Debug)]
@@ -45,7 +44,7 @@ pub fn run(args: FmtArgs) -> Result<Outcome> {
 
     // A config that exists but can't be used must stop the run: formatting with defaults would
     // rewrite every file with settings the user didn't choose.
-    let config = VaultConfig::load(&vault_root)?;
+    let config = super::load_config(&vault_root)?;
 
     if !config.formatter.enabled {
         println!("Formatter is disabled (formatter.enabled = false in .satz.toml); nothing to do.");

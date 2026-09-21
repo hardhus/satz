@@ -173,9 +173,10 @@ async fn process_file_event(
     if is_config_file(path, vault_root) {
         use tower_lsp_server::ls_types::MessageType;
 
-        let outcome = {
+        let (outcome, warnings) = {
             let mut s = state.write().await;
-            reload_config(&mut s, vault_root)
+            let outcome = reload_config(&mut s, vault_root);
+            (outcome, s.config_warnings.clone())
         };
         match outcome {
             ReloadOutcome::Reloaded => {
@@ -185,6 +186,13 @@ async fn process_file_event(
                         "satz: reloaded configuration from .satz.toml",
                     )
                     .await;
+                // Settings that were ignored must be seen: the rest applies, so nothing else would
+                // tell the user that one of them did nothing.
+                if !warnings.is_empty() {
+                    let message = crate::state::config_warnings_message(&warnings);
+                    client.log_message(MessageType::WARNING, &message).await;
+                    client.show_message(MessageType::WARNING, message).await;
+                }
             }
             ReloadOutcome::RevertedToDefaults => {
                 client
@@ -427,12 +435,13 @@ pub fn reload_config(state: &mut SatzState, vault_root: &Path) -> ReloadOutcome 
     let existed = vault_root
         .join(satz_core::config::CONFIG_FILE_NAME)
         .exists();
-    match satz_core::VaultConfig::load(vault_root) {
-        Ok(config) => {
+    match satz_core::VaultConfig::load_with_warnings(vault_root) {
+        Ok((config, warnings)) => {
             // Cached formatted texts were computed with the old settings (and capacity).
             state.format_cache = crate::state::FormatCache::new(config.lsp.format_cache_capacity);
             state.config = config;
             state.config_error = None;
+            state.config_warnings = warnings;
             state.config_revision += 1;
             state.sync_daily(chrono::Local::now().date_naive());
             if existed {
@@ -585,13 +594,56 @@ mod tests {
         assert_eq!(state.config_error, None);
         assert!(state.formatting_allowed());
 
-        // A typo'd key is an error too, and does not half-apply the valid keys next to it.
+        // A typo'd key no longer stops the reload: the valid keys next to it apply and the typo is
+        // reported as a warning; formatting stays on.
         v.write("[hover]\npreview_lines = 7\nbogus = 1\n");
+        assert_eq!(reload_config(&mut state, &v.0), ReloadOutcome::Reloaded);
+        assert_eq!(state.config.hover.preview_lines, 7);
+        assert_eq!(
+            state.config_warnings.len(),
+            1,
+            "{:?}",
+            state.config_warnings
+        );
+        assert!(state.config_warnings[0].contains("bogus"));
+        assert!(state.formatting_allowed());
+
+        // Fixed: the warning goes away.
+        v.write("[hover]\npreview_lines = 7\n");
+        assert_eq!(reload_config(&mut state, &v.0), ReloadOutcome::Reloaded);
+        assert!(state.config_warnings.is_empty());
+
+        // A value of the wrong type is still an error, and nothing is half-applied.
+        v.write("[hover]\npreview_lines = \"many\"\nline = 1\n");
         assert!(matches!(
             reload_config(&mut state, &v.0),
-            ReloadOutcome::Failed(m) if m.contains("bogus")
+            ReloadOutcome::Failed(m) if m.contains("preview_lines")
         ));
-        assert_eq!(state.config.hover.preview_lines, 5, "nothing half-applied");
+        assert_eq!(state.config.hover.preview_lines, 7, "nothing half-applied");
+    }
+
+    #[test]
+    fn a_reload_with_mistakes_applies_the_rest_and_keeps_the_warnings_until_it_is_fixed() {
+        let v = TempVault::new("reload-warn");
+        let mut state = SatzState::default();
+        v.write("[formatter.wrap]\nenabled = true\n[formatter.misc]\nhr_style = \"====\"\n[daily_note]\nfolder = \"j\"\n");
+        assert_eq!(reload_config(&mut state, &v.0), ReloadOutcome::Reloaded);
+        assert_eq!(state.config.daily_note.folder, "j");
+        assert_eq!(state.config.formatter.misc.hr_style, "---");
+        assert_eq!(
+            state.config_warnings.len(),
+            2,
+            "{:?}",
+            state.config_warnings
+        );
+        assert!(state.formatting_allowed());
+        // Deleting the file: defaults, no warnings.
+        v.delete();
+        assert_eq!(
+            reload_config(&mut state, &v.0),
+            ReloadOutcome::RevertedToDefaults
+        );
+        assert!(state.config_warnings.is_empty());
     }
 
     #[test]

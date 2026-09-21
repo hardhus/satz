@@ -477,6 +477,13 @@ impl LanguageServer for Backend {
                     client.log_message(MessageType::WARNING, &message).await;
                     client.show_message(MessageType::WARNING, message).await;
                 }
+                // Settings that were ignored (an unknown key, a value outside its choices): the rest
+                // of the file applies, so this is the only place the user learns of them.
+                if !outcome.config_warnings.is_empty() {
+                    let message = crate::state::config_warnings_message(&outcome.config_warnings);
+                    client.log_message(MessageType::WARNING, &message).await;
+                    client.show_message(MessageType::WARNING, message).await;
+                }
 
                 let (supports_pull, uris) = {
                     let s = state_arc.read().await;

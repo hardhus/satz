@@ -339,6 +339,83 @@ impl VaultConfig {
         Ok(config)
     }
 
+    /// Like `from_toml`, but a mistake in a value's NAME or CONTENT does not stop the configuration
+    /// from working. Returns the settings that could be read and one warning per thing that was
+    /// ignored:
+    /// - an unknown key is dropped (`[formatter.wrap] enabled = true`),
+    /// - a string setting with a value outside its choices, or an invalid `daily_note.format`,
+    ///   falls back to its default.
+    ///
+    /// Everything else in the file applies. Broken TOML and a value of the wrong type are still
+    /// errors: there is nothing to make of them.
+    pub fn from_toml_lenient(toml_str: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
+        let mut warnings = Vec::new();
+        let mut value: toml::Value = toml::from_str(toml_str)?;
+        let defaults = toml::Value::try_from(Self::default())
+            .map_err(<toml::de::Error as serde::de::Error>::custom)?;
+        prune_unknown(&mut value, &defaults, "", &mut warnings);
+        let mut config: Self = value.try_into()?;
+        config.replace_invalid_values(&mut warnings);
+        Ok((config, warnings))
+    }
+
+    /// Puts the default in place of every value `validate` would reject, one warning each.
+    fn replace_invalid_values(&mut self, warnings: &mut Vec<String>) {
+        use chrono::format::{Item, StrftimeItems};
+        let defaults = Self::default();
+        if StrftimeItems::new(&self.daily_note.format).any(|item| matches!(item, Item::Error)) {
+            warnings.push(format!(
+                "invalid daily_note.format {:?}: not a valid strftime format string; using {:?}",
+                self.daily_note.format, defaults.daily_note.format
+            ));
+            self.daily_note.format = defaults.daily_note.format.clone();
+        }
+        let mut fix = |key: &str, value: &mut String, allowed: &[&str], default: &str| {
+            if let Err(problem) = one_of(key, value, allowed) {
+                warnings.push(format!("{problem}; using {default:?}"));
+                *value = default.to_string();
+            }
+        };
+        let f = &mut self.formatter;
+        let d = &defaults.formatter;
+        fix(
+            "formatter.misc.hr_style",
+            &mut f.misc.hr_style,
+            &["---", "***", "___"],
+            &d.misc.hr_style,
+        );
+        fix(
+            "formatter.misc.code_fence_style",
+            &mut f.misc.code_fence_style,
+            &["```", "~~~"],
+            &d.misc.code_fence_style,
+        );
+        fix(
+            "formatter.emphasis.italic_marker",
+            &mut f.emphasis.italic_marker,
+            &["*", "_"],
+            &d.emphasis.italic_marker,
+        );
+        fix(
+            "formatter.emphasis.bold_marker",
+            &mut f.emphasis.bold_marker,
+            &["**", "__"],
+            &d.emphasis.bold_marker,
+        );
+        fix(
+            "formatter.lists.marker",
+            &mut f.lists.marker,
+            &["-", "*", "+"],
+            &d.lists.marker,
+        );
+        fix(
+            "formatter.wrap.link_width_mode",
+            &mut f.wrap.link_width_mode,
+            &["raw", "display"],
+            &d.wrap.link_width_mode,
+        );
+    }
+
     /// Checks values serde alone can't: `daily_note.format` must be a valid `strftime` string,
     /// because formatting a date with an invalid one panics (`satz daily`, and relative daily
     /// links like `[[bugün]]` in the language server).
@@ -381,6 +458,27 @@ impl VaultConfig {
         Ok(())
     }
 
+    /// `load`, lenient (see `from_toml_lenient`): what could be read is returned with one warning per
+    /// ignored setting, each naming the file. Missing file -> defaults and no warnings; unreadable
+    /// or broken TOML or a value of the wrong type -> an error, as with `load`.
+    pub fn load_with_warnings(vault_root: &std::path::Path) -> anyhow::Result<(Self, Vec<String>)> {
+        let path = vault_root.join(CONFIG_FILE_NAME);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Self::default(), Vec::new()));
+            }
+            Err(e) => anyhow::bail!("failed to read {}: {}", path.display(), e),
+        };
+        let (config, warnings) = Self::from_toml_lenient(&content)
+            .map_err(|e| anyhow::anyhow!("invalid {}: {}", path.display(), e))?;
+        let warnings = warnings
+            .into_iter()
+            .map(|w| format!("{CONFIG_FILE_NAME}: {w}"))
+            .collect();
+        Ok((config, warnings))
+    }
+
     /// Loads `<vault_root>/.satz.toml`.
     ///
     /// - missing file -> the default configuration
@@ -399,6 +497,45 @@ impl VaultConfig {
             Err(e) => anyhow::bail!("failed to read {}: {}", path.display(), e),
         };
         Self::from_toml(&content).map_err(|e| anyhow::anyhow!("invalid {}: {}", path.display(), e))
+    }
+}
+
+/// Removes every key of `value` that `defaults` (the full default configuration as a TOML tree)
+/// does not have, at every level, with a warning naming the key and the keys that are valid there.
+fn prune_unknown(
+    value: &mut toml::Value,
+    defaults: &toml::Value,
+    path: &str,
+    warnings: &mut Vec<String>,
+) {
+    let (Some(table), Some(known)) = (value.as_table_mut(), defaults.as_table()) else {
+        return;
+    };
+    let join = |key: &str| {
+        if path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{path}.{key}")
+        }
+    };
+    let unknown: Vec<String> = table
+        .keys()
+        .filter(|key| !known.contains_key(key.as_str()))
+        .cloned()
+        .collect();
+    for key in unknown {
+        table.remove(&key);
+        let valid: Vec<&str> = known.keys().map(String::as_str).collect();
+        warnings.push(format!(
+            "unknown setting {} (ignored); valid settings here: {}",
+            join(&key),
+            valid.join(", ")
+        ));
+    }
+    for (key, default) in known {
+        if let Some(inner) = table.get_mut(key) {
+            prune_unknown(inner, default, &join(key), warnings);
+        }
     }
 }
 
@@ -899,5 +1036,168 @@ link_width_mode = "display"
     #[test]
     fn defaults_and_the_documented_example_still_validate() {
         assert!(VaultConfig::default().validate().is_ok());
+    }
+
+    // ---- a config with mistakes still works, and says what it ignored ----
+
+    fn lenient(toml: &str) -> (VaultConfig, Vec<String>) {
+        VaultConfig::from_toml_lenient(toml).unwrap_or_else(|e| panic!("should load: {e}"))
+    }
+
+    #[test]
+    fn an_unknown_key_is_ignored_with_a_warning_and_the_rest_is_applied() {
+        let (cfg, warnings) = lenient(
+            "[formatter]\nline_width = 100\n\n[formatter.wrap]\nenabled = true\nlink_width_mode = \"display\"\n",
+        );
+        assert_eq!(cfg.formatter.line_width, 100);
+        assert_eq!(cfg.formatter.wrap.link_width_mode, "display");
+        assert!(
+            !cfg.formatter.wrap.enable,
+            "the misspelled key changed nothing"
+        );
+        assert!(cfg.formatter.enabled);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("formatter.wrap.enabled"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("enable"),
+            "names the real keys: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_at_every_level_are_found() {
+        let (cfg, warnings) = lenient(
+            "nonsense = 1\n\n[lsp]\nfoo = \"x\"\ncompletion_limit = 50\n\n[whole_table_typo]\na = 1\n\n[formatter.tables]\ncell_padding = 2\nbogus = true\n",
+        );
+        assert_eq!(cfg.lsp.completion_limit, 50);
+        assert_eq!(cfg.formatter.tables.cell_padding, 2);
+        let joined = warnings.join("\n");
+        for key in [
+            "nonsense",
+            "lsp.foo",
+            "whole_table_typo",
+            "formatter.tables.bogus",
+        ] {
+            assert!(joined.contains(key), "{key} not reported in {warnings:?}");
+        }
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+    }
+
+    #[test]
+    fn an_invalid_string_value_falls_back_for_that_field_only() {
+        let (cfg, warnings) = lenient(
+            "[formatter.misc]\nhr_style = \"* * *\"\ncode_fence_style = \"~~~\"\n\n[formatter.wrap]\nlink_width_mode = \"Raw\"\n\n[formatter]\nline_width = 72\n",
+        );
+        assert_eq!(cfg.formatter.misc.hr_style, "---", "the default");
+        assert_eq!(
+            cfg.formatter.misc.code_fence_style, "~~~",
+            "a valid value next to it is kept"
+        );
+        assert_eq!(cfg.formatter.wrap.link_width_mode, "raw");
+        assert_eq!(cfg.formatter.line_width, 72);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("hr_style") && w.contains("* * *"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("link_width_mode") && w.contains("Raw"))
+        );
+        assert!(warnings.iter().all(|w| w.contains("using")), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_invalid_daily_format_falls_back_to_the_default_format() {
+        let (cfg, warnings) = lenient("[daily_note]\nformat = \"%Q%\"\nfolder = \"journal\"\n");
+        assert_eq!(
+            cfg.daily_note.format,
+            VaultConfig::default().daily_note.format
+        );
+        assert_eq!(cfg.daily_note.folder, "journal");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("daily_note.format"), "{warnings:?}");
+    }
+
+    #[test]
+    fn several_kinds_of_mistake_at_once_are_all_reported() {
+        let (cfg, warnings) = lenient(
+            "typo = 1\n[formatter.lists]\nmarker = \"#\"\n[daily_note]\nformat = \"%Q%\"\n[hover]\npreview_lines = 4\n",
+        );
+        assert_eq!(cfg.hover.preview_lines, 4);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    #[test]
+    fn a_config_without_mistakes_has_no_warnings_and_equals_the_strict_one() {
+        for toml in [
+            "",
+            "# comment\n",
+            "[formatter]\nline_width = 100\n",
+            "id_scheme = \"hierarchical\"\n",
+        ] {
+            let (cfg, warnings) = lenient(toml);
+            assert!(warnings.is_empty(), "{toml:?}: {warnings:?}");
+            assert_eq!(cfg, VaultConfig::from_toml(toml).unwrap());
+        }
+    }
+
+    #[test]
+    fn broken_toml_and_wrong_types_are_still_errors_with_a_position() {
+        let err = VaultConfig::from_toml_lenient("[formatter\nline_width = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 1"), "{err}");
+        let err = VaultConfig::from_toml_lenient("[formatter.wrap]\nenable = \"yes\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("enable") || err.contains("boolean") || err.contains("invalid type"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn odd_key_names_and_a_bom_do_not_break_the_warning_path() {
+        let (cfg, warnings) =
+            lenient("\u{feff}[formatter]\nline_width = 90\n\"ünlü anahtar\" = 1\n\"a.b\" = 2\n");
+        assert_eq!(cfg.formatter.line_width, 90);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let long = format!("{} = 1\n", "k".repeat(5000));
+        let (_, warnings) = lenient(&long);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn loading_a_file_with_mistakes_returns_the_config_and_names_the_file_in_the_warnings() {
+        let dir = std::env::temp_dir().join(format!("satz_cfg_lenient_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "[formatter]\nline_width = 66\nbogus = 1\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = VaultConfig::load_with_warnings(&dir).unwrap();
+        assert_eq!(cfg.formatter.line_width, 66);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains(CONFIG_FILE_NAME) && warnings[0].contains("bogus"),
+            "{warnings:?}"
+        );
+        // No file: the defaults and no warnings. A broken file: the error, as before.
+        let empty = dir.join("nothing");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            VaultConfig::load_with_warnings(&empty).unwrap(),
+            (VaultConfig::default(), vec![])
+        );
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "[formatter\n").unwrap();
+        assert!(VaultConfig::load_with_warnings(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

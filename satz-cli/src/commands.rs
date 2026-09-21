@@ -43,6 +43,17 @@ pub(crate) fn vault_dir(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Reads `<vault>/.satz.toml`. A file that cannot be read or parsed at all is an error; mistakes
+/// inside a readable one (an unknown key, a value outside its choices) are printed as
+/// `warning: ...` lines on stderr and the rest of the file applies.
+pub(crate) fn load_config(vault_root: &Path) -> Result<satz_core::VaultConfig> {
+    let (config, warnings) = satz_core::VaultConfig::load_with_warnings(vault_root)?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(config)
+}
+
 /// Turns a Windows extended-length path into its ordinary form: `\\?\C:\x` -> `C:\x` and
 /// `\\?\UNC\srv\share\x` -> `\\srv\share\x`. Anything else (including other `\\?\` forms such as
 /// `\\?\Volume{..}\`, ordinary paths, and non-Windows paths) is returned unchanged.

@@ -6,19 +6,20 @@ satz reads an optional `.satz.toml` file from the **vault root** (the directory 
 - The LSP server (`satz-lsp`) reads it once at startup and then **hot-reloads** it: editing and saving `.satz.toml` while the server is running re-parses it and applies the new values immediately, no restart needed. Deleting the file returns to the defaults.
 - Only the `.satz.toml` in the **vault root** is read. A `.satz.toml` in a subfolder, or a file named `satz.toml`, is ignored.
 
-All keys are optional. Unknown keys are rejected (TOML parsing is strict — there's no passthrough "extra" bucket at the config level, unlike frontmatter), so a typo such as `[formatter.wrap] enabled = true` (the key is `enable`) is reported instead of silently ignored.
+All keys are optional. A mistake in a key's name or in a string setting's value does not stop the file from working: the mistake is **ignored and reported as a warning**, and everything else in the file applies, formatting included.
 
-String-valued formatter settings are checked too: `misc.hr_style`, `misc.code_fence_style`, `emphasis.italic_marker`, `emphasis.bold_marker`, `lists.marker` and `wrap.link_width_mode` must be one of the values listed in their tables, otherwise the file is invalid (`invalid formatter.misc.hr_style "====": expected one of "---", "***", "___"`) instead of the setting being silently ignored.
+- An **unknown key** (a typo such as `[formatter.wrap] enabled = true`; the key is `enable`) is ignored: `unknown setting formatter.wrap.enabled (ignored); valid settings here: enable, link_width_mode`.
+- A string-valued formatter setting outside its choices (`misc.hr_style`, `misc.code_fence_style`, `emphasis.italic_marker`, `emphasis.bold_marker`, `lists.marker`, `wrap.link_width_mode`) and an invalid `daily_note.format` fall back to **that setting's default**: `invalid formatter.misc.hr_style "====": expected one of "---", "***", "___"; using "---"`.
 
-### When the file is invalid
+### When the file is broken
 
-A file that exists but can't be used — broken TOML, an unknown key, a value of the wrong type or out of range, an invalid `daily_note.format`, or a file that can't be read — is always reported, with the file name and (for TOML errors) the line and column. It never silently falls back to the defaults:
+Broken TOML, a value of the wrong type or out of range, or a file that can't be read cannot be made sense of, so it is an error, always reported with the file name and (for TOML errors) the line and column. It never silently falls back to the defaults:
 
-| Where | What happens |
-|---|---|
-| `satz fmt`, `satz daily` | Error on stderr, exit status `1`, **no file is changed or created**. |
-| `satz-lsp` at startup | The vault is still indexed with the default settings, a warning message is shown in the editor, and **formatting is turned off** (format-on-save, *Format Document*, *Format entire vault*) until the file is valid. |
-| `satz-lsp` on hot-reload | The previous settings stay in effect, the same warning is shown, and formatting is turned off until the file is valid. Fixing and saving the file turns it back on automatically. |
+| Where | Mistakes in names/values (warnings) | Broken file (error) |
+|---|---|---|
+| `satz fmt`, `satz daily` | `warning: ...` lines on stderr, one per ignored setting; the command runs with the rest of the file (exit status unaffected). | Error on stderr, exit status `1`, **no file is changed or created**. |
+| `satz-lsp` at startup | One warning message in the editor listing every ignored setting; the rest applies and formatting stays on. | The vault is still indexed with the default settings, a warning message is shown, and **formatting is turned off** (format-on-save, *Format Document*, *Format entire vault*) until the file is valid. |
+| `satz-lsp` on hot-reload | The same warning message after every save that still has mistakes; the rest applies. | The previous settings stay in effect, the same warning is shown, and formatting is turned off until the file is valid. Fixing and saving the file turns it back on automatically. |
 
 ## Full example
 

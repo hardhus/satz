@@ -172,6 +172,10 @@ pub struct SatzState {
     /// user did not choose would silently rewrite their notes.
     pub config_error: Option<String>,
 
+    /// Settings of `.satz.toml` that were ignored (an unknown key, a value outside its choices):
+    /// everything else applies and formatting stays on, but the user is told.
+    pub config_warnings: Vec<String>,
+
     /// Whether the client supports pull diagnostics
     pub client_supports_pull_diagnostics: bool,
 
@@ -246,6 +250,21 @@ pub fn config_error_message(error: &str, fallback: &str) -> String {
     )
 }
 
+/// The message shown to the user when parts of `.satz.toml` were ignored: every setting that was,
+/// and that all the rest applies (formatting included). Empty when there is nothing to say.
+pub fn config_warnings_message(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut message =
+        String::from("satz: some settings in .satz.toml were ignored; everything else applies:");
+    for warning in warnings {
+        message.push_str("\n- ");
+        message.push_str(warning);
+    }
+    message
+}
+
 /// A snapshot of an open document to parse OUTSIDE the state lock.
 #[derive(Debug, Clone)]
 pub struct ReparseJob {
@@ -314,6 +333,8 @@ pub struct IndexingOutcome {
     pub doc_count: usize,
     /// Why `.satz.toml` could not be used (defaults are in effect), if it could not.
     pub config_error: Option<String>,
+    /// Settings of `.satz.toml` that were ignored; the rest of it is in effect.
+    pub config_warnings: Vec<String>,
     /// Why the vault could not be indexed at all, if it could not.
     pub failure: Option<String>,
 }
@@ -336,12 +357,13 @@ impl SatzState {
             Ok(state) => (state, None),
             Err(error) => {
                 tracing::error!(%error, "initial indexing failed");
-                let (config, config_error) = Self::load_config(vault_root);
+                let (config, config_error, config_warnings) = Self::load_config(vault_root);
                 let state = SatzState {
                     vault_root: Some(vault_root.to_path_buf()),
                     format_cache: FormatCache::new(config.lsp.format_cache_capacity),
                     config,
                     config_error,
+                    config_warnings,
                     indexing_complete: true,
                     ..SatzState::default()
                 };
@@ -351,6 +373,7 @@ impl SatzState {
         let outcome = IndexingOutcome {
             doc_count: new_state.index.doc_count(),
             config_error: new_state.config_error.clone(),
+            config_warnings: new_state.config_warnings.clone(),
             failure,
         };
         new_state.client_supports_pull_diagnostics = self.client_supports_pull_diagnostics;
@@ -430,18 +453,23 @@ impl SatzState {
     /// An unusable `.satz.toml` does not stop indexing: the default configuration is used and
     /// the reason is recorded in `config_error` for the caller to show to the user.
     /// The vault's settings, or the defaults and the reason when `.satz.toml` cannot be used.
-    fn load_config(vault_root: &Path) -> (VaultConfig, Option<String>) {
-        match VaultConfig::load(vault_root) {
-            Ok(config) => (config, None),
+    fn load_config(vault_root: &Path) -> (VaultConfig, Option<String>, Vec<String>) {
+        match VaultConfig::load_with_warnings(vault_root) {
+            Ok((config, warnings)) => {
+                for warning in &warnings {
+                    tracing::warn!("initialize_index: {warning}");
+                }
+                (config, None, warnings)
+            }
             Err(e) => {
                 tracing::warn!("initialize_index: {e}; using default settings");
-                (VaultConfig::default(), Some(e.to_string()))
+                (VaultConfig::default(), Some(e.to_string()), Vec::new())
             }
         }
     }
 
     pub fn initialize_index(vault_root: PathBuf) -> anyhow::Result<Self> {
-        let (config, config_error) = Self::load_config(&vault_root);
+        let (config, config_error, config_warnings) = Self::load_config(&vault_root);
         tracing::debug!(
             config_error = config_error.is_some(),
             "initialize_index: loaded .satz.toml (or default)"
@@ -461,6 +489,7 @@ impl SatzState {
             open_docs: HashMap::new(),
             config,
             config_error,
+            config_warnings,
             client_supports_pull_diagnostics: false,
             client_supports_document_changes: false,
             config_revision: 0,
@@ -975,33 +1004,16 @@ mod tests {
     }
 
     #[test]
-    fn initialize_index_reports_unknown_keys_and_wrong_types() {
-        for (label, content, expect) in [
-            (
-                "unknown key",
-                "[formatter.wrap]\nenabled = true\n",
-                "enabled",
-            ),
-            (
-                "wrong type",
-                "[hover]\npreview_lines = \"many\"\n",
-                "preview_lines",
-            ),
-            (
-                "bad daily format",
-                "[daily_note]\nformat = \"%Q\"\n",
-                "daily_note.format",
-            ),
-        ] {
-            let v = TempVault::new("badkey");
-            v.config(content);
-            let state = SatzState::initialize_index(v.0.clone()).unwrap();
-            let error = state.config_error.as_deref().unwrap_or_else(|| {
-                panic!("{label}: config error must be recorded");
-            });
-            assert!(error.contains(expect), "{label}: {error}");
-            assert!(!state.formatting_allowed(), "{label}");
-        }
+    fn initialize_index_reports_wrong_types_as_an_error() {
+        let v = TempVault::new("badkey");
+        v.config("[hover]\npreview_lines = \"many\"\n");
+        let state = SatzState::initialize_index(v.0.clone()).unwrap();
+        let error = state
+            .config_error
+            .as_deref()
+            .expect("a config error must be recorded");
+        assert!(error.contains("preview_lines"), "{error}");
+        assert!(!state.formatting_allowed());
     }
 
     #[test]
@@ -1999,5 +2011,82 @@ mod tests {
         state.finish_indexing(Ok(SatzState::default()), Path::new("/vault"));
         assert!(state.client_supports_semantic_tokens);
         assert!(state.client_supports_pull_diagnostics);
+    }
+
+    // ---- a config with mistakes: the rest applies, the mistakes are reported ----
+
+    #[test]
+    fn unknown_keys_and_bad_values_are_warnings_and_formatting_stays_on() {
+        for (label, content, expect) in [
+            (
+                "unknown key",
+                "[formatter.wrap]\nenabled = true\n",
+                "enabled",
+            ),
+            (
+                "bad daily format",
+                "[daily_note]\nformat = \"%Q\"\n",
+                "daily_note.format",
+            ),
+            (
+                "bad choice",
+                "[formatter.misc]\nhr_style = \"====\"\n",
+                "hr_style",
+            ),
+        ] {
+            let v = TempVault::new("warnkey");
+            v.config(&format!("{content}\n[hover]\npreview_lines = 3\n"));
+            let state = SatzState::initialize_index(v.0.clone()).unwrap();
+            assert_eq!(state.config_error, None, "{label}");
+            assert_eq!(
+                state.config.hover.preview_lines, 3,
+                "{label}: the rest applies"
+            );
+            assert_eq!(
+                state.config_warnings.len(),
+                1,
+                "{label}: {:?}",
+                state.config_warnings
+            );
+            assert!(
+                state.config_warnings[0].contains(expect),
+                "{label}: {:?}",
+                state.config_warnings
+            );
+            assert!(state.formatting_allowed(), "{label}");
+        }
+    }
+
+    #[test]
+    fn the_warnings_come_back_with_the_indexing_outcome_and_survive_the_index_swap() {
+        let v = TempVault::new("warnswap");
+        v.config("[bogus]\nx = 1\n");
+        let fresh = SatzState::initialize_index(v.0.clone()).unwrap();
+        let mut state = SatzState::default();
+        let outcome = state.finish_indexing(Ok(fresh), &v.0);
+        assert_eq!(outcome.config_warnings.len(), 1);
+        assert_eq!(state.config_warnings, outcome.config_warnings);
+        // A failed walk still loads the settings and reports their mistakes.
+        let mut state = SatzState::default();
+        let outcome = state.finish_indexing(Err(anyhow::anyhow!("no folder")), &v.0);
+        assert!(outcome.failure.is_some());
+        assert_eq!(outcome.config_warnings.len(), 1);
+    }
+
+    #[test]
+    fn the_warning_message_lists_every_ignored_setting_and_says_the_rest_applies() {
+        let message = config_warnings_message(&[
+            ".satz.toml: unknown setting formatter.wrap.enabled (ignored)".to_string(),
+            ".satz.toml: invalid formatter.misc.hr_style \"====\"; using \"---\"".to_string(),
+        ]);
+        assert!(message.contains("formatter.wrap.enabled"), "{message}");
+        assert!(message.contains("hr_style"), "{message}");
+        assert!(message.contains("everything else"), "{message}");
+        assert_eq!(
+            message.lines().count(),
+            3,
+            "a header and one line each: {message}"
+        );
+        assert_eq!(config_warnings_message(&[]), "");
     }
 }
