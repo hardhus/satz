@@ -796,11 +796,13 @@ mod tests {
         let rel = SatzState::get_rel_path(path, Some(root));
         assert_eq!(rel, PathBuf::from("projeler/proje1.md"));
 
-        // Case-insensitive test on Windows path format
-        let root_win = Path::new("C:\\Notlar\\İş");
-        let path_win = Path::new("c:\\notlar\\iş\\projeler\\proje1.md");
-        let rel_win = SatzState::get_rel_path(path_win, Some(root_win));
-        assert_eq!(rel_win, PathBuf::from("projeler\\proje1.md"));
+        // Case-insensitive test on Windows path format (`\` separates only on Windows)
+        if cfg!(windows) {
+            let root_win = Path::new("C:\\Notlar\\İş");
+            let path_win = Path::new("c:\\notlar\\iş\\projeler\\proje1.md");
+            let rel_win = SatzState::get_rel_path(path_win, Some(root_win));
+            assert_eq!(rel_win, PathBuf::from("projeler\\proje1.md"));
+        }
     }
 
     #[test]

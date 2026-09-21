@@ -1708,12 +1708,16 @@ mod tests {
     #[tokio::test]
     async fn opening_a_note_indexes_its_buffer_and_closing_it_forgets_a_note_without_a_file() {
         let (backend, _service) = shared_backend().await;
+        // Inside the vault root, so the path is the same on every operating system.
+        let uri = crate::convert::path_to_uri(&root().join("new-note.md"))
+            .unwrap()
+            .to_string();
         backend
-            .did_open(open_params("file:///new-note.md", 1, "# New\n\n[[a]]\n"))
+            .did_open(open_params(&uri, 1, "# New\n\n[[a]]\n"))
             .await;
         {
             let state = backend.state.read().await;
-            assert!(state.open_docs.contains_key("file:///new-note.md"));
+            assert!(state.open_docs.contains_key(&uri));
             assert!(
                 state
                     .index
@@ -1728,9 +1732,9 @@ mod tests {
                 1
             );
         }
-        backend.did_close(close_params("file:///new-note.md")).await;
+        backend.did_close(close_params(&uri)).await;
         let state = backend.state.read().await;
-        assert!(!state.open_docs.contains_key("file:///new-note.md"));
+        assert!(!state.open_docs.contains_key(&uri));
         assert!(
             state
                 .index
