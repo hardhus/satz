@@ -2,7 +2,7 @@
 //! scratch out of the same documents. A deterministic pseudo-random sequence of edits is applied
 //! and, after every step, everything observable about the index is compared.
 
-use satz_core::{DocId, Document, Index, parse_document};
+use satz_core::{DocId, Document, Index, VaultGraph, parse_document};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -141,8 +141,25 @@ fn observe(index: &Index) -> String {
     tags.sort();
     let broken = index.docs_with_broken_links().count();
 
+    // The graph export as it comes out, order included: it must not depend on how the index got
+    // to this state.
+    let graph = VaultGraph::build(index).to_data();
+    let graph_nodes: Vec<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
+    let graph_edges: Vec<(&str, &str, &str, Option<&str>)> = graph
+        .edges
+        .iter()
+        .map(|e| {
+            (
+                e.source.as_str(),
+                e.target.as_str(),
+                e.kind.as_str(),
+                e.label.as_deref(),
+            )
+        })
+        .collect();
+
     format!(
-        "backlinks={per_doc:?}\nresolved={resolved:?}\norphans={orphans:?}\ntags={tags:?}\nbroken={broken}\n"
+        "backlinks={per_doc:?}\nresolved={resolved:?}\norphans={orphans:?}\ntags={tags:?}\nbroken={broken}\ngraph_nodes={graph_nodes:?}\ngraph_edges={graph_edges:?}\n"
     )
 }
 

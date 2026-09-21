@@ -1491,3 +1491,47 @@ fn resolve_reports_found_and_not_found_as_an_outcome_and_writes_only_what_it_fou
     .unwrap_err();
     assert!(e.to_string().contains("does not exist"), "{e}");
 }
+
+// ---- graph: the same vault gives the same output every run ----
+
+#[test]
+fn graph_output_is_the_same_in_every_run_and_in_note_id_order() {
+    let v = TempDir::new("graph_stable");
+    for i in 0..36 {
+        let folder = ["", "sub/", "Zeta/", "ş/"][i % 4];
+        v.write(
+            &format!("{folder}n{i:02}.md"),
+            &format!(
+                "# Note {i}\n\n[[n{:02}]] ![[n{:02}]] [[n{:02}]]\n",
+                (i + 1) % 36,
+                (i + 5) % 36,
+                (i + 1) % 36
+            ),
+        );
+    }
+    let run = |format: &str| {
+        let o = satz(&["graph", "-v", v.str(), "-f", format]);
+        assert!(o.status.success(), "{}", err(&o));
+        out(&o)
+    };
+
+    let json = run("json");
+    let dot = run("dot");
+    for round in 0..4 {
+        // Every run is a new process with its own hash seeds.
+        assert_eq!(run("json"), json, "JSON differs in run {round}");
+        assert_eq!(run("dot"), dot, "DOT differs in run {round}");
+    }
+
+    let data: serde_json::Value = serde_json::from_str(&json).expect("JSON");
+    let ids: Vec<&str> = data["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids.len(), 36);
+    assert_eq!(ids, sorted, "nodes come in note id order");
+}

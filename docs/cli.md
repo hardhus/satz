@@ -177,6 +177,8 @@ JSON shape:
 }
 ```
 
+Nodes are listed by note id, and edges by the id of their source note and then in the order the links appear in that note, so the same vault always gives the same output (it diffs cleanly).
+
 `kind` is one of `wikilink`, `embed`, `markdown`, `footnote`. `label` carries the `#heading` or `#^block` anchor when the link targets one. Only links that successfully resolve to another indexed document become edges; external `http(s)://` links and unresolved links are omitted from the graph.
 
 | Flag | Default | Meaning |

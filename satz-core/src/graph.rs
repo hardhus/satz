@@ -4,7 +4,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::index::Index;
-use crate::model::{DocId, LinkKind};
+use crate::model::{DocId, Document, LinkKind};
 
 /// A node in the vault graph representing a document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,12 +40,20 @@ pub struct VaultGraph {
 
 impl VaultGraph {
     /// Builds a `VaultGraph` from the given `Index`.
+    ///
+    /// The graph is a function of the notes: nodes come in note id order, and the edges of each
+    /// source note (sources in that same order) in the order its links stand in the text. The
+    /// index keeps its notes in a hash map whose order changes from run to run; the export must
+    /// not.
     pub fn build(index: &Index) -> Self {
         let mut graph = DiGraph::new();
         let mut node_indices = HashMap::new();
 
+        let mut docs: Vec<&Document> = index.documents().collect();
+        docs.sort_by(|a, b| a.id.cmp(&b.id));
+
         // 1. Add all document nodes
-        for doc in index.documents() {
+        for &doc in &docs {
             let tags = doc.tags.iter().map(|t| t.name.clone()).collect();
             let node = GraphNode {
                 id: doc.id.as_str().to_string(),
@@ -58,7 +66,7 @@ impl VaultGraph {
         }
 
         // 2. Add edges for links between documents
-        for doc in index.documents() {
+        for &doc in &docs {
             let Some(&src_idx) = node_indices.get(&doc.id) else {
                 continue;
             };
