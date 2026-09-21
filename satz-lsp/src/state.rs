@@ -81,6 +81,17 @@ impl OpenDocument {
     }
 }
 
+/// How long to wait before re-parsing after a change: `debounce` since the last change, but not
+/// past `max_wait` since the FIRST change of a series -- typing without a pause must not postpone
+/// the reparse for ever. `elapsed` is the time since that first change.
+pub fn debounce_delay(
+    debounce: std::time::Duration,
+    max_wait: std::time::Duration,
+    elapsed: std::time::Duration,
+) -> std::time::Duration {
+    debounce.min(max_wait.saturating_sub(elapsed))
+}
+
 /// What is remembered about one content hash.
 #[derive(Debug, Clone)]
 enum CachedFormat {
@@ -909,74 +920,65 @@ mod tests {
     }
 
     #[test]
-    fn test_debounce_and_max_wait_delay_calculation() {
-        let debounce = std::time::Duration::from_millis(200);
-        let max_wait = std::time::Duration::from_millis(500);
+    fn the_debounce_delay_is_the_debounce_until_max_wait_cuts_it_short() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let delay =
+            |debounce, max_wait, elapsed| debounce_delay(ms(debounce), ms(max_wait), ms(elapsed));
 
-        // At t = 0
-        let elapsed_0 = std::time::Duration::from_millis(0);
-        let delay_0 = debounce.min(max_wait.saturating_sub(elapsed_0));
-        assert_eq!(delay_0, std::time::Duration::from_millis(200));
+        // Defaults (200 / 500): the debounce while there is plenty of max-wait left...
+        assert_eq!(delay(200, 500, 0), ms(200), "first change of a series");
+        assert_eq!(
+            delay(200, 500, 100),
+            ms(200),
+            "typing on, max-wait far away"
+        );
+        assert_eq!(
+            delay(200, 500, 300),
+            ms(200),
+            "exactly as much max-wait left as debounce"
+        );
+        // ...the rest of the max-wait once that is shorter...
+        assert_eq!(delay(200, 500, 400), ms(100), "max-wait caps the delay");
+        assert_eq!(delay(200, 500, 499), ms(1), "one millisecond left");
+        // ...and nothing once it is used up (no underflow, no panic).
+        assert_eq!(delay(200, 500, 500), ms(0), "max-wait exactly used up");
+        assert_eq!(delay(200, 500, 550), ms(0), "max-wait exceeded");
+        assert_eq!(
+            debounce_delay(ms(200), ms(500), Duration::MAX),
+            ms(0),
+            "an absurd elapsed time"
+        );
 
-        // At t = 100
-        let elapsed_100 = std::time::Duration::from_millis(100);
-        let delay_100 = debounce.min(max_wait.saturating_sub(elapsed_100));
-        assert_eq!(delay_100, std::time::Duration::from_millis(200));
-
-        // At t = 400 (max_wait capping)
-        let elapsed_400 = std::time::Duration::from_millis(400);
-        let delay_400 = debounce.min(max_wait.saturating_sub(elapsed_400));
-        assert_eq!(delay_400, std::time::Duration::from_millis(100));
-
-        // At t = 550 (max_wait exceeded)
-        let elapsed_550 = std::time::Duration::from_millis(550);
-        let delay_550 = debounce.min(max_wait.saturating_sub(elapsed_550));
-        assert_eq!(delay_550, std::time::Duration::from_millis(0));
+        // A max-wait shorter than the debounce wins from the start.
+        assert_eq!(delay(300, 100, 0), ms(100), "max-wait below debounce");
+        // Zero settings mean "reparse at once", never a wait.
+        assert_eq!(delay(0, 500, 0), ms(0), "no debounce");
+        assert_eq!(delay(200, 0, 0), ms(0), "no max-wait");
+        assert_eq!(delay(0, 0, 0), ms(0), "neither");
     }
 
-    #[tokio::test]
-    async fn test_async_debounced_task_execution() {
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
-
-        let state = Arc::new(RwLock::new(SatzState::default()));
-        let uri = "file:///test.md";
-        let path = Path::new("test.md");
-
-        {
-            let mut s = state.write().await;
-            s.open_document(uri, "# Initial", path, 1);
+    #[test]
+    fn the_debounce_delay_never_grows_while_typing_continues() {
+        use std::time::Duration;
+        let mut previous = Duration::MAX;
+        for elapsed in 0..700 {
+            let delay = debounce_delay(
+                Duration::from_millis(200),
+                Duration::from_millis(500),
+                Duration::from_millis(elapsed),
+            );
+            assert!(
+                delay <= previous,
+                "at {elapsed} ms: {delay:?} after {previous:?}"
+            );
+            assert!(
+                Duration::from_millis(elapsed) + delay
+                    <= Duration::from_millis(500).max(Duration::from_millis(elapsed)),
+                "at {elapsed} ms the reparse would land past the max-wait: {delay:?}"
+            );
+            previous = delay;
         }
-
-        // Send 3 rapid changes
-        for i in 2..=4 {
-            let mut s = state.write().await;
-            if let Some(doc) = s.open_docs.get_mut(uri) {
-                if let Some(prev) = doc.pending_task.take() {
-                    prev.abort();
-                }
-                doc.rope = ropey::Rope::from_str(&format!("# Version {}", i));
-                doc.version = i;
-
-                let state_clone = state.clone();
-                let uri_clone = uri.to_string();
-                let handle = tokio::task::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    let mut st = state_clone.write().await;
-                    st.reparse_open_document(&uri_clone);
-                });
-                doc.pending_task = Some(handle);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        // Wait for final debounced task to complete
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let s = state.read().await;
-        let doc_id = satz_core::DocId::new("test.md");
-        let parsed = s.index.get_doc(&doc_id).expect("Doc should exist in index");
-        assert_eq!(parsed.title, "Version 4");
     }
 
     /// A unique, self-cleaning vault directory containing one note.

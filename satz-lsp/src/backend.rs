@@ -694,7 +694,7 @@ impl LanguageServer for Backend {
         let now = std::time::Instant::now();
         let first = open_doc.first_change_at.get_or_insert(now);
         let elapsed = now.duration_since(*first);
-        let delay = debounce.min(max_wait.saturating_sub(elapsed));
+        let delay = crate::state::debounce_delay(debounce, max_wait, elapsed);
 
         if let Some(previous) = open_doc.pending_task.take() {
             previous.abort();
@@ -1906,6 +1906,92 @@ mod tests {
             1,
             "{sent:?}"
         );
+    }
+
+    // ---- debounce and max-wait, through the real `did_change` ----
+
+    /// The title the index holds for the open `a.md`.
+    async fn indexed_title_of_a(backend: &Backend) -> String {
+        let state = backend.state.read().await;
+        state
+            .index
+            .get_doc(&satz_core::DocId::new("a.md"))
+            .expect("a.md is indexed")
+            .title
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn quick_successive_changes_are_parsed_once_with_the_last_text() {
+        let (backend, _service) = shared_backend().await;
+        {
+            let mut state = backend.state.write().await;
+            state.config.lsp.reparse_debounce_ms = 50;
+            state.config.lsp.reparse_max_wait_ms = 5_000;
+        }
+        for version in 2..=4 {
+            backend
+                .did_change(change_params(
+                    "file:///a.md",
+                    version,
+                    &format!("# Version {version}\n"),
+                ))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            indexed_title_of_a(&backend).await,
+            "A",
+            "the debounce has not run out yet: the index still holds the old text"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        assert_eq!(indexed_title_of_a(&backend).await, "Version 4");
+        let state = backend.state.read().await;
+        assert!(!state.has_stale_open_documents());
+        assert!(
+            state.open_docs["file:///a.md"]
+                .pending_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished()),
+            "only the reparse of the last change was left, and it is done"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_without_a_pause_is_still_parsed_once_the_max_wait_is_up() {
+        // Every change comes sooner (30 ms) than the debounce (100 ms) would fire, so without the
+        // max-wait (250 ms) the index would not move until the typing stops.
+        let (backend, _service) = shared_backend().await;
+        {
+            let mut state = backend.state.write().await;
+            state.config.lsp.reparse_debounce_ms = 100;
+            state.config.lsp.reparse_max_wait_ms = 250;
+        }
+        let mut title_while_typing = String::new();
+        for i in 0..14 {
+            backend
+                .did_change(change_params(
+                    "file:///a.md",
+                    2 + i,
+                    &format!("# Typing {i}\n"),
+                ))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            if i == 10 {
+                // ~330 ms in and still typing: the max-wait fired at ~250 ms.
+                title_while_typing = indexed_title_of_a(&backend).await;
+            }
+        }
+        assert!(
+            title_while_typing.starts_with("Typing"),
+            "the index never moved while typing went on: {title_while_typing:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(indexed_title_of_a(&backend).await, "Typing 13");
+        assert!(!backend.state.read().await.has_stale_open_documents());
     }
 
     #[tokio::test]
