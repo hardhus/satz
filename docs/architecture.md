@@ -5,7 +5,7 @@ This page is for anyone who wants to use satz's pieces as a Rust library rather 
 ## Workspace layout
 
 ```
-satz-core/   library only — parsing, indexing, graph, formatter, config, no I/O beyond walking the filesystem
+satz-core/   library only — parsing, indexing, graph, formatter, config, no I/O beyond walking the filesystem and reading `.satz.toml`
 satz-cli/    binary `satz` + lib `satz_cli` — thin command layer on top of satz-core
 satz-lsp/    binary `satz-lsp` — tower-lsp-server implementation on top of satz-core
 ```

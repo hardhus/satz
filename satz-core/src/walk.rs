@@ -59,7 +59,9 @@ fn io_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Traverses the given `vault_root` path respecting `.gitignore` rules and parses all `.md` files in parallel.
+/// Traverses the given `vault_root` path and parses all `.md` files in parallel. `.ignore` files
+/// are respected always, `.gitignore` files (and git's global ignore file) only when the vault is
+/// inside a git repository.
 ///
 /// Returns a list of `Document`s. Files with read errors or invalid encoding are logged as warnings and skipped.
 pub fn walk_vault(vault_root: &Path) -> Result<Vec<Document>> {
@@ -265,6 +267,32 @@ mod tests {
             t.write(&format!("{dir}/hidden.md"), "# hidden\n");
         }
         assert_eq!(t.walk(), vec!["keep.md"]);
+    }
+
+    #[test]
+    fn a_gitignore_applies_only_inside_a_git_repository_and_an_ignore_file_always() {
+        // Git's ignore rules need a repository (the `ignore` crate's default): a `.gitignore` in a
+        // folder that is no repository does nothing. docs/cli.md says so.
+        let plain = Tree::new("gitignore_plain");
+        plain.write("keep.md", "# keep\n");
+        plain.write("secret.md", "# secret\n");
+        plain.write(".gitignore", "secret.md\n");
+        assert_eq!(plain.walk(), vec!["keep.md", "secret.md"]);
+
+        let repo = Tree::new("gitignore_repo");
+        repo.write("keep.md", "# keep\n");
+        repo.write("secret.md", "# secret\n");
+        repo.write("sub/also-secret.md", "# secret\n");
+        repo.write(".gitignore", "secret.md\nalso-secret.md\n");
+        repo.write(".git/HEAD", "ref: refs/heads/main\n");
+        assert_eq!(repo.walk(), vec!["keep.md"]);
+
+        // A `.ignore` file is read whether or not there is a repository.
+        let dot_ignore = Tree::new("dot_ignore");
+        dot_ignore.write("keep.md", "# keep\n");
+        dot_ignore.write("secret.md", "# secret\n");
+        dot_ignore.write(".ignore", "secret.md\n");
+        assert_eq!(dot_ignore.walk(), vec!["keep.md"]);
     }
 
     #[test]

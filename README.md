@@ -19,7 +19,7 @@ Point it at a folder of `.md` files and it gives you: link/tag/backlink indexing
 - Whole-vault formatting from the CLI (`satz fmt --check`/`--write`) or the editor (`satz.formatWorkspace`), plus single-file `textDocument/formatting` — all producing minimal, line-scoped edits rather than replacing whole files.
 
 **CLI (`satz`)**
-- `index`, `stats` — vault-wide summary (docs, links, tags, orphans), human or JSON output.
+- `index`, `stats` — vault-wide summary (docs, links, tags, orphans); `stats --json` for scripts.
 - `list` — filter documents by tag, orphan status, or list every broken link.
 - `resolve` — resolve a wikilink target to a file path from the shell.
 - `daily` — open or create today's daily note.

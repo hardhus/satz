@@ -7,7 +7,7 @@ General notes that apply to every command:
 - Logging goes to **stderr** via `tracing`, default level `WARN`. Set `RUST_LOG=info` (or `debug`) before running to see more.
 - Any `--vault`/`-v` or positional `path` argument defaults to `.` (the current directory) unless noted otherwise.
 - When the output goes into a pipe and the reader leaves early (`satz list | head -1`), the command ends without an error message; its exit code is still the command's own result (for example `fmt --check` still exits 1 when files need formatting).
-- Vault walking respects `.gitignore` and always skips `.git`, `.obsidian`, `node_modules`, `.trash`, `.stversions`, `.svn`, `.hg` regardless of ignore files.
+- Vault walking always skips `.git`, `.obsidian`, `node_modules`, `.trash`, `.stversions`, `.svn`, `.hg` regardless of ignore files. Beyond that it reads `.ignore` files, and `.gitignore` files together with your global git ignore file (`core.excludesFile`) — but the git ones only when the vault is inside a git repository (a `.git` folder is present); a `.gitignore` in a folder that is not a repository has no effect. Other hidden files and folders are read like any other.
 
 ## `satz index [path]`
 
