@@ -187,6 +187,9 @@ pub struct SatzState {
     /// Whether the client answers `workspace/semanticTokens/refresh`.
     pub client_supports_semantic_tokens_refresh: bool,
 
+    /// Whether the client asks for semantic tokens at all (`textDocument.semanticTokens`).
+    pub client_supports_semantic_tokens: bool,
+
     /// Flag indicating that open document identity keys changed and peers need diagnostic refresh
     peers_dirty: bool,
 
@@ -356,6 +359,7 @@ impl SatzState {
         new_state.client_supports_diagnostic_refresh = self.client_supports_diagnostic_refresh;
         new_state.client_supports_semantic_tokens_refresh =
             self.client_supports_semantic_tokens_refresh;
+        new_state.client_supports_semantic_tokens = self.client_supports_semantic_tokens;
         new_state.open_docs = std::mem::take(&mut self.open_docs);
         for doc in new_state.open_docs.values() {
             let rel_path = Self::get_rel_path(&doc.path, new_state.vault_root.as_deref());
@@ -462,6 +466,7 @@ impl SatzState {
             config_revision: 0,
             client_supports_diagnostic_refresh: false,
             client_supports_semantic_tokens_refresh: false,
+            client_supports_semantic_tokens: false,
             peers_dirty: false,
             format_cache,
             indexing_complete: true,
@@ -1984,5 +1989,15 @@ mod tests {
         assert_eq!(inside(&state), PathBuf::from("a.md"));
         state.set_vault_root(None);
         assert_eq!(inside(&state), PathBuf::from("/vault/sub/a.md"));
+    }
+
+    #[test]
+    fn a_finished_index_keeps_what_the_client_can_do() {
+        let mut state = SatzState::default();
+        state.client_supports_semantic_tokens = true;
+        state.client_supports_pull_diagnostics = true;
+        state.finish_indexing(Ok(SatzState::default()), Path::new("/vault"));
+        assert!(state.client_supports_semantic_tokens);
+        assert!(state.client_supports_pull_diagnostics);
     }
 }

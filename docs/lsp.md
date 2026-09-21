@@ -29,7 +29,7 @@ Vault indexing happens in the background right after `initialize` — a big vaul
 
 ## Diagnostics
 
-Pull diagnostics (`textDocument/diagnostic`, `workspace/diagnostic`) carry a `resultId`; a client that sends it back as `previousResultId` gets an `unchanged` report while nothing in the vault or the configuration has changed, instead of the full list. Any change invalidates every id (a diagnostic can depend on the whole index). The server only sends `workspace/diagnostic/refresh` and `workspace/semanticTokens/refresh` to clients that announced `refreshSupport` for them; a failed refresh request is logged as a warning.
+Pull diagnostics (`textDocument/diagnostic`, `workspace/diagnostic`) carry a `resultId`; a client that sends it back as `previousResultId` gets an `unchanged` report while nothing in the vault or the configuration has changed, instead of the full list. Any change invalidates every id (a diagnostic can depend on the whole index). `workspace/semanticTokens/refresh` goes to every client that asks for semantic tokens and `workspace/diagnostic/refresh` to every client that pulls diagnostics, whether or not it announced `refreshSupport` for them: the colours and diagnostics of a note opened while the vault is still being indexed are computed from an incomplete index, and this request is what makes the client fetch them again once it is complete. A client that does not know the request just answers with an error, which is only logged at debug level.
 
 Diagnostic codes you'll see in `diagnostic.code`:
 
