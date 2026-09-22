@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::cmp::{Ordering, Reverse};
+
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
@@ -6,60 +9,293 @@ use tower_lsp_server::ls_types::{
 
 use crate::state::SatzState;
 
-/// The answer for a candidate list: sorted (by folded label, then detail) so the same request always
-/// gives the same list whatever order the index iterates in, and cut at `limit` (0 = no limit). A cut
-/// answer is a list marked incomplete, so the client asks again as the user types.
-fn respond(mut items: Vec<CompletionItem>, limit: usize, query: &str) -> CompletionResponse {
-    let by_label = |a: &CompletionItem, b: &CompletionItem| {
-        satz_core::fold_key(&a.label)
-            .cmp(&satz_core::fold_key(&b.label))
-            .then_with(|| a.label.cmp(&b.label))
-            .then_with(|| a.detail.cmp(&b.detail))
-    };
-    if limit == 0 || items.len() <= limit {
-        items.sort_by(by_label);
-        return CompletionResponse::Array(items);
+/// What ranking needs to know about a candidate, so the same order is used whether a candidate is
+/// a finished item or a light description of one that is built only if it is offered.
+trait Ranked {
+    fn label(&self) -> Cow<'_, str>;
+    /// What the typed query is matched against.
+    fn filter_text(&self) -> &str;
+    fn detail(&self) -> Option<Cow<'_, str>>;
+}
+
+impl Ranked for CompletionItem {
+    fn label(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.label)
     }
 
-    // The list has to be cut. What the user has typed decides what stays: without that, the cut
-    // keeps the first candidates of the alphabet and a note or heading further down (`Nesne`) is
-    // never offered, however much of its name is typed.
-    let query = satz_core::fold_key(query);
-    if !query.is_empty() {
-        let mut ranker = crate::rank::Ranker::new(&query);
-        let mut scored: Vec<(u8, u32, CompletionItem)> = items
-            .into_iter()
-            .filter_map(|item| {
-                let text = satz_core::fold_key(item.filter_text.as_deref().unwrap_or(&item.label));
-                let score = ranker.score(&text)?;
-                let tier = if text == query {
-                    0
-                } else if text.starts_with(&query) {
-                    1
-                } else {
-                    2
-                };
-                Some((tier, score, item))
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| b.1.cmp(&a.1))
-                .then_with(|| by_label(&a.2, &b.2))
-        });
-        items = scored.into_iter().map(|(_, _, item)| item).collect();
-    } else {
-        items.sort_by(by_label);
+    fn filter_text(&self) -> &str {
+        self.filter_text.as_deref().unwrap_or(&self.label)
     }
-    let cut = items.len() > limit;
-    items.truncate(limit);
-    if cut {
-        return CompletionResponse::List(CompletionList {
+
+    fn detail(&self) -> Option<Cow<'_, str>> {
+        self.detail.as_deref().map(Cow::Borrowed)
+    }
+}
+
+/// A candidate's rank: the cheap part (match tier, then score) and where it is in the list, which
+/// is the order it was found in and decides between candidates that rank the same in every other
+/// way. Small on purpose: ranking moves these around, never the candidates themselves.
+struct Entry {
+    coarse: (u8, Reverse<u32>),
+    at: usize,
+}
+
+/// An entry whose folded label is worked out: the expensive part of the order.
+struct Keyed {
+    entry: Entry,
+    key: String,
+}
+
+impl Keyed {
+    fn new<T: Ranked>(candidates: &[T], entry: Entry) -> Self {
+        let key = satz_core::fold_key(&candidates[entry.at].label());
+        Self { entry, key }
+    }
+
+    /// By folded label, then label, then detail, then the order found (a total order).
+    fn by_label<T: Ranked>(candidates: &[T], a: &Self, b: &Self) -> Ordering {
+        let (x, y) = (&candidates[a.entry.at], &candidates[b.entry.at]);
+        a.key
+            .cmp(&b.key)
+            .then_with(|| x.label().cmp(&y.label()))
+            .then_with(|| x.detail().cmp(&y.detail()))
+            .then_with(|| a.entry.at.cmp(&b.entry.at))
+    }
+}
+
+/// The places (in `candidates`) of the best `k`, in order: by `coarse`, and among equal `coarse` by
+/// label. Only the entries that can be among the `k` get their label folded: with a query, most
+/// fall behind on `coarse` alone.
+fn top_k<T: Ranked>(candidates: &[T], mut entries: Vec<Entry>, k: usize) -> Vec<usize> {
+    let mut ties = Vec::new();
+    if entries.len() > k {
+        // Everything ahead of the k-th on `coarse` is in; everything behind is out; the entries
+        // equal to it compete for the places that are left.
+        entries.select_nth_unstable_by(k - 1, |a, b| a.coarse.cmp(&b.coarse));
+        let edge = entries[k - 1].coarse;
+        let (ahead, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| e.coarse < edge);
+        entries = ahead;
+        ties = rest.into_iter().filter(|e| e.coarse == edge).collect();
+    }
+    let mut ahead: Vec<Keyed> = entries
+        .into_iter()
+        .map(|e| Keyed::new(candidates, e))
+        .collect();
+    ahead.sort_unstable_by(|a, b| {
+        a.entry
+            .coarse
+            .cmp(&b.entry.coarse)
+            .then_with(|| Keyed::by_label(candidates, a, b))
+    });
+    let mut out: Vec<usize> = ahead.into_iter().map(|k| k.entry.at).collect();
+
+    if !ties.is_empty() {
+        let places = k - out.len();
+        let mut ties: Vec<Keyed> = ties
+            .into_iter()
+            .map(|e| Keyed::new(candidates, e))
+            .collect();
+        if ties.len() > places {
+            ties.select_nth_unstable_by(places - 1, |a, b| Keyed::by_label(candidates, a, b));
+            ties.truncate(places);
+        }
+        ties.sort_unstable_by(|a, b| Keyed::by_label(candidates, a, b));
+        out.extend(ties.into_iter().map(|k| k.entry.at));
+    }
+    out
+}
+
+/// The candidates that are answered, in order, and whether more were left out.
+struct Ranking<T> {
+    items: Vec<T>,
+    incomplete: bool,
+}
+
+/// Sorts (by folded label, then detail, so the same request always gives the same list whatever
+/// order the index iterates in) and cuts at `limit` (0 = no limit). A cut answer is incomplete, so
+/// the client asks again as the user types.
+///
+/// When the list has to be cut, what the user has typed decides what stays: without that, the cut
+/// keeps the first candidates of the alphabet and a note or heading further down (`Nesne`) is
+/// never offered, however much of its name is typed.
+fn rank<T: Ranked>(candidates: Vec<T>, limit: usize, query: &str) -> Ranking<T> {
+    let total = candidates.len();
+    let unranked = || -> Vec<Entry> {
+        (0..total)
+            .map(|at| Entry {
+                coarse: (0, Reverse(0)),
+                at,
+            })
+            .collect()
+    };
+
+    let (places, incomplete) = if limit == 0 || total <= limit {
+        (top_k(&candidates, unranked(), total.max(1)), false)
+    } else {
+        let query = satz_core::fold_key(query);
+        if query.is_empty() {
+            (top_k(&candidates, unranked(), limit), true)
+        } else {
+            let mut ranker = crate::rank::Ranker::new(&query);
+            let scored: Vec<Entry> = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(at, item)| {
+                    let text = satz_core::fold_key(item.filter_text());
+                    let score = ranker.score(&text)?;
+                    let tier = if text == query {
+                        0
+                    } else if text.starts_with(&query) {
+                        1
+                    } else {
+                        2
+                    };
+                    Some(Entry {
+                        coarse: (tier, Reverse(score)),
+                        at,
+                    })
+                })
+                .collect();
+            let matched = scored.len();
+            (top_k(&candidates, scored, limit), matched > limit)
+        }
+    };
+
+    let mut slots: Vec<Option<T>> = candidates.into_iter().map(Some).collect();
+    Ranking {
+        items: places
+            .into_iter()
+            .filter_map(|at| slots[at].take())
+            .collect(),
+        incomplete,
+    }
+}
+
+fn response_of(items: Vec<CompletionItem>, incomplete: bool) -> CompletionResponse {
+    if incomplete {
+        CompletionResponse::List(CompletionList {
             is_incomplete: true,
             items,
-        });
+        })
+    } else {
+        CompletionResponse::Array(items)
     }
-    CompletionResponse::Array(items)
+}
+
+/// The answer for a list of finished items (see `rank`).
+fn respond(items: Vec<CompletionItem>, limit: usize, query: &str) -> CompletionResponse {
+    let ranking = rank(items, limit, query);
+    response_of(ranking.items, ranking.incomplete)
+}
+
+/// A note, alias or heading that could be offered, before anything is built for it: cheap to make,
+/// so all of them can be ranked and only the ones that are answered turned into items.
+struct Candidate<'a> {
+    doc: &'a satz_core::Document,
+    hit: Hit<'a>,
+}
+
+enum Hit<'a> {
+    /// The note itself.
+    Title,
+    Alias(&'a str),
+    /// A heading's text, trimmed (never empty).
+    Heading(&'a str),
+}
+
+/// What a note is called in the list: its title, or its id when it has none.
+fn title_label(doc: &satz_core::Document) -> &str {
+    if doc.title != "Untitled" && !doc.title.is_empty() {
+        &doc.title
+    } else {
+        doc.id.as_str()
+    }
+}
+
+impl Ranked for Candidate<'_> {
+    fn label(&self) -> Cow<'_, str> {
+        match self.hit {
+            Hit::Title => Cow::Borrowed(title_label(self.doc)),
+            Hit::Alias(alias) => Cow::Owned(format!("{} (alias)", alias)),
+            Hit::Heading(text) => Cow::Borrowed(text),
+        }
+    }
+
+    fn filter_text(&self) -> &str {
+        match self.hit {
+            Hit::Title => title_label(self.doc),
+            Hit::Alias(text) | Hit::Heading(text) => text,
+        }
+    }
+
+    fn detail(&self) -> Option<Cow<'_, str>> {
+        Some(match self.hit {
+            Hit::Title => Cow::Borrowed(self.doc.id.as_str()),
+            Hit::Alias(_) => Cow::Owned(format!("Alias for: {}", self.doc.title)),
+            Hit::Heading(_) => Cow::Owned(format!("Heading in {}", title_label(self.doc))),
+        })
+    }
+}
+
+impl Candidate<'_> {
+    /// The item for a note, alias or heading. `insert_text` is always the document's own
+    /// vault-relative path (extension stripped), never its title: a title is free-form prose the
+    /// user should be able to reword at any time (this is a book, chapters get retitled) without
+    /// silently breaking every wikilink that was inserted by completion -- paths only change via
+    /// `rename`, which already rewrites every link (of any style) pointing at the renamed document.
+    fn build(&self, range: Range, close_suffix: &str) -> CompletionItem {
+        let d = self.doc;
+        let path_str = d.path.to_string_lossy().replace('\\', "/");
+        let insert_base = path_str.strip_suffix(".md").unwrap_or(&path_str);
+        let data = Some(serde_json::json!({ "doc_id": d.id.as_str() }));
+        match self.hit {
+            Hit::Title => {
+                let label = title_label(d);
+                CompletionItem {
+                    label: label.to_string(),
+                    kind: Some(CompletionItemKind::FILE),
+                    detail: Some(d.id.as_str().to_string()),
+                    text_edit: Some(completion_text_edit(
+                        range,
+                        format!("{}{}", insert_base, close_suffix),
+                    )),
+                    filter_text: Some(label.to_string()),
+                    data,
+                    ..Default::default()
+                }
+            }
+            Hit::Alias(alias) => CompletionItem {
+                label: format!("{} (alias)", alias),
+                kind: Some(CompletionItemKind::REFERENCE),
+                detail: Some(format!("Alias for: {}", d.title)),
+                text_edit: Some(completion_text_edit(
+                    range,
+                    format!("{}{}", alias, close_suffix),
+                )),
+                filter_text: Some(alias.to_string()),
+                data,
+                ..Default::default()
+            },
+            // So e.g. typing "olgu" can directly surface a `## Olgu` heading buried in some other
+            // document as `path#Olgu`, without first having to complete to that document and then
+            // separately complete `#`. No manual `sort_text` bias here: a short, close-to-exact
+            // heading label like "Olgu" already ranks above an unrelated, much longer title in any
+            // reasonable client-side fuzzy matcher, so hand-tuning order here would just as likely
+            // fight the client's own scoring as help it.
+            Hit::Heading(text) => CompletionItem {
+                label: text.to_string(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(format!("Heading in {}", title_label(d))),
+                text_edit: Some(completion_text_edit(
+                    range,
+                    format!("{}#{}{}", insert_base, text, close_suffix),
+                )),
+                filter_text: Some(text.to_string()),
+                data,
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// Builds an explicit replace-range `text_edit` covering `[query_start, cursor)` instead of a
@@ -237,88 +473,43 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
             }
         } else {
             // Document / Note completion
-            let mut items = Vec::new();
             let range = range_at(inside_wikilink_start, word_end);
 
+            let mut candidates: Vec<Candidate> = Vec::new();
             for d in state.index.documents() {
-                // Title completion. `insert_text` is always the document's own vault-relative
-                // path (extension stripped), never its title: a title is free-form prose the
-                // user should be able to reword at any time (this is a book, chapters get
-                // retitled) without silently breaking every wikilink that was inserted by
-                // completion — paths only change via `rename`, which already rewrites every
-                // link (of any style) pointing at the renamed document.
-                let title_label = if d.title != "Untitled" && !d.title.is_empty() {
-                    d.title.clone()
-                } else {
-                    d.id.as_str().to_string()
-                };
-                let path_str = d.path.to_string_lossy().replace('\\', "/");
-                let insert_base = path_str
-                    .strip_suffix(".md")
-                    .unwrap_or(&path_str)
-                    .to_string();
-
-                items.push(CompletionItem {
-                    label: title_label.clone(),
-                    kind: Some(CompletionItemKind::FILE),
-                    detail: Some(d.id.as_str().to_string()),
-                    text_edit: Some(completion_text_edit(
-                        range,
-                        format!("{}{}", insert_base, close_suffix),
-                    )),
-                    filter_text: Some(title_label.clone()),
-                    data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
-                    ..Default::default()
+                candidates.push(Candidate {
+                    doc: d,
+                    hit: Hit::Title,
                 });
-
-                // Alias completions
                 for alias in &d.frontmatter.aliases {
-                    items.push(CompletionItem {
-                        label: format!("{} (alias)", alias),
-                        kind: Some(CompletionItemKind::REFERENCE),
-                        detail: Some(format!("Alias for: {}", d.title)),
-                        text_edit: Some(completion_text_edit(
-                            range,
-                            format!("{}{}", alias, close_suffix),
-                        )),
-                        filter_text: Some(alias.clone()),
-                        data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
-                        ..Default::default()
+                    candidates.push(Candidate {
+                        doc: d,
+                        hit: Hit::Alias(alias),
                     });
                 }
-
-                // Heading completions, so e.g. typing "olgu" can directly surface a `## Olgu`
-                // heading buried in some other document as `path#Olgu`, without first having to
-                // complete to that document and then separately complete `#`. No manual
-                // `sort_text` bias here: a short, close-to-exact heading label like "Olgu"
-                // already ranks above an unrelated, much longer title in any reasonable
-                // client-side fuzzy matcher, so hand-tuning order here would just as likely
-                // fight the client's own scoring as help it.
                 for h in &d.headings {
                     let heading_text = h.text.trim();
                     if heading_text.is_empty() {
                         continue;
                     }
-                    items.push(CompletionItem {
-                        label: heading_text.to_string(),
-                        kind: Some(CompletionItemKind::FIELD),
-                        detail: Some(format!("Heading in {}", title_label)),
-                        text_edit: Some(completion_text_edit(
-                            range,
-                            format!("{}#{}{}", insert_base, heading_text, close_suffix),
-                        )),
-                        filter_text: Some(heading_text.to_string()),
-                        data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
-                        ..Default::default()
+                    candidates.push(Candidate {
+                        doc: d,
+                        hit: Hit::Heading(heading_text),
                     });
                 }
             }
 
             tracing::debug!(
-                count = items.len(),
+                count = candidates.len(),
                 "completion: returning candidates (documents/headings/aliases)"
             );
-            return Some(respond(items, limit, inside_wikilink));
+            let ranking = rank(candidates, limit, inside_wikilink);
+            let items = ranking
+                .items
+                .iter()
+                .map(|c| c.build(range, close_suffix))
+                .collect();
+            return Some(response_of(items, ranking.incomplete));
         }
     }
 
@@ -1610,5 +1801,413 @@ body"
         assert_eq!(edited(&items, "Target"), "[[doc-b]] tail");
         let (items, _) = complete_marked(&[TARGET], "[[Ta‸rget|shown]] x^2", |_| {});
         assert_eq!(edited(&items, "Target"), "[[doc-b|shown]] x^2");
+    }
+
+    // ---- the answer must stay what it was: the straightforward versions, kept as the reference ----
+
+    /// `respond` as it was before candidates were ranked first: every item built, sorted with a
+    /// comparator that folds both labels on every comparison, then cut.
+    fn reference_respond(
+        mut items: Vec<CompletionItem>,
+        limit: usize,
+        query: &str,
+    ) -> CompletionResponse {
+        let by_label = |a: &CompletionItem, b: &CompletionItem| {
+            satz_core::fold_key(&a.label)
+                .cmp(&satz_core::fold_key(&b.label))
+                .then_with(|| a.label.cmp(&b.label))
+                .then_with(|| a.detail.cmp(&b.detail))
+        };
+        if limit == 0 || items.len() <= limit {
+            items.sort_by(by_label);
+            return CompletionResponse::Array(items);
+        }
+        let query = satz_core::fold_key(query);
+        if !query.is_empty() {
+            let mut ranker = crate::rank::Ranker::new(&query);
+            let mut scored: Vec<(u8, u32, CompletionItem)> = items
+                .into_iter()
+                .filter_map(|item| {
+                    let text =
+                        satz_core::fold_key(item.filter_text.as_deref().unwrap_or(&item.label));
+                    let score = ranker.score(&text)?;
+                    let tier = if text == query {
+                        0
+                    } else if text.starts_with(&query) {
+                        1
+                    } else {
+                        2
+                    };
+                    Some((tier, score, item))
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| by_label(&a.2, &b.2))
+            });
+            items = scored.into_iter().map(|(_, _, item)| item).collect();
+        } else {
+            items.sort_by(by_label);
+        }
+        let cut = items.len() > limit;
+        items.truncate(limit);
+        if cut {
+            return CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items,
+            });
+        }
+        CompletionResponse::Array(items)
+    }
+
+    /// The items for `[[` + a typed query, built for every note the way they were before.
+    fn reference_note_items(state: &SatzState, range: Range) -> Vec<CompletionItem> {
+        let close_suffix = "]]";
+        let mut items = Vec::new();
+        for d in state.index.documents() {
+            let title_label = if d.title != "Untitled" && !d.title.is_empty() {
+                d.title.clone()
+            } else {
+                d.id.as_str().to_string()
+            };
+            let path_str = d.path.to_string_lossy().replace('\\', "/");
+            let insert_base = path_str
+                .strip_suffix(".md")
+                .unwrap_or(&path_str)
+                .to_string();
+            items.push(CompletionItem {
+                label: title_label.clone(),
+                kind: Some(CompletionItemKind::FILE),
+                detail: Some(d.id.as_str().to_string()),
+                text_edit: Some(completion_text_edit(
+                    range,
+                    format!("{}{}", insert_base, close_suffix),
+                )),
+                filter_text: Some(title_label.clone()),
+                data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
+                ..Default::default()
+            });
+            for alias in &d.frontmatter.aliases {
+                items.push(CompletionItem {
+                    label: format!("{} (alias)", alias),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!("Alias for: {}", d.title)),
+                    text_edit: Some(completion_text_edit(
+                        range,
+                        format!("{}{}", alias, close_suffix),
+                    )),
+                    filter_text: Some(alias.clone()),
+                    data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
+                    ..Default::default()
+                });
+            }
+            for h in &d.headings {
+                let heading_text = h.text.trim();
+                if heading_text.is_empty() {
+                    continue;
+                }
+                items.push(CompletionItem {
+                    label: heading_text.to_string(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(format!("Heading in {}", title_label)),
+                    text_edit: Some(completion_text_edit(
+                        range,
+                        format!("{}#{}{}", insert_base, heading_text, close_suffix),
+                    )),
+                    filter_text: Some(heading_text.to_string()),
+                    data: Some(serde_json::json!({ "doc_id": d.id.as_str() })),
+                    ..Default::default()
+                });
+            }
+        }
+        items
+    }
+
+    /// The items for `#` + a typed query, built for every tag the way they were before.
+    fn reference_tag_items(state: &SatzState, range: Range) -> Vec<CompletionItem> {
+        let spellings = tag_spellings(state);
+        state
+            .index
+            .all_tags()
+            .into_iter()
+            .map(|key| {
+                let tag_name = spellings.get(key).map_or(key, String::as_str);
+                CompletionItem {
+                    label: format!("#{}", tag_name),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    detail: Some("Tag".to_string()),
+                    filter_text: Some(tag_name.to_string()),
+                    text_edit: Some(completion_text_edit(range, tag_name.to_string())),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const TITLES: &[&str] = &[
+        "Alpha",
+        "alpha",
+        "İş Notları",
+        "istanbul planı",
+        "Çeviri",
+        "felsefe",
+        "felsefe kavram",
+        "😀 Emoji",
+        "Hub",
+        "Sub One",
+        "ışık",
+        "Okul Notları",
+        "Untitled",
+        "",
+    ];
+    const HEADINGS: &[&str] = &[
+        "Özet",
+        "Detaylar",
+        "İstanbul planı",
+        "felsefe",
+        "Sub One",
+        "Ownership",
+        "iş",
+        "ışık",
+        "Alpha",
+    ];
+    const TAGS: &[&str] = &[
+        "rust", "Rust", "RUST", "proje", "Proje", "iş", "İş", "ışık", "a/b",
+    ];
+    const TYPED: &[&str] = &[
+        "",
+        "   ",
+        "a",
+        "i",
+        "iş",
+        "İş",
+        "istanbul",
+        "felsefe",
+        "felsefe kavram",
+        "kavram felsefe",
+        "zzzz",
+        "ö",
+        "😀",
+        "^alpha",
+        "alpha$",
+        "!hub",
+        "sub one",
+        "Alpha",
+        "ownership",
+        "a b c d e f g h i j k l m n o p",
+    ];
+
+    fn random_note(rng: &mut Rng) -> String {
+        let mut text = String::new();
+        let title = TITLES[rng.below(TITLES.len())];
+        if rng.below(2) == 0 {
+            text.push_str("---\n");
+            if rng.below(2) == 0 && !title.is_empty() {
+                text.push_str(&format!("title: {title}\n"));
+            }
+            if rng.below(3) == 0 {
+                text.push_str(&format!(
+                    "aliases: [{}, {}]\n",
+                    TITLES[rng.below(TITLES.len())].replace(',', ""),
+                    HEADINGS[rng.below(HEADINGS.len())]
+                ));
+            }
+            text.push_str("---\n");
+        }
+        if rng.below(4) != 0 && !title.is_empty() {
+            text.push_str(&format!("# {title}\n\n"));
+        }
+        for _ in 0..rng.below(5) {
+            let level = 1 + rng.below(3);
+            text.push_str(&format!(
+                "{} {}\n\ntext\n\n",
+                "#".repeat(level),
+                HEADINGS[rng.below(HEADINGS.len())]
+            ));
+        }
+        if rng.below(3) == 0 {
+            text.push_str(&format!(
+                "#{} #{}\n",
+                TAGS[rng.below(TAGS.len())],
+                TAGS[rng.below(TAGS.len())]
+            ));
+        }
+        text
+    }
+
+    /// A vault of the given notes plus the open note holding `open_line`; completion is asked at
+    /// the end of that line.
+    fn state_from(texts: &[String], open_line: &str) -> SatzState {
+        let mut docs: Vec<satz_core::Document> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let path = format!("f{}/note-{i}.md", i % 7);
+                parse_document(text, Path::new(&path))
+            })
+            .collect();
+        docs.push(parse_document(open_line, Path::new("open.md")));
+        let mut state = SatzState::default();
+        state.index = Index::build(docs);
+        state.set_vault_root(Some(Path::new("").to_path_buf()));
+        state.open_docs.insert(
+            "file:///open.md".to_string(),
+            crate::state::OpenDocument::new(
+                "file:///open.md",
+                Path::new("open.md").to_path_buf(),
+                open_line,
+                1,
+            ),
+        );
+        state
+    }
+
+    fn state_with_open_line(notes: usize, rng: &mut Rng, open_line: &str) -> SatzState {
+        let texts: Vec<String> = (0..notes).map(|_| random_note(rng)).collect();
+        state_from(&texts, open_line)
+    }
+
+    fn ask(state: &SatzState, open_line: &str) -> Option<CompletionResponse> {
+        completion(
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: "file:///open.md".parse().unwrap(),
+                    },
+                    position: Position::new(0, open_line.encode_utf16().count() as u32),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+            state,
+        )
+    }
+
+    fn describe(response: &CompletionResponse) -> String {
+        format!("{response:?}")
+    }
+
+    fn range_after(prefix_units: usize, typed: &str) -> Range {
+        Range::new(
+            Position::new(0, prefix_units as u32),
+            Position::new(0, (prefix_units + typed.encode_utf16().count()) as u32),
+        )
+    }
+
+    #[test]
+    fn notes_are_offered_exactly_as_the_straightforward_version_offers_them() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut cases = 0;
+        for round in 0..40 {
+            // Small vaults, and vaults with far more candidates than the limits below.
+            let notes = if round % 4 == 0 {
+                100 + rng.below(80)
+            } else {
+                1 + rng.below(30)
+            };
+            for typed in TYPED {
+                let line = format!("[[{typed}");
+                let mut state = state_with_open_line(notes, &mut rng, &line);
+                for limit in [0usize, 1, 5, 30, 200, 100_000] {
+                    state.config.lsp.completion_limit = limit;
+                    let got = ask(&state, &line).expect("an answer");
+                    let items = reference_note_items(&state, range_after(2, typed));
+                    let want = reference_respond(items, limit, typed);
+                    assert_eq!(
+                        describe(&got),
+                        describe(&want),
+                        "round {round} ({notes} notes), typed {typed:?}, limit {limit}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases >= 4000, "{cases} cases");
+    }
+
+    #[test]
+    fn notes_that_are_alike_keep_the_order_they_were_found_in() {
+        // Same title, same alias, same headings: every sort key ties, so the order is the order
+        // of production alone (the index's own iteration order).
+        for typed in ["", "s", "same", "twin", "part"] {
+            let line = format!("[[{typed}");
+            let texts: Vec<String> = (0..150)
+                .map(|_| {
+                    "---
+title: Same
+aliases: [Twin]
+---
+# Same
+
+## Part
+
+## Part
+"
+                    .to_string()
+                })
+                .collect();
+            let mut state = state_from(&texts, &line);
+            for limit in [0usize, 7, 100, 200, 100_000] {
+                state.config.lsp.completion_limit = limit;
+                let got = ask(&state, &line).expect("an answer");
+                let want = reference_respond(
+                    reference_note_items(&state, range_after(2, typed)),
+                    limit,
+                    typed,
+                );
+                assert_eq!(
+                    describe(&got),
+                    describe(&want),
+                    "typed {typed:?}, limit {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tags_are_offered_exactly_as_the_straightforward_version_offers_them() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        let mut cases = 0;
+        for round in 0..40 {
+            let notes = if round % 4 == 0 {
+                150 + rng.below(80)
+            } else {
+                1 + rng.below(30)
+            };
+            for typed in ["", "r", "ru", "Rust", "pro", "iş", "ıs", "a/", "zzz", "İ"] {
+                let line = format!("#{typed}");
+                let mut state = state_with_open_line(notes, &mut rng, &line);
+                for limit in [0usize, 1, 3, 200, 100_000] {
+                    state.config.lsp.completion_limit = limit;
+                    let got = ask(&state, &line).expect("an answer");
+                    let items = reference_tag_items(&state, range_after(1, typed));
+                    let want = reference_respond(items, limit, typed);
+                    assert_eq!(
+                        describe(&got),
+                        describe(&want),
+                        "round {round} ({notes} notes), typed {typed:?}, limit {limit}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases >= 1500, "{cases} cases");
     }
 }
