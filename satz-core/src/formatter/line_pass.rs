@@ -590,4 +590,204 @@ mod tests {
             assert_eq!(html(&once), html(src), "blanks = {blanks}: {once:?}");
         }
     }
+
+    // ---- two ways of asking which lines are inside a code or HTML block (kept apart, compared) ----
+    //
+    // `line_pass::protected_lines` (two pointers over the spans) and `math::lines_touching`
+    // (two binary searches and a difference array) answer the same question for two different
+    // passes. They are not merged (neither is slow, and this pass runs on every format); what
+    // keeps them from drifting apart is that they are compared here against the plain definition.
+
+    use super::super::math::{
+        Line, lines_touching, protected_lines as math_protected_lines, split_lines,
+    };
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const PIECES: &[&str] = &[
+        "plain text",
+        "",
+        "",
+        "  indented text",
+        "    code by indentation",
+        "\tcode by tab",
+        "```",
+        "```rust",
+        "``` ",
+        "````",
+        "~~~",
+        "~~~ text",
+        "<div>",
+        "</div>",
+        "<!-- comment -->",
+        "<details>",
+        "---",
+        "+++",
+        "title: x",
+        "# heading",
+        "text with a\rlone carriage return",
+        "a line that is rather longer than the others, so that its end lies far from its start",
+        "$$",
+        "`inline` and $x$",
+    ];
+
+    const PREFIXES: &[&str] = &["", "", "", "> ", "> > ", "- ", "1. ", "   ", "  - "];
+
+    fn random_document(rng: &mut Rng) -> String {
+        let lines = rng.below(40);
+        let mut text = String::new();
+        for i in 0..lines {
+            if i > 0 {
+                text.push('\n');
+            }
+            text.push_str(PREFIXES[rng.below(PREFIXES.len())]);
+            text.push_str(PIECES[rng.below(PIECES.len())]);
+        }
+        // Sometimes the last line has its line end, sometimes not, sometimes there are more.
+        match rng.below(4) {
+            0 => text.push('\n'),
+            1 => text.push_str("\n\n"),
+            _ => {}
+        }
+        text
+    }
+
+    /// The definition, asked of every line about every span.
+    fn touching_by_definition(lines: &[Line], spans: &[ByteRange]) -> Vec<bool> {
+        lines
+            .iter()
+            .map(|line| {
+                spans
+                    .iter()
+                    .any(|span| span.start <= line.end && span.end > line.start)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_ways_of_finding_the_lines_of_a_block_agree_with_the_definition() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut documents, mut with_blocks, mut protected_lines_seen) = (0, 0, 0usize);
+        for _ in 0..4000 {
+            let source = random_document(&mut rng);
+            let raw_lines: Vec<&str> = source.lines().collect();
+            let starts = line_starts(&source, &raw_lines);
+            let lines = split_lines(&source);
+
+            // The two ways of cutting a note into lines give the same lines.
+            assert_eq!(raw_lines.len(), lines.len(), "{source:?}");
+            for (i, line) in lines.iter().enumerate() {
+                assert_eq!(
+                    (starts[i], starts[i] + raw_lines[i].len()),
+                    (line.start, line.end),
+                    "line {i} of {source:?}"
+                );
+            }
+
+            let structure = parse_structure(&source);
+            let blocks: Vec<ByteRange> = structure
+                .code_block_spans
+                .iter()
+                .chain(structure.html_block_spans.iter())
+                .copied()
+                .collect();
+            let wanted = touching_by_definition(&lines, &blocks);
+            assert_eq!(
+                protected_lines(&source, &raw_lines, &structure),
+                wanted,
+                "the format pass, {source:?}"
+            );
+            assert_eq!(
+                lines_touching(&lines, &blocks),
+                wanted,
+                "the math pass, {source:?}"
+            );
+
+            // The math pass also leaves alone the front matter.
+            let mut with_front_matter = blocks.clone();
+            with_front_matter.extend(structure.frontmatter_range);
+            assert_eq!(
+                math_protected_lines(&lines, &structure),
+                touching_by_definition(&lines, &with_front_matter),
+                "math and front matter, {source:?}"
+            );
+
+            documents += 1;
+            with_blocks += usize::from(!blocks.is_empty());
+            protected_lines_seen += wanted.iter().filter(|p| **p).count();
+        }
+        // The documents really do have blocks in them (a test that compares empty with empty
+        // says nothing).
+        assert!(
+            with_blocks > 1500,
+            "{with_blocks} of {documents} have a block"
+        );
+        assert!(
+            protected_lines_seen > 5000,
+            "{protected_lines_seen} protected lines"
+        );
+    }
+
+    #[test]
+    fn the_line_starts_skip_both_kinds_of_line_end() {
+        let source = "a\r\nbb\n\ncc";
+        let lines: Vec<&str> = source.lines().collect();
+        assert_eq!(lines, vec!["a", "bb", "", "cc"]);
+        assert_eq!(line_starts(source, &lines), vec![0, 3, 6, 7]);
+    }
+
+    #[test]
+    fn the_format_pass_answers_as_the_definition_does_for_any_spans_at_all() {
+        // Spans that begin or end exactly at a line's start or end, nest, overlap, are empty or
+        // lie beyond the text: the parser does not produce all of these, the function must
+        // still be right about them.
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        for case in 0..4000 {
+            let mut text = String::new();
+            for _ in 0..rng.below(30) {
+                text.push_str(&"x".repeat(rng.below(7)));
+                text.push('\n');
+            }
+            if rng.below(3) == 0 {
+                text.push_str("tail");
+            }
+            let raw_lines: Vec<&str> = text.lines().collect();
+            let lines = split_lines(&text);
+            let mut structure = crate::parser::structure::StructureOutput::default();
+            for _ in 0..rng.below(7) {
+                let start = rng.below(text.len() + 3);
+                let end = start + rng.below(text.len() + 3 - start.min(text.len() + 2));
+                let span = ByteRange::new(start, end);
+                if rng.below(2) == 0 {
+                    structure.code_block_spans.push(span);
+                } else {
+                    structure.html_block_spans.push(span);
+                }
+            }
+            let blocks: Vec<ByteRange> = structure
+                .code_block_spans
+                .iter()
+                .chain(structure.html_block_spans.iter())
+                .copied()
+                .collect();
+            assert_eq!(
+                protected_lines(&text, &raw_lines, &structure),
+                touching_by_definition(&lines, &blocks),
+                "case {case}: text {text:?}, spans {blocks:?}"
+            );
+        }
+    }
 }

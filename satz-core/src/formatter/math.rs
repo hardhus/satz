@@ -31,10 +31,10 @@ pub struct MathMask {
     blocks: usize,
 }
 
-struct Line {
-    start: usize,
+pub(super) struct Line {
+    pub(super) start: usize,
     /// End of the text, before the line ending.
-    end: usize,
+    pub(super) end: usize,
 }
 
 /// Masks the math in `source`. `None` when there is nothing to mask or masking is not safe; the
@@ -198,7 +198,7 @@ fn longest_run(text: &str, ch: char) -> usize {
     longest
 }
 
-fn split_lines(source: &str) -> Vec<Line> {
+pub(super) fn split_lines(source: &str) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut start = 0;
     for raw in source.split_inclusive('\n') {
@@ -210,7 +210,7 @@ fn split_lines(source: &str) -> Vec<Line> {
 }
 
 /// Lines that are code, raw HTML or frontmatter: math is not looked for there.
-fn protected_lines(lines: &[Line], structure: &StructureOutput) -> Vec<bool> {
+pub(super) fn protected_lines(lines: &[Line], structure: &StructureOutput) -> Vec<bool> {
     let mut spans: Vec<ByteRange> = structure
         .code_block_spans
         .iter()
@@ -228,7 +228,7 @@ fn protected_lines(lines: &[Line], structure: &StructureOutput) -> Vec<bool> {
 /// neighbours: found by two binary searches and counted in a difference array. That is
 /// `O(lines + spans * log lines)`; asking every line about every span is what made a note with
 /// many code blocks take time in proportion to the square of its size.
-fn lines_touching(lines: &[Line], spans: &[ByteRange]) -> Vec<bool> {
+pub(super) fn lines_touching(lines: &[Line], spans: &[ByteRange]) -> Vec<bool> {
     let mut opened = vec![0i32; lines.len() + 1];
     for span in spans {
         let first = lines.partition_point(|line| line.end < span.start);
