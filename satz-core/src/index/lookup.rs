@@ -1025,4 +1025,385 @@ mod tests {
             Some(&DocId::new("tlp/2.0121.md"))
         );
     }
+
+    // ---- what a link points at, and what is recorded for it: the same as before (4.1) ----
+
+    /// `link_target` as it was: the target as an owned id, every branch cloning it.
+    ///
+    fn reference_link_target(index: &Index, src: &Document, link: &Link) -> Option<DocId> {
+        if crate::model::link::is_external_target(&link.target_doc) {
+            return None;
+        }
+        match link.kind {
+            LinkKind::WikiLink | LinkKind::Embed => {
+                let is_degenerate = link.target_doc.is_empty()
+                    && link
+                        .target_heading
+                        .as_deref()
+                        .is_none_or(|h| h.trim().is_empty())
+                    && link
+                        .target_block
+                        .as_deref()
+                        .is_none_or(|b| b.trim().is_empty());
+                if is_degenerate {
+                    None
+                } else if link.target_doc.is_empty() {
+                    Some(src.id.clone())
+                } else {
+                    // A note with that name wins; otherwise a daily alias (`[[bugün]]`) means
+                    // that day's note -- the same order full link resolution uses.
+                    index
+                        .resolve_link(&link.target_doc)
+                        .or_else(|| {
+                            let (config, today) = index.daily.as_ref()?;
+                            index.resolve_relative_daily_on(&link.target_doc, config, *today)
+                        })
+                        .cloned()
+                }
+            }
+            LinkKind::Markdown => {
+                if link.target_doc.is_empty() {
+                    None
+                } else {
+                    index
+                        .resolve_markdown_target(&src.path, &link.target_doc)
+                        .cloned()
+                }
+            }
+            LinkKind::Footnote => None,
+        }
+    }
+
+    struct T41Rng(u64);
+
+    impl T41Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<'a>(&mut self, of: &[&'a str]) -> &'a str {
+            of[self.below(of.len())]
+        }
+    }
+
+    const T41_NAMES: &[&str] = &[
+        "Alpha",
+        "alpha",
+        "Beta",
+        "Gamma Delta",
+        "Nota",
+        "İş Notu",
+        "ışık",
+    ];
+
+    /// What can stand where a link names a note.
+    const T41_TARGETS: &[&str] = &[
+        "Alpha",
+        "alpha",
+        "Beta",
+        "Gamma Delta",
+        "Nota",
+        "İş Notu",
+        "ışık",
+        "n1",
+        "n2",
+        "f1/n2",
+        "f0/dup",
+        "dup",
+        "nope",
+        "bugün",
+        "dün",
+        "yarın",
+        "today",
+        "yesterday",
+        "N1",
+    ];
+
+    /// What can stand where a Markdown link names a file.
+    const T41_PATHS: &[&str] = &[
+        "n1.md",
+        "../f1/n2.md",
+        "f0/dup.md",
+        "dup.md",
+        "missing.md",
+        "sub/x.md",
+        "N1.MD",
+        "n%201.md",
+        "n3.md",
+        "./n2.md",
+    ];
+
+    const T41_LINKS: &[&str] = &[
+        "[[{t}]]",
+        "![[{t}]]",
+        "[[{t}|shown]]",
+        "[[{t}#Heading]]",
+        "[[{t}#^blk]]",
+        "![[{t}#H]]",
+        "[[#Heading]]",
+        "[[#^blk]]",
+        "[[]]",
+        "[[#]]",
+        "[[|x]]",
+        "[[ ]]",
+        "[x]({p})",
+        "[x]({p}#h)",
+        "[x](#h)",
+        "[x]()",
+        "[x](https://a.b/c)",
+        "[x](mailto:a@b.c)",
+        "[^1] and more",
+        "https://bare.link",
+        "[[{t}]] and [[{t}]]",
+    ];
+
+    fn t41_body(rng: &mut T41Rng) -> String {
+        let mut body = String::from("# Head\n\n## Heading\n\ntext ^blk\n\n");
+        for _ in 0..rng.below(9) {
+            let piece = T41_LINKS[rng.below(T41_LINKS.len())]
+                .replace("{t}", rng.pick(T41_TARGETS))
+                .replace("{p}", rng.pick(T41_PATHS));
+            body.push_str(&piece);
+            body.push(' ');
+        }
+        body
+    }
+
+    /// A vault of random notes; the note headers (which give the notes their names) are kept, so
+    /// that a note can be written again with other links and the same name.
+    struct T41Vault {
+        index: Index,
+        notes: Vec<(String, String)>,
+    }
+
+    fn t41_vault(rng: &mut T41Rng) -> T41Vault {
+        let mut notes: Vec<(String, String)> = Vec::new();
+        for i in 0..3 + rng.below(12) {
+            let path = match rng.below(4) {
+                0 => format!("n{i}.md"),
+                1 => format!("f{}/n{i}.md", rng.below(3)),
+                2 => format!(
+                    "f{}/{}.md",
+                    rng.below(3),
+                    T41_NAMES[rng.below(T41_NAMES.len())]
+                ),
+                _ => format!("n{i}.md"),
+            };
+            if notes.iter().any(|(p, _)| *p == path) {
+                continue;
+            }
+            let mut header = String::new();
+            if rng.below(2) == 0 {
+                header.push_str("---\n");
+                if rng.below(2) == 0 {
+                    header.push_str(&format!("title: {}\n", rng.pick(T41_NAMES)));
+                }
+                if rng.below(3) == 0 {
+                    header.push_str(&format!(
+                        "aliases: [{}, {}]\n",
+                        rng.pick(T41_NAMES),
+                        rng.pick(T41_NAMES)
+                    ));
+                }
+                header.push_str("---\n");
+            }
+            notes.push((path, header));
+        }
+        for path in ["f0/dup.md", "f1/dup.md"] {
+            if rng.below(2) == 0 && !notes.iter().any(|(p, _)| p == path) {
+                notes.push((path.to_string(), String::new()));
+            }
+        }
+        let today = chrono::Local::now().date_naive();
+        let with_daily = rng.below(5) != 0;
+        if with_daily {
+            for day in [today.pred_opt().unwrap(), today, today.succ_opt().unwrap()] {
+                if rng.below(3) != 0 {
+                    notes.push((
+                        format!("daily/{}.md", day.format("%Y-%m-%d")),
+                        String::new(),
+                    ));
+                }
+            }
+        }
+        let docs = notes
+            .iter()
+            .map(|(path, header)| doc(path, &format!("{header}{}", t41_body(rng))))
+            .collect();
+        let mut index = Index::build(docs);
+        if with_daily {
+            index.set_daily(Some((crate::config::DailyNoteConfig::default(), today)));
+        }
+        T41Vault { index, notes }
+    }
+
+    /// What the index records for links, worked out again from the notes with the reference.
+    fn t41_expected_tables(
+        index: &Index,
+    ) -> (
+        HashMap<DocId, HashSet<DocId>>,
+        HashMap<DocId, HashSet<DocId>>,
+    ) {
+        let mut outgoing: HashMap<DocId, HashSet<DocId>> = HashMap::new();
+        let mut backlinks: HashMap<DocId, HashSet<DocId>> = HashMap::new();
+        for doc in index.docs.values() {
+            let targets: HashSet<DocId> = doc
+                .links
+                .iter()
+                .filter_map(|link| reference_link_target(index, doc, link))
+                .collect();
+            for target in &targets {
+                backlinks
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(doc.id.clone());
+            }
+            if !targets.is_empty() {
+                outgoing.insert(doc.id.clone(), targets);
+            }
+        }
+        (outgoing, backlinks)
+    }
+
+    #[test]
+    fn a_links_target_is_the_same_as_it_always_was() {
+        let mut rng = T41Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut links, mut resolved, mut own) = (0, 0, 0);
+        for round in 0..600 {
+            let vault = t41_vault(&mut rng);
+            for doc in vault.index.docs.values() {
+                for link in &doc.links {
+                    let got = vault.index.link_target(doc, link);
+                    let want = reference_link_target(&vault.index, doc, link);
+                    assert_eq!(
+                        got,
+                        want,
+                        "round {round}: {:?} in {}",
+                        link,
+                        doc.id.as_str()
+                    );
+                    links += 1;
+                    resolved += usize::from(want.is_some());
+                    own += usize::from(want.as_ref() == Some(&doc.id));
+                }
+            }
+        }
+        assert!(links > 5000, "{links} links");
+        assert!(resolved > 1500, "{resolved} resolved");
+        assert!(own > 100, "{own} links to the note they are in");
+    }
+
+    #[test]
+    fn what_is_recorded_for_links_is_the_same_after_building_and_after_every_change() {
+        let mut rng = T41Rng(0x0123_4567_89AB_CDEF);
+        for round in 0..300 {
+            let mut vault = t41_vault(&mut rng);
+            let (out, back) = t41_expected_tables(&vault.index);
+            assert_eq!(vault.index.outgoing, out, "round {round}: built, outgoing");
+            assert_eq!(
+                vault.index.backlinks, back,
+                "round {round}: built, backlinks"
+            );
+
+            for step in 0..4 {
+                let (path, header) = vault.notes[rng.below(vault.notes.len())].clone();
+                match rng.below(4) {
+                    // Written again under the same name, with other links: only its own edges move.
+                    0 | 1 => {
+                        let text = format!("{header}{}", t41_body(&mut rng));
+                        vault.index.replace_doc(doc(&path, &text));
+                    }
+                    // A new note, which may make links elsewhere resolve.
+                    2 => {
+                        let new_path = format!("new{step}-{round}.md");
+                        let text = format!("# {}\n\n{}", rng.pick(T41_NAMES), t41_body(&mut rng));
+                        vault.index.replace_doc(doc(&new_path, &text));
+                        vault.notes.push((new_path, String::new()));
+                    }
+                    _ => {
+                        vault.index.remove_doc(&DocId::new(&path));
+                        vault.notes.retain(|(p, _)| *p != path);
+                        if vault.notes.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                let (out, back) = t41_expected_tables(&vault.index);
+                assert_eq!(
+                    vault.index.outgoing, out,
+                    "round {round}, step {step}: outgoing"
+                );
+                assert_eq!(
+                    vault.index.backlinks, back,
+                    "round {round}, step {step}: backlinks"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn links_the_parser_never_makes_get_the_same_answer_as_before() {
+        // Every kind of link with every kind of target, heading and block, made by hand: the
+        // parser does not produce empty wikilinks or targets like `https://x` in a wikilink, but
+        // the rule for them is part of what `link_target` promises.
+        let mut index = Index::build(vec![
+            doc(
+                "n1.md",
+                "---\naliases: [\"https://x\", \"mailto:a@b.c\"]\n---\n# N1\n",
+            ),
+            doc("src.md", "# Src\n"),
+            doc("sub/n2.md", "# N2\n"),
+        ]);
+        index.set_daily(Some((
+            crate::config::DailyNoteConfig::default(),
+            chrono::Local::now().date_naive(),
+        )));
+        let src = index.docs[&DocId::new("src.md")].clone();
+        let mut checked = 0;
+        for kind in [
+            LinkKind::WikiLink,
+            LinkKind::Embed,
+            LinkKind::Markdown,
+            LinkKind::Footnote,
+        ] {
+            for target in [
+                "",
+                "n1",
+                "N1",
+                "https://x",
+                "mailto:a@b.c",
+                "sub/n2.md",
+                "n1.md",
+                "bugün",
+                "nope",
+            ] {
+                for heading in [None, Some(""), Some(" "), Some("H")] {
+                    for block in [None, Some(""), Some(" "), Some("b")] {
+                        let link = Link::new(
+                            kind,
+                            target.to_string(),
+                            heading.map(str::to_string),
+                            block.map(str::to_string),
+                            None,
+                            crate::ByteRange::new(0, 1),
+                        );
+                        assert_eq!(
+                            index.link_target(&src, &link),
+                            reference_link_target(&index, &src, &link),
+                            "{link:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 9 * 4 * 4);
+    }
 }
