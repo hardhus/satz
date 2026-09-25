@@ -28,6 +28,17 @@ pub struct Link {
 }
 
 impl Link {
+    /// Whether the link points at nothing: no note, and no heading and no block either, or only
+    /// white space where those would be (`[[]]`, `[[#]]`, `[[|x]]`, `[x]()`). Such a link is not a
+    /// broken link (there is nothing to break) and is not a backlink (it leads nowhere).
+    ///
+    /// The one definition of this: the parser, the resolution of links and the backlinks all ask it
+    /// here.
+    pub fn is_degenerate(&self) -> bool {
+        let blank = |part: &Option<String>| part.as_deref().is_none_or(|s| s.trim().is_empty());
+        self.target_doc.is_empty() && blank(&self.target_heading) && blank(&self.target_block)
+    }
+
     pub fn new(
         kind: LinkKind,
         target_doc: String,

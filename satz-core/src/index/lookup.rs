@@ -259,15 +259,7 @@ impl Index {
         current_doc: Option<&'a Document>,
         config: Option<&crate::config::VaultConfig>,
     ) -> LinkResolution<'a> {
-        let heading_empty = link
-            .target_heading
-            .as_deref()
-            .is_none_or(|h| h.trim().is_empty());
-        let block_empty = link
-            .target_block
-            .as_deref()
-            .is_none_or(|b| b.trim().is_empty());
-        if link.target_doc.is_empty() && heading_empty && block_empty {
+        if link.is_degenerate() {
             return match current_doc {
                 Some(d) => LinkResolution::Resolved {
                     doc: d,
@@ -465,16 +457,7 @@ impl Index {
         }
         match link.kind {
             LinkKind::WikiLink | LinkKind::Embed => {
-                let is_degenerate = link.target_doc.is_empty()
-                    && link
-                        .target_heading
-                        .as_deref()
-                        .is_none_or(|h| h.trim().is_empty())
-                    && link
-                        .target_block
-                        .as_deref()
-                        .is_none_or(|b| b.trim().is_empty());
-                if is_degenerate {
+                if link.is_degenerate() {
                     None
                 } else if link.target_doc.is_empty() {
                     Some(src.id.clone())
@@ -2093,5 +2076,335 @@ mod tests {
             t42_reference_index(&hub, false).snapshot()
         );
         assert_eq!(built.backlinks_of(&DocId::new("n7.md")).count(), 260);
+    }
+
+    // ---- a link that points at nothing: one rule, wherever it is asked (4.3) ----
+
+    /// `resolve_link_full_with_config` as it was: the rule for a link that points at nothing written
+    /// out in its own place.
+    ///
+    fn reference_resolve_full<'a>(
+        index: &'a Index,
+        link: &Link,
+        current_doc: Option<&'a Document>,
+        config: Option<&crate::config::VaultConfig>,
+    ) -> LinkResolution<'a> {
+        let heading_empty = link
+            .target_heading
+            .as_deref()
+            .is_none_or(|h| h.trim().is_empty());
+        let block_empty = link
+            .target_block
+            .as_deref()
+            .is_none_or(|b| b.trim().is_empty());
+        if link.target_doc.is_empty() && heading_empty && block_empty {
+            return match current_doc {
+                Some(d) => LinkResolution::Resolved {
+                    doc: d,
+                    anchor: None,
+                },
+                None => LinkResolution::DocMissing,
+            };
+        }
+
+        let found = if link.target_doc.is_empty() {
+            None
+        } else {
+            match (link.kind, current_doc) {
+                (LinkKind::Markdown, Some(from)) => {
+                    index.resolve_markdown_target(&from.path, &link.target_doc)
+                }
+                _ => index.resolve_link(&link.target_doc),
+            }
+        };
+        let resolved_id = match (found, config) {
+            (Some(id), _) => Some(id),
+            (None, Some(cfg)) if !link.target_doc.is_empty() => {
+                index.resolve_relative_daily(&link.target_doc, &cfg.daily_note)
+            }
+            _ => None,
+        };
+
+        let target_doc = if link.target_doc.is_empty() {
+            match current_doc {
+                Some(d) => d,
+                None => return LinkResolution::DocMissing,
+            }
+        } else if let Some(target_id) = resolved_id {
+            match index.get_doc(target_id) {
+                Some(d) => d,
+                None => return LinkResolution::DocMissing,
+            }
+        } else {
+            return LinkResolution::DocMissing;
+        };
+
+        if let Some(block_id) = &link.target_block {
+            if let Some(b) = target_doc
+                .resolve_block(block_id)
+                .map(|i| &target_doc.blocks[i])
+            {
+                LinkResolution::Resolved {
+                    doc: target_doc,
+                    anchor: Some(b.range),
+                }
+            } else {
+                LinkResolution::AnchorMissing { doc: target_doc }
+            }
+        } else if let Some(heading_ref) = &link.target_heading {
+            let link_slug = crate::slug::slugify(heading_ref);
+            if let Some(h) = target_doc
+                .headings
+                .iter()
+                .find(|h| h.matches_with_slug(heading_ref, &link_slug))
+            {
+                LinkResolution::Resolved {
+                    doc: target_doc,
+                    anchor: Some(h.range),
+                }
+            } else {
+                LinkResolution::AnchorMissing { doc: target_doc }
+            }
+        } else {
+            LinkResolution::Resolved {
+                doc: target_doc,
+                anchor: None,
+            }
+        }
+    }
+
+    /// The rule as `resolve_link_full_with_config` had it.
+    fn rule_of_the_full_resolution(link: &Link) -> bool {
+        let heading_empty = link
+            .target_heading
+            .as_deref()
+            .is_none_or(|h| h.trim().is_empty());
+        let block_empty = link
+            .target_block
+            .as_deref()
+            .is_none_or(|b| b.trim().is_empty());
+        link.target_doc.is_empty() && heading_empty && block_empty
+    }
+
+    /// The rule as `link_target` had it.
+    fn rule_of_the_backlinks(link: &Link) -> bool {
+        link.target_doc.is_empty()
+            && link
+                .target_heading
+                .as_deref()
+                .is_none_or(|h| h.trim().is_empty())
+            && link
+                .target_block
+                .as_deref()
+                .is_none_or(|b| b.trim().is_empty())
+    }
+
+    const T43_KINDS: [LinkKind; 4] = [
+        LinkKind::WikiLink,
+        LinkKind::Embed,
+        LinkKind::Markdown,
+        LinkKind::Footnote,
+    ];
+
+    fn t43_link(kind: LinkKind, target: &str, heading: Option<&str>, block: Option<&str>) -> Link {
+        Link::new(
+            kind,
+            target.to_string(),
+            heading.map(str::to_string),
+            block.map(str::to_string),
+            None,
+            crate::ByteRange::new(0, 1),
+        )
+    }
+
+    #[test]
+    fn the_places_that_ask_whether_a_link_points_at_nothing_agree_on_every_link() {
+        let mut cells = 0;
+        let mut degenerate = 0;
+        for kind in T43_KINDS {
+            for target in ["", " ", "\t", "a", "#"] {
+                for heading in [
+                    None,
+                    Some(""),
+                    Some(" "),
+                    Some("\t"),
+                    Some("\n"),
+                    Some("H"),
+                    Some(" H "),
+                ] {
+                    for block in [None, Some(""), Some(" "), Some("\t"), Some("b")] {
+                        let link = t43_link(kind, target, heading, block);
+                        // By hand, what "nothing to point at" means: no note, and no heading or
+                        // block with anything but white space in it.
+                        let by_hand = target.is_empty()
+                            && heading.is_none_or(|h| h.chars().all(char::is_whitespace))
+                            && block.is_none_or(|b| b.chars().all(char::is_whitespace));
+                        assert_eq!(rule_of_the_full_resolution(&link), by_hand, "{link:?}");
+                        assert_eq!(rule_of_the_backlinks(&link), by_hand, "{link:?}");
+                        assert_eq!(link.is_degenerate(), by_hand, "{link:?}");
+                        cells += 1;
+                        degenerate += usize::from(by_hand);
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 4 * 5 * 7 * 5);
+        assert_eq!(degenerate, 4 * 4 * 5);
+    }
+
+    /// A small fixed vault for the full resolution: notes with headings and blocks, a note in a
+    /// folder, the daily notes, and the note the links are in.
+    fn t43_vault() -> Index {
+        let today = chrono::Local::now().date_naive();
+        let daily = format!("daily/{}.md", today.format("%Y-%m-%d"));
+        let mut index = Index::build(vec![
+            doc("n1.md", "# N1\n\n## H\n\ntext ^blk\n"),
+            doc("sub/n2.md", "# N2\n\n## Other\n"),
+            doc("src.md", "# Src\n\n## H\n\n^blk\n"),
+            doc(&daily, "# Entry\n"),
+        ]);
+        index.set_daily(Some((crate::config::DailyNoteConfig::default(), today)));
+        index
+    }
+
+    #[test]
+    fn the_full_resolution_of_every_kind_of_link_is_the_same_as_it_always_was() {
+        let index = t43_vault();
+        let config = crate::config::VaultConfig::default();
+        let src = index.docs[&DocId::new("src.md")].clone();
+        let (mut cells, mut nowhere, mut missing_doc, mut missing_anchor, mut found) =
+            (0, 0, 0, 0, 0);
+        for kind in T43_KINDS {
+            for target in [
+                "",
+                " ",
+                "n1",
+                "N1",
+                "sub/n2.md",
+                "nope",
+                "bugün",
+                "https://x",
+            ] {
+                for heading in [
+                    None,
+                    Some(""),
+                    Some(" "),
+                    Some("\t"),
+                    Some("H"),
+                    Some("missing"),
+                ] {
+                    for block in [None, Some(""), Some(" "), Some("blk"), Some("missing")] {
+                        let link = t43_link(kind, target, heading, block);
+                        for current in [Some(&src), None] {
+                            for cfg in [Some(&config), None] {
+                                let got = index.resolve_link_full_with_config(&link, current, cfg);
+                                let want = reference_resolve_full(&index, &link, current, cfg);
+                                assert_eq!(
+                                    got,
+                                    want,
+                                    "{link:?}, current {}, config {}",
+                                    current.is_some(),
+                                    cfg.is_some()
+                                );
+                                cells += 1;
+                                match want {
+                                    LinkResolution::DocMissing => missing_doc += 1,
+                                    LinkResolution::AnchorMissing { .. } => missing_anchor += 1,
+                                    LinkResolution::Resolved { anchor: None, .. }
+                                        if rule_of_the_full_resolution(&link) =>
+                                    {
+                                        nowhere += 1
+                                    }
+                                    LinkResolution::Resolved { .. } => found += 1,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 4 * 8 * 6 * 5 * 2 * 2);
+        assert!(
+            nowhere > 20 && missing_doc > 100 && missing_anchor > 20 && found > 100,
+            "{nowhere} nowhere, {missing_doc} no note, {missing_anchor} no anchor, {found} found"
+        );
+    }
+
+    #[test]
+    fn the_full_resolution_of_every_parsed_link_is_the_same_as_it_always_was() {
+        let mut rng = T41Rng(0xA5A5_5A5A_1234_4321);
+        let config = crate::config::VaultConfig::default();
+        let (mut links, mut resolved) = (0, 0);
+        for round in 0..300 {
+            let vault = t41_vault(&mut rng);
+            for doc in vault.index.docs.values() {
+                for link in &doc.links {
+                    let got =
+                        vault
+                            .index
+                            .resolve_link_full_with_config(link, Some(doc), Some(&config));
+                    let want = reference_resolve_full(&vault.index, link, Some(doc), Some(&config));
+                    assert_eq!(got, want, "round {round}: {link:?} in {}", doc.id.as_str());
+                    links += 1;
+                    resolved += usize::from(matches!(want, LinkResolution::Resolved { .. }));
+                }
+            }
+        }
+        assert!(
+            links > 3000 && resolved > 1000,
+            "{links} links, {resolved} resolved"
+        );
+    }
+
+    #[test]
+    fn what_the_index_does_with_a_link_that_points_at_nothing_follows_from_the_one_rule() {
+        let index = t43_vault();
+        let src = index.docs[&DocId::new("src.md")].clone();
+        let (mut nowhere, mut elsewhere) = (0, 0);
+        for kind in [LinkKind::WikiLink, LinkKind::Embed] {
+            for heading in [
+                None,
+                Some(""),
+                Some(" "),
+                Some("\t"),
+                Some("H"),
+                Some("missing"),
+            ] {
+                for block in [None, Some(""), Some(" "), Some("blk"), Some("missing")] {
+                    let link = t43_link(kind, "", heading, block);
+                    let degenerate = link.is_degenerate();
+                    // No backlink for it; a link with a heading or block is one to its own note.
+                    let target = index.link_target(&src, &link);
+                    assert_eq!(
+                        target,
+                        if degenerate {
+                            None
+                        } else {
+                            Some(src.id.clone())
+                        },
+                        "{link:?}"
+                    );
+                    // No broken link for it either: it resolves, silently, to the note it is in.
+                    let full = index.resolve_link_full(&link, Some(&src));
+                    if degenerate {
+                        assert_eq!(
+                            full,
+                            LinkResolution::Resolved {
+                                doc: &src,
+                                anchor: None
+                            },
+                            "{link:?}"
+                        );
+                        nowhere += 1;
+                    } else {
+                        elsewhere += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            nowhere >= 2 * 4 * 3 && elsewhere > 10,
+            "{nowhere} and {elsewhere}"
+        );
     }
 }

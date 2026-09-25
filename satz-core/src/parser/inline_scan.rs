@@ -183,24 +183,23 @@ fn parse_wikilink(source: &str, start: usize, is_embed: bool) -> Option<(Link, u
             (target_raw.to_string(), None, None)
         };
 
-    // Nothing to point at (`[[]]`, `[[|x]]`, `[[#]]`): plain text, not a link.
+    // An empty heading or block is no heading or block.
     let target_heading = target_heading.filter(|h| !h.is_empty());
     let target_block = target_block.filter(|b| !b.is_empty());
-    if target_doc.is_empty() && target_heading.is_none() && target_block.is_none() {
+    let link = Link::new(
+        kind,
+        target_doc,
+        target_heading,
+        target_block,
+        display,
+        range,
+    );
+
+    // Nothing to point at (`[[]]`, `[[|x]]`, `[[#]]`): plain text, not a link.
+    if link.is_degenerate() {
         return None;
     }
-
-    Some((
-        Link::new(
-            kind,
-            target_doc,
-            target_heading,
-            target_block,
-            display,
-            range,
-        ),
-        full_end,
-    ))
+    Some((link, full_end))
 }
 
 /// Attempts to parse a `[^label]`-shaped footnote reference candidate starting at `start`, where
@@ -585,5 +584,85 @@ mod tests {
         }
         assert_eq!(blocks("a ^b c ^d"), vec!["d"]);
         assert_eq!(blocks("first ^one\nsecond ^two"), vec!["one", "two"]);
+    }
+
+    // ---- what a wikilink points at, worked out again the way it was (4.3) ----
+
+    /// `(target_doc, heading, block, display)` of the wikilink whose text between the brackets is
+    /// `inner_slice`, or `None` when it points at nothing: the extraction of `parse_wikilink` as it
+    /// was, kept as the reference.
+    fn reference_wikilink_parts(inner_slice: &str) -> Option<Parts> {
+        // Parse target and display. Inside a table cell the separator is written `\|`; that one
+        // backslash belongs to the separator, not to the target.
+        let (target_raw, display) = match inner_slice.find('|') {
+            Some(pipe) => {
+                let target = &inner_slice[..pipe];
+                let target = target.strip_suffix('\\').unwrap_or(target);
+                (
+                    target.trim(),
+                    Some(inner_slice[pipe + 1..].trim().to_string()),
+                )
+            }
+            None => (inner_slice.trim(), None),
+        };
+        let (target_doc, target_heading, target_block) =
+            if let Some((doc, block)) = target_raw.split_once("#^") {
+                (doc.trim().to_string(), None, Some(block.trim().to_string()))
+            } else if let Some((doc, heading)) = target_raw.split_once('#') {
+                (
+                    doc.trim().to_string(),
+                    Some(heading.trim().to_string()),
+                    None,
+                )
+            } else {
+                (target_raw.to_string(), None, None)
+            };
+        let target_heading = target_heading.filter(|h| !h.is_empty());
+        let target_block = target_block.filter(|b| !b.is_empty());
+        if target_doc.is_empty() && target_heading.is_none() && target_block.is_none() {
+            return None;
+        }
+        Some((target_doc, target_heading, target_block, display))
+    }
+
+    #[test]
+    fn a_wikilink_points_at_what_it_always_did_and_nothing_else_is_a_link() {
+        let targets = ["", " ", "a", "a b", "İş", "a/b", "a.md", "\t"];
+        let anchors = [
+            "", "#", "# ", "#h", "# h ", "#^", "#^b", "#^ b ", "#h#^b", "#^b#h", "##", "#\t",
+            "#^\t",
+        ];
+        let displays = ["", "|", "|x", "| x ", "\\|x", "|x|y", "| "];
+        let pads = ["", " ", "\t"];
+        let (mut cases, mut links, mut dropped) = (0, 0, 0);
+        for target in targets {
+            for anchor in anchors {
+                for display in displays {
+                    for pad in pads {
+                        for embed in ["", "!"] {
+                            let inner = format!("{pad}{target}{anchor}{display}{pad}");
+                            let text = format!("{embed}[[{inner}]]");
+                            let wanted = reference_wikilink_parts(&inner);
+                            let got = wiki(&text);
+                            for link in scan_inline(&text, &[]).wiki_links {
+                                assert!(!link.is_degenerate(), "{text:?}: {link:?}");
+                            }
+                            match &wanted {
+                                Some(parts) => assert_eq!(got, vec![parts.clone()], "{text:?}"),
+                                None => assert!(got.is_empty(), "{text:?}: {got:?}"),
+                            }
+                            cases += 1;
+                            links += usize::from(wanted.is_some());
+                            dropped += usize::from(wanted.is_none());
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 8 * 13 * 7 * 3 * 2);
+        assert!(
+            links > 3000 && dropped > 100,
+            "{links} links, {dropped} dropped"
+        );
     }
 }
