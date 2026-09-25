@@ -501,6 +501,110 @@ impl Index {
         }
     }
 
+    /// What one note adds to the lookup tables, worked out from the note alone.
+    fn note_keys(doc: &Document) -> NoteKeys {
+        let path = PathBuf::from(doc.path.to_string_lossy().replace('\\', "/"));
+        let folded = fold_path_key(&path.to_string_lossy());
+        let stem = doc
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(fold_key)
+            .unwrap_or_default();
+        let names = std::iter::once(fold_key(&doc.title))
+            .chain(doc.frontmatter.aliases.iter().map(|a| fold_key(a)))
+            .collect();
+        NoteKeys {
+            path,
+            folded,
+            stem,
+            names,
+            tags: Self::tag_keys(doc),
+        }
+    }
+
+    /// Exact path -> note; the last note of a clash wins.
+    fn fill_by_path(table: &mut HashMap<PathBuf, DocId>, ids: &[DocId], paths: Vec<PathBuf>) {
+        for (id, path) in ids.iter().zip(paths) {
+            table.insert(path, id.clone());
+        }
+    }
+
+    /// Folded path -> note; the first note of a clash wins.
+    fn fill_by_path_folded(table: &mut HashMap<String, DocId>, ids: &[DocId], folded: Vec<String>) {
+        for (id, key) in ids.iter().zip(folded) {
+            table.entry(key).or_insert_with(|| id.clone());
+        }
+    }
+
+    /// File name -> note; the first note of a clash wins. Returns the clashes, by note index.
+    fn fill_by_stem(
+        table: &mut HashMap<String, DocId>,
+        ids: &[DocId],
+        stems: Vec<String>,
+        log_conflicts: bool,
+    ) -> Vec<(usize, String)> {
+        let mut conflicts = Vec::new();
+        for (at, (id, stem)) in ids.iter().zip(stems).enumerate() {
+            if stem.is_empty() {
+                continue;
+            }
+            match table.entry(stem) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    if log_conflicts {
+                        conflicts.push((
+                            at,
+                            format!(
+                                "stem conflict: '{}' (keeping {:?}, ignoring {:?})",
+                                e.key(),
+                                e.get(),
+                                id
+                            ),
+                        ));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(id.clone());
+                }
+            }
+        }
+        conflicts
+    }
+
+    /// Title or alias -> note; the last note of a clash wins. Returns the clashes, by note index.
+    fn fill_by_title_alias(
+        table: &mut HashMap<String, DocId>,
+        ids: &[DocId],
+        names: Vec<Vec<String>>,
+        log_conflicts: bool,
+    ) -> Vec<(usize, String)> {
+        let mut conflicts = Vec::new();
+        for (at, (id, keys)) in ids.iter().zip(names).enumerate() {
+            for key in keys {
+                if log_conflicts && table.get(&key).is_some_and(|other| other != id) {
+                    conflicts.push((
+                        at,
+                        format!("title/alias conflict: '{key}' (overwriting previous entry)"),
+                    ));
+                }
+                table.insert(key, id.clone());
+            }
+        }
+        conflicts
+    }
+
+    fn fill_tags(
+        table: &mut std::collections::BTreeMap<String, HashSet<DocId>>,
+        ids: &[DocId],
+        tag_keys: Vec<Vec<String>>,
+    ) {
+        for (id, keys) in ids.iter().zip(tag_keys) {
+            for key in keys {
+                table.entry(key).or_default().insert(id.clone());
+            }
+        }
+    }
+
     fn tag_keys(doc: &Document) -> Vec<String> {
         doc.tags
             .iter()
@@ -567,7 +671,14 @@ impl Index {
 
     /// `rebuild_derived`, with the choice of sharing the work between cores made by the caller (a
     /// test asks for both and compares them). The tables come out the same either way.
-    pub(crate) fn rebuild_derived_with(&mut self, log_conflicts: bool, parallel: bool) {
+    /// Returns the conflicts it found between notes (a file name, a title or an alias that two
+    /// notes share) as messages, in the order of the notes; they are also logged. Empty unless
+    /// `log_conflicts`.
+    pub(crate) fn rebuild_derived_with(
+        &mut self,
+        log_conflicts: bool,
+        parallel: bool,
+    ) -> Vec<String> {
         self.by_path.clear();
         self.by_path_folded.clear();
         self.by_stem.clear();
@@ -579,54 +690,70 @@ impl Index {
         let mut ids: Vec<DocId> = self.docs.keys().cloned().collect();
         ids.sort();
 
-        // Pass 1: lookup tables + tags, so pass 2 sees a complete index.
-        for id in &ids {
-            let doc = &self.docs[id];
-            let normalized_path = PathBuf::from(doc.path.to_string_lossy().replace('\\', "/"));
-            self.by_path_folded
-                .entry(fold_path_key(&normalized_path.to_string_lossy()))
-                .or_insert_with(|| id.clone());
-            self.by_path.insert(normalized_path, id.clone());
+        // Pass 1: lookup tables + tags, so pass 2 sees a complete index. What a note contributes
+        // to them is worked out from the note alone (for all notes at once, on every core, for a
+        // vault big enough to make that worth it) ...
+        let this: &Index = self;
+        let keys: Vec<NoteKeys> = if parallel {
+            ids.par_iter()
+                .map(|id| Index::note_keys(&this.docs[id]))
+                .collect()
+        } else {
+            ids.iter()
+                .map(|id| Index::note_keys(&this.docs[id]))
+                .collect()
+        };
+        let mut keys = NoteKeysByTable::from(keys);
 
-            let stem_key = doc
-                .path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(fold_key)
-                .unwrap_or_default();
-            if !stem_key.is_empty() {
-                match self.by_stem.entry(stem_key) {
-                    std::collections::hash_map::Entry::Occupied(e) => {
-                        if log_conflicts {
-                            tracing::warn!(
-                                "stem conflict: '{}' (keeping {:?}, ignoring {:?})",
-                                e.key(),
-                                e.get(),
-                                id
-                            );
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(id.clone());
-                    }
-                }
-            }
-
-            let title_and_aliases = std::iter::once(fold_key(&doc.title))
-                .chain(doc.frontmatter.aliases.iter().map(|a| fold_key(a)));
-            for key in title_and_aliases {
-                if log_conflicts && self.by_title_alias.get(&key).is_some_and(|o| o != id) {
-                    tracing::warn!(
-                        "title/alias conflict: '{}' (overwriting previous entry)",
-                        key
-                    );
-                }
-                self.by_title_alias.insert(key, id.clone());
-            }
-
-            for tag_key in Self::tag_keys(doc) {
-                self.tags.entry(tag_key).or_default().insert(id.clone());
-            }
+        // ... and each table is then filled note after note in the order of `ids`, which is what
+        // decides who wins a clash. The tables do not depend on one another, so they are filled at
+        // the same time.
+        let Index {
+            by_path,
+            by_path_folded,
+            by_stem,
+            by_title_alias,
+            tags,
+            ..
+        } = self;
+        let (mut stem_conflicts, mut title_conflicts) = (Vec::new(), Vec::new());
+        if parallel {
+            let (ids, keys) = (&ids, &mut keys);
+            let (paths, folded) = (
+                std::mem::take(&mut keys.paths),
+                std::mem::take(&mut keys.folded),
+            );
+            let (stems, names) = (
+                std::mem::take(&mut keys.stems),
+                std::mem::take(&mut keys.names),
+            );
+            let tag_keys = std::mem::take(&mut keys.tags);
+            let (stem_out, title_out) = (&mut stem_conflicts, &mut title_conflicts);
+            rayon::scope(|scope| {
+                scope.spawn(move |_| Index::fill_by_path(by_path, ids, paths));
+                scope.spawn(move |_| Index::fill_by_path_folded(by_path_folded, ids, folded));
+                scope.spawn(move |_| {
+                    *stem_out = Index::fill_by_stem(by_stem, ids, stems, log_conflicts)
+                });
+                scope.spawn(move |_| {
+                    *title_out =
+                        Index::fill_by_title_alias(by_title_alias, ids, names, log_conflicts)
+                });
+                scope.spawn(move |_| Index::fill_tags(tags, ids, tag_keys));
+            });
+        } else {
+            Index::fill_by_path(by_path, &ids, keys.paths);
+            Index::fill_by_path_folded(by_path_folded, &ids, keys.folded);
+            stem_conflicts = Index::fill_by_stem(by_stem, &ids, keys.stems, log_conflicts);
+            title_conflicts =
+                Index::fill_by_title_alias(by_title_alias, &ids, keys.names, log_conflicts);
+            Index::fill_tags(tags, &ids, keys.tags);
+        }
+        // The clashes are reported as the sequential rebuild reported them: note by note, a file
+        // name clash before the title and alias clashes of the same note.
+        let conflicts = merge_conflicts(stem_conflicts, title_conflicts);
+        for message in &conflicts {
+            tracing::warn!("{message}");
         }
 
         // Pass 2: resolve links. Which note each note's links reach only reads the tables that pass
@@ -645,6 +772,7 @@ impl Index {
             self.record_edges(id, targets);
         }
         self.revision += 1;
+        conflicts
     }
 
     /// Replaces or inserts a document in the index, keeping every derived table consistent.
@@ -761,6 +889,62 @@ fn strip_md_extension(name: &str) -> &str {
 }
 
 /// The key of `by_path_folded`: `/`-separated, without `.md`, case- and Unicode-folded.
+/// What one note adds to each lookup table.
+struct NoteKeys {
+    path: PathBuf,
+    folded: String,
+    stem: String,
+    /// Its title and its aliases, folded.
+    names: Vec<String>,
+    tags: Vec<String>,
+}
+
+/// The same keys, gathered by table (each table is filled from its own list).
+#[derive(Default)]
+struct NoteKeysByTable {
+    paths: Vec<PathBuf>,
+    folded: Vec<String>,
+    stems: Vec<String>,
+    names: Vec<Vec<String>>,
+    tags: Vec<Vec<String>>,
+}
+
+impl From<Vec<NoteKeys>> for NoteKeysByTable {
+    fn from(keys: Vec<NoteKeys>) -> Self {
+        let mut by_table = NoteKeysByTable::default();
+        for key in keys {
+            by_table.paths.push(key.path);
+            by_table.folded.push(key.folded);
+            by_table.stems.push(key.stem);
+            by_table.names.push(key.names);
+            by_table.tags.push(key.tags);
+        }
+        by_table
+    }
+}
+
+/// Puts the two lists of clashes (each in the order of the notes) into one, a note's file name
+/// clash before its title and alias clashes.
+fn merge_conflicts(stems: Vec<(usize, String)>, titles: Vec<(usize, String)>) -> Vec<String> {
+    let (mut stems, mut titles) = (stems.into_iter().peekable(), titles.into_iter().peekable());
+    let mut merged = Vec::new();
+    loop {
+        let take_stem = match (stems.peek(), titles.peek()) {
+            (Some((s, _)), Some((t, _))) => s <= t,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let next = if take_stem {
+            stems.next()
+        } else {
+            titles.next()
+        };
+        merged.extend(next.map(|(_, message)| message));
+    }
+    merged
+}
+
 /// From this many notes on, rebuilding the derived tables shares the work between cores. Below
 /// it the threads cost more than they save: on a 4-core (8 threads) laptop, sequential against
 /// shared, best of many rounds: 50 notes 0.79x (slower), 100 notes 0.96x, 200 notes 1.59x, 400 notes
@@ -1456,7 +1640,8 @@ mod tests {
 
     /// `rebuild_derived` as it was: one note after the other, tables filled and then links resolved.
     ///
-    fn reference_rebuild(index: &mut Index, log_conflicts: bool) {
+    fn reference_rebuild(index: &mut Index, log_conflicts: bool) -> Vec<String> {
+        let mut messages: Vec<String> = Vec::new();
         index.by_path.clear();
         index.by_path_folded.clear();
         index.by_stem.clear();
@@ -1488,12 +1673,12 @@ mod tests {
                 match index.by_stem.entry(stem_key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
                         if log_conflicts {
-                            tracing::warn!(
+                            messages.push(format!(
                                 "stem conflict: '{}' (keeping {:?}, ignoring {:?})",
                                 e.key(),
                                 e.get(),
                                 id
-                            );
+                            ));
                         }
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -1506,10 +1691,10 @@ mod tests {
                 .chain(doc.frontmatter.aliases.iter().map(|a| fold_key(a)));
             for key in title_and_aliases {
                 if log_conflicts && index.by_title_alias.get(&key).is_some_and(|o| o != id) {
-                    tracing::warn!(
+                    messages.push(format!(
                         "title/alias conflict: '{}' (overwriting previous entry)",
                         key
-                    );
+                    ));
                 }
                 index.by_title_alias.insert(key, id.clone());
             }
@@ -1524,6 +1709,7 @@ mod tests {
             index.add_doc_edges(id);
         }
         index.revision += 1;
+        messages
     }
 
     struct T42Rng(u64);
@@ -1796,5 +1982,36 @@ mod tests {
         let mut big = big;
         big.replace_doc(doc("brand-new-note.md", "# Brand new\n"));
         assert_eq!(count(), before + 2);
+    }
+
+    #[test]
+    fn the_clashes_are_reported_as_before_and_in_the_same_order() {
+        let mut rng = T42Rng(0xABCD_EF01_2345_6789);
+        let mut reported = 0;
+        for round in 0..60 {
+            let n = if round % 5 == 0 {
+                250 + rng.below(300)
+            } else {
+                2 + rng.below(50)
+            };
+            let docs = t42_docs(&mut rng, n);
+            let messages = |parallel: bool, log: bool| {
+                let mut index = Index::default();
+                for d in &docs {
+                    index.docs.insert(d.id.clone(), d.clone());
+                }
+                index.rebuild_derived_with(log, parallel)
+            };
+            let mut reference = Index::default();
+            for d in &docs {
+                reference.docs.insert(d.id.clone(), d.clone());
+            }
+            let wanted = reference_rebuild(&mut reference, true);
+            assert_eq!(messages(false, true), wanted, "round {round}, on one core");
+            assert_eq!(messages(true, true), wanted, "round {round}, on all cores");
+            assert!(messages(true, false).is_empty() && messages(false, false).is_empty());
+            reported += wanted.len();
+        }
+        assert!(reported > 300, "{reported} clashes reported");
     }
 }
