@@ -630,6 +630,40 @@ impl Index {
             .collect()
     }
 
+    /// Records what every note links to, all at once: the same `outgoing` and `backlinks` that
+    /// `record_edges` makes note after note, made from the edges ordered by the note they lead to,
+    /// so that each note's backlinks are one run of them and the runs become sets on every core.
+    /// `backlinks` and `outgoing` are empty when this is called.
+    fn record_all_edges_in_parts(&mut self, ids: &[DocId], targets: Vec<HashSet<DocId>>) {
+        let mut edges: Vec<(&DocId, &DocId)> = ids
+            .iter()
+            .zip(&targets)
+            .flat_map(|(id, targets)| targets.iter().map(move |target| (target, id)))
+            .collect();
+        edges.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
+        // Where the edges to one note begin (and the end).
+        let mut starts: Vec<usize> = (0..edges.len())
+            .filter(|&at| at == 0 || edges[at - 1].0 != edges[at].0)
+            .collect();
+        starts.push(edges.len());
+        let runs: Vec<(DocId, HashSet<DocId>)> = (0..starts.len() - 1)
+            .into_par_iter()
+            .map(|run| {
+                let edges = &edges[starts[run]..starts[run + 1]];
+                let sources = edges.iter().map(|(_, source)| (*source).clone()).collect();
+                (edges[0].0.clone(), sources)
+            })
+            .collect();
+        drop(edges);
+        self.backlinks = runs.into_iter().collect();
+        self.outgoing.reserve(ids.len());
+        for (id, targets) in ids.iter().zip(targets) {
+            if !targets.is_empty() {
+                self.outgoing.insert(id.clone(), targets);
+            }
+        }
+    }
+
     /// Records `targets` as the notes `id` links to: in `outgoing`, and `id` in each one's `backlinks`.
     fn record_edges(&mut self, id: &DocId, targets: HashSet<DocId>) {
         for target in &targets {
@@ -768,8 +802,12 @@ impl Index {
         } else {
             ids.iter().map(|id| self.doc_targets(id)).collect()
         };
-        for (id, targets) in ids.iter().zip(targets) {
-            self.record_edges(id, targets);
+        if parallel {
+            self.record_all_edges_in_parts(&ids, targets);
+        } else {
+            for (id, targets) in ids.iter().zip(targets) {
+                self.record_edges(id, targets);
+            }
         }
         self.revision += 1;
         conflicts
@@ -2013,5 +2051,47 @@ mod tests {
             reported += wanted.len();
         }
         assert!(reported > 300, "{reported} clashes reported");
+    }
+
+    #[test]
+    fn a_big_vault_where_nothing_links_to_anything_has_no_edges() {
+        let docs: Vec<Document> = (0..260)
+            .map(|i| {
+                doc(
+                    &format!("f{}/n{i}.md", i % 7),
+                    &format!("# Note {i}\n\nNo links here.\n"),
+                )
+            })
+            .collect();
+        for parallel in [false, true] {
+            let mut index = Index::default();
+            for d in &docs {
+                index.docs.insert(d.id.clone(), d.clone());
+            }
+            index.rebuild_derived_with(false, parallel);
+            assert!(
+                index.backlinks.is_empty() && index.outgoing.is_empty(),
+                "parallel: {parallel}"
+            );
+            assert_eq!(
+                index.snapshot(),
+                t42_reference_index(&docs, false).snapshot()
+            );
+        }
+        // ... and where every note links to the same one, and to itself.
+        let hub: Vec<Document> = (0..260)
+            .map(|i| {
+                doc(
+                    &format!("n{i}.md"),
+                    &format!("# Note {i}\n\n[[Note 7]] [[Note {i}]]\n"),
+                )
+            })
+            .collect();
+        let built = Index::build(hub.clone());
+        assert_eq!(
+            built.snapshot(),
+            t42_reference_index(&hub, false).snapshot()
+        );
+        assert_eq!(built.backlinks_of(&DocId::new("n7.md")).count(), 260);
     }
 }
