@@ -105,6 +105,47 @@ fn lists(n: usize) -> String {
     )
 }
 
+/// Tables and quotes, and list items whose marker changes width (`*   ` becomes `- `) and that
+/// have a continuation line: each such item is compared with every table and quote of the note to
+/// see whether it touches one.
+fn tables_quotes_and_wide_markers(n: usize) -> String {
+    repeated(
+        "| a | b |\n|---|---|\n| 1 | 2 |\n\n> quoted\n\n*   item\n    goes on\n\n",
+        n,
+    )
+}
+
+/// The same note with the marker already the way the formatter writes it: the items keep their
+/// width, so nothing is compared with the tables and quotes. What the note above costs more than
+/// this one is what that comparison costs.
+fn tables_quotes_and_narrow_markers(n: usize) -> String {
+    repeated(
+        "| a | b |\n|---|---|\n| 1 | 2 |\n\n> quoted\n\n- item\n  goes on\n\n",
+        n,
+    )
+}
+
+/// `items` list items with wide markers, in chains that nest `depth` deep.
+fn nested_wide_lists(items: usize, depth: usize) -> String {
+    let mut text = String::new();
+    for _ in 0..items.div_ceil(depth) {
+        for level in 0..depth {
+            text.push_str(&"    ".repeat(level));
+            text.push_str("*   item\n");
+        }
+        text.push('\n');
+    }
+    text
+}
+
+fn shallow_wide_lists(n: usize) -> String {
+    nested_wide_lists(n, 2)
+}
+
+fn deep_wide_lists(n: usize) -> String {
+    nested_wide_lists(n, 40)
+}
+
 fn code_heavy(n: usize) -> String {
     "text `code` here\n\n```\ncode\n```\n\n".repeat(n)
 }
@@ -398,6 +439,30 @@ fn formatter_families(settings: &Settings, flagged: &mut Vec<String>) {
         ("tables (misaligned, non-ASCII)", tables, 4000, Some(true)),
         ("messy lists (numbering, nested)", lists, 6000, Some(true)),
         (
+            "tables, quotes and list items with wide markers",
+            tables_quotes_and_wide_markers,
+            3000,
+            None,
+        ),
+        (
+            "the same, markers already narrow",
+            tables_quotes_and_narrow_markers,
+            3000,
+            None,
+        ),
+        (
+            "list items with wide markers, 2 levels deep",
+            shallow_wide_lists,
+            4000,
+            None,
+        ),
+        (
+            "list items with wide markers, 40 levels deep",
+            deep_wide_lists,
+            4000,
+            None,
+        ),
+        (
             "code blocks and inline code, no `$`",
             code_heavy,
             5000,
@@ -493,6 +558,14 @@ fn formatter_scaling(settings: &Settings, flagged: &mut Vec<String>) {
         ("tables", tables),
         ("dirty prose", prose_dirty),
         ("messy lists", lists),
+        (
+            "tables, quotes and list items with wide markers",
+            tables_quotes_and_wide_markers,
+        ),
+        (
+            "the same, markers already narrow",
+            tables_quotes_and_narrow_markers,
+        ),
     ];
     for (name, make) in families {
         let sizes: Vec<usize> = [1000, 2000, 4000, 8000]
