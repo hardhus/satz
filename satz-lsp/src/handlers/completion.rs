@@ -307,6 +307,419 @@ fn completion_text_edit(range: Range, new_text: String) -> CompletionTextEdit {
     CompletionTextEdit::Edit(TextEdit { range, new_text })
 }
 
+/// Where the cursor is on its line, and the text around it: the ground every decision about what
+/// to offer stands on. Text and numbers only; nothing is built here.
+struct Cursor<'a> {
+    /// The cursor's line, without its line end.
+    source: &'a str,
+    /// The cursor's line number in the note.
+    line: u32,
+    /// The cursor's byte offset in `source`.
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    /// The column is in UTF-16 units; a column past the end means the end of the line, and one in
+    /// the middle of a surrogate pair stays before that character.
+    fn new(source: &'a str, line: u32, column: u32) -> Self {
+        let mut at = 0usize;
+        let mut units = 0u32;
+        for c in source.chars() {
+            if units + c.len_utf16() as u32 > column {
+                break;
+            }
+            units += c.len_utf16() as u32;
+            at += c.len_utf8();
+        }
+        Self { source, line, at }
+    }
+
+    /// The line up to the cursor.
+    fn prefix(&self) -> &'a str {
+        &self.source[..self.at]
+    }
+
+    /// Where the word the cursor is inside ends (`[[Ol|gu]]`): what follows the cursor up to it is
+    /// part of what is replaced, or the completion would leave it behind (`[[doc-bgu]]`). It ends
+    /// at a bracket, `|`, `#` or `^`. Whitespace ends the word too, whichever comes first: text
+    /// further along the line (`x^2`, a later `#tag`, a table `|`) is not part of what is being
+    /// completed and must survive.
+    fn word_end(&self) -> usize {
+        let tail = &self.source[self.at..];
+        self.at
+            + tail
+                .find(|c: char| matches!(c, ']' | '|' | '#' | '^') || c.is_whitespace())
+                .unwrap_or(tail.len())
+    }
+
+    /// The closing brackets a link needs after the word: none -> `]]`, one -> the missing `]`,
+    /// both -> nothing. (The link may continue with `|display` or `#anchor` before its closing
+    /// `]]`.)
+    fn close_suffix(&self) -> &'static str {
+        let after_word = &self.source[self.word_end()..];
+        let closed_later = after_word
+            .split("[[")
+            .next()
+            .is_some_and(|s| s.contains("]]"));
+        if closed_later {
+            ""
+        } else if after_word.starts_with(']') {
+            "]"
+        } else {
+            "]]"
+        }
+    }
+
+    /// The range between two byte offsets of the line, in the client's UTF-16 columns.
+    fn range(&self, start: usize, end: usize) -> Range {
+        let column = |byte: usize| self.source[..byte].encode_utf16().count() as u32;
+        Range::new(
+            Position::new(self.line, column(start)),
+            Position::new(self.line, column(end)),
+        )
+    }
+}
+
+/// What the cursor is in the middle of writing: where it is decided which candidates are offered.
+/// Data only; the offsets are bytes of the cursor's line, where the text being replaced starts.
+#[derive(Debug, PartialEq)]
+enum CompletionContext<'a> {
+    /// `[[note|`: after the `|` the link's display text is written; nothing is offered.
+    DisplayText,
+    /// `[[typed`: a note, an alias or a heading of any note.
+    Note { typed: &'a str, start: usize },
+    /// `[[target#typed`: a heading of `target` (empty: this note), and its blocks while nothing
+    /// has been typed.
+    Heading {
+        target: &'a str,
+        typed: &'a str,
+        start: usize,
+    },
+    /// `[[target#^typed`: a block of `target` (empty: this note). The replaced text includes the
+    /// typed `^`, because every new text starts with its own.
+    Block { target: &'a str, start: usize },
+    /// `[^label`: a footnote definition.
+    Footnote { start: usize },
+    /// `#typed`: a tag.
+    Tag { typed: &'a str, start: usize },
+}
+
+/// The contexts the cursor can be in, the most specific first. The first one that can answer does;
+/// a later one is only asked when the ones before it had nothing to say.
+fn contexts<'a>(cursor: &Cursor<'a>) -> Vec<CompletionContext<'a>> {
+    let prefix = cursor.prefix();
+    let mut found = Vec::new();
+
+    // A `[[` that a `]]` has already closed on this line is finished text, not a link being typed.
+    let open_bracket = prefix
+        .rfind("[[")
+        .filter(|idx| !prefix[idx + 2..].contains("]]"));
+    if let Some(open_bracket_idx) = open_bracket {
+        let inside = &prefix[open_bracket_idx + 2..];
+        let start = open_bracket_idx + 2;
+        found.push(if inside.contains('|') {
+            CompletionContext::DisplayText
+        } else if let Some((target, anchor)) = inside.split_once('#') {
+            let anchor_start = start + target.len() + 1;
+            if anchor.starts_with('^') {
+                CompletionContext::Block {
+                    target,
+                    start: anchor_start,
+                }
+            } else {
+                CompletionContext::Heading {
+                    target,
+                    typed: anchor,
+                    start: anchor_start,
+                }
+            }
+        } else {
+            CompletionContext::Note {
+                typed: inside,
+                start,
+            }
+        });
+    }
+
+    if let Some(open_footnote) = prefix.rfind("[^")
+        && !prefix[open_footnote + 2..].contains(']')
+    {
+        found.push(CompletionContext::Footnote {
+            start: open_footnote + 2,
+        });
+    }
+
+    if let Some(hash) = prefix.rfind('#') {
+        // A tag starts at the line start, after whitespace, or after an opening bracket/quote (the
+        // same set the parser accepts), and only tag characters have been typed since the `#`:
+        // `# Heading text|` is a heading marker, not a tag being typed.
+        let starts_a_tag = prefix[..hash].chars().next_back().is_none_or(|c| {
+            c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\'' | '<' | '—' | '–')
+        });
+        let only_tag_characters = prefix[hash + 1..]
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'));
+        if starts_a_tag && only_tag_characters {
+            found.push(CompletionContext::Tag {
+                typed: &prefix[hash + 1..],
+                start: hash + 1,
+            });
+        }
+    }
+
+    found
+}
+
+/// The note a `[[target#…` refers to.
+enum Target<'s> {
+    Found(&'s satz_core::Document),
+    /// No note is called that: nothing can be offered.
+    NotResolved,
+    /// The name resolves, but the index has no such note.
+    NotIndexed,
+}
+
+/// `target` is empty for a reference to the note the cursor is in.
+fn target_of<'s>(
+    state: &'s SatzState,
+    current: &'s satz_core::Document,
+    target: &str,
+) -> Target<'s> {
+    let id = if target.is_empty() {
+        &current.id
+    } else if let Some(resolved) = state.index.resolve_link(target) {
+        resolved
+    } else {
+        tracing::debug!(
+            target,
+            "completion: returning candidates count=0 (target doc did not resolve)"
+        );
+        return Target::NotResolved;
+    };
+    match state.index.get_doc(id) {
+        Some(doc) => Target::Found(doc),
+        None => Target::NotIndexed,
+    }
+}
+
+/// The items for one context; `None` when it has nothing to say, and the next context is asked.
+fn answer(
+    context: &CompletionContext,
+    cursor: &Cursor,
+    state: &SatzState,
+    current: &satz_core::Document,
+) -> Option<CompletionResponse> {
+    let limit = state.config.lsp.completion_limit;
+    match *context {
+        // After `|` the user is writing the link's display text: nothing to complete.
+        CompletionContext::DisplayText => Some(CompletionResponse::Array(vec![])),
+        CompletionContext::Note { typed, start } => {
+            Some(note_items(state, cursor, typed, start, limit))
+        }
+        CompletionContext::Heading {
+            target,
+            typed,
+            start,
+        } => match target_of(state, current, target) {
+            Target::Found(doc) => Some(heading_items(doc, cursor, typed, start)),
+            Target::NotResolved => Some(CompletionResponse::Array(vec![])),
+            Target::NotIndexed => None,
+        },
+        CompletionContext::Block { target, start } => match target_of(state, current, target) {
+            Target::Found(doc) => Some(block_items(doc, cursor, start)),
+            Target::NotResolved => Some(CompletionResponse::Array(vec![])),
+            Target::NotIndexed => None,
+        },
+        CompletionContext::Footnote { start } => Some(footnote_items(current, cursor, start)),
+        CompletionContext::Tag { typed, start } => {
+            Some(tag_items(state, cursor, typed, start, limit))
+        }
+    }
+}
+
+/// Every note, alias and heading of the vault that matches what was typed.
+fn note_items(
+    state: &SatzState,
+    cursor: &Cursor,
+    typed: &str,
+    start: usize,
+    limit: usize,
+) -> CompletionResponse {
+    let range = cursor.range(start, cursor.word_end());
+    let close_suffix = cursor.close_suffix();
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for d in state.index.documents() {
+        candidates.push(Candidate {
+            doc: d,
+            hit: Hit::Title,
+        });
+        for alias in &d.frontmatter.aliases {
+            candidates.push(Candidate {
+                doc: d,
+                hit: Hit::Alias(alias),
+            });
+        }
+        for h in &d.headings {
+            let heading_text = h.text.trim();
+            if heading_text.is_empty() {
+                continue;
+            }
+            candidates.push(Candidate {
+                doc: d,
+                hit: Hit::Heading(heading_text),
+            });
+        }
+    }
+
+    tracing::debug!(
+        count = candidates.len(),
+        "completion: returning candidates (documents/headings/aliases)"
+    );
+    let ranking = rank(candidates, limit, typed);
+    let items = ranking
+        .items
+        .iter()
+        .map(|c| c.build(range, close_suffix))
+        .collect();
+    response_of(items, ranking.incomplete)
+}
+
+fn block_item(block_id: &str, range: Range, close_suffix: &str) -> CompletionItem {
+    CompletionItem {
+        label: format!("^{block_id}"),
+        kind: Some(CompletionItemKind::VARIABLE),
+        detail: Some("Block Anchor".to_string()),
+        text_edit: Some(completion_text_edit(
+            range,
+            format!("^{block_id}{close_suffix}"),
+        )),
+        filter_text: Some(format!("^{block_id}")),
+        ..Default::default()
+    }
+}
+
+/// The blocks of `target`: `[[doc#^...`.
+fn block_items(target: &satz_core::Document, cursor: &Cursor, start: usize) -> CompletionResponse {
+    let range = cursor.range(start, cursor.word_end());
+    let close_suffix = cursor.close_suffix();
+    let items: Vec<CompletionItem> = target
+        .blocks
+        .iter()
+        .map(|b| block_item(&b.id, range, close_suffix))
+        .collect();
+    tracing::debug!(
+        count = items.len(),
+        "completion: returning candidates (block anchors)"
+    );
+    CompletionResponse::Array(items)
+}
+
+/// The headings of `target`, and its blocks while nothing has been typed: `[[doc#...`.
+fn heading_items(
+    target: &satz_core::Document,
+    cursor: &Cursor,
+    typed: &str,
+    start: usize,
+) -> CompletionResponse {
+    let range = cursor.range(start, cursor.word_end());
+    let close_suffix = cursor.close_suffix();
+    // A link to a heading that appears twice reaches the first one, so the later copy is not a
+    // different target and is not offered.
+    let mut seen_slugs = std::collections::HashSet::new();
+    let mut items: Vec<CompletionItem> = target
+        .headings
+        .iter()
+        .filter(|h| seen_slugs.insert(h.slug.as_str()))
+        .map(|h| {
+            let new_text = format!("{}{}", h.text.trim(), close_suffix);
+            CompletionItem {
+                label: h.text.trim().to_string(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(format!("Level {} Heading", h.level)),
+                text_edit: Some(completion_text_edit(range, new_text)),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    // If query is empty, also suggest blocks
+    if typed.is_empty() {
+        items.extend(
+            target
+                .blocks
+                .iter()
+                .map(|b| block_item(&b.id, range, close_suffix)),
+        );
+    }
+
+    tracing::debug!(
+        count = items.len(),
+        "completion: returning candidates (headings/blocks for doc)"
+    );
+    CompletionResponse::Array(items)
+}
+
+/// The footnote definitions of the note the cursor is in: `[^...`.
+fn footnote_items(
+    current: &satz_core::Document,
+    cursor: &Cursor,
+    start: usize,
+) -> CompletionResponse {
+    let range = cursor.range(start, cursor.at);
+    let items: Vec<CompletionItem> = current
+        .footnotes
+        .definitions
+        .iter()
+        .map(|f| CompletionItem {
+            label: f.label.clone(),
+            kind: Some(CompletionItemKind::REFERENCE),
+            detail: Some("Footnote Definition".to_string()),
+            text_edit: Some(completion_text_edit(range, f.label.clone())),
+            ..Default::default()
+        })
+        .collect();
+    tracing::debug!(
+        count = items.len(),
+        "completion: returning candidates (footnotes)"
+    );
+    CompletionResponse::Array(items)
+}
+
+/// Every tag of the vault: `#...`.
+fn tag_items(
+    state: &SatzState,
+    cursor: &Cursor,
+    typed: &str,
+    start: usize,
+    limit: usize,
+) -> CompletionResponse {
+    let range = cursor.range(start, cursor.at);
+    let spellings = tag_spellings(state);
+    let items: Vec<CompletionItem> = state
+        .index
+        .all_tags()
+        .into_iter()
+        .map(|key| {
+            // The index keys tags folded; complete with the spelling the vault uses.
+            let tag_name = spellings.get(key).map_or(key, String::as_str);
+            CompletionItem {
+                label: format!("#{}", tag_name),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some("Tag".to_string()),
+                filter_text: Some(tag_name.to_string()),
+                text_edit: Some(completion_text_edit(range, tag_name.to_string())),
+                ..Default::default()
+            }
+        })
+        .collect();
+    tracing::debug!(
+        count = items.len(),
+        "completion: returning candidates (tags)"
+    );
+    respond(items, limit, typed)
+}
+
 pub fn completion(params: CompletionParams, state: &SatzState) -> Option<CompletionResponse> {
     let uri = params.text_document_position.text_document.uri.as_str();
     let pos = params.text_document_position.position;
@@ -317,268 +730,18 @@ pub fn completion(params: CompletionParams, state: &SatzState) -> Option<Complet
     // Byte-offset/text-scan against the LIVE rope, not `doc.line_index`: `doc` is the
     // debounced (200-500ms) reparse snapshot, but completion re-fires immediately on every
     // `[`/`#`/`^` keystroke, faster than that debounce can settle. Scanning stale text here
-    // corrupts the line-prefix/closing-bracket checks below -- e.g. producing a duplicated
+    // corrupts the line-prefix/closing-bracket checks -- e.g. producing a duplicated
     // `]]` when a second wikilink is typed quickly on the same line right after a first one.
     // Only the line the cursor is on is needed (copied once), not the whole document: every
-    // decision below looks at that line.
+    // decision looks at that line.
     let line_number = (pos.line as usize).min(open_doc.rope.len_lines().saturating_sub(1));
     let line_text = open_doc.rope.line(line_number).to_string();
     let source: &str = line_text.trim_end_matches(['\r', '\n']);
-    let line_start_offset = 0usize;
-    // The column is in UTF-16 units; a column past the end means the end of the line, and one in the
-    // middle of a surrogate pair stays before that character.
-    let mut byte_offset = 0usize;
-    let mut units = 0u32;
-    for c in source.chars() {
-        if units + c.len_utf16() as u32 > pos.character {
-            break;
-        }
-        units += c.len_utf16() as u32;
-        byte_offset += c.len_utf8();
-    }
-    let line_no = line_number as u32;
-    let col16 = |byte: usize| source[..byte].encode_utf16().count() as u32;
-    let range_at = |start: usize, end: usize| {
-        Range::new(
-            Position::new(line_no, col16(start)),
-            Position::new(line_no, col16(end)),
-        )
-    };
-    let limit = state.config.lsp.completion_limit;
+    let cursor = Cursor::new(source, line_number as u32, pos.character);
 
-    // Get prefix of the current line up to byte_offset
-    let line_prefix = &source[line_start_offset..byte_offset];
-
-    // The rest of the word the cursor is inside (`[[Ol|gu]]`) is part of what is being replaced,
-    // or the completion would leave it behind (`[[doc-bgu]]`). It ends at a bracket, `|`, `#` or `^`.
-    // Whitespace ends the word too, whichever comes first: text further along the line (`x^2`, a
-    // later `#tag`, a table `|`) is not part of what is being completed and must survive.
-    let tail = &source[byte_offset..];
-    let word_end = byte_offset
-        + tail
-            .find(|c: char| matches!(c, ']' | '|' | '#' | '^') || c.is_whitespace())
-            .unwrap_or(tail.len());
-    // Closing brackets after the word: none -> `]]`, one -> the missing `]`, both -> nothing.
-    // (The link may continue with `|display` or `#anchor` before its closing `]]`.)
-    let after_word = &source[word_end..];
-    let closed_later = after_word
-        .split("[[")
-        .next()
-        .is_some_and(|s| s.contains("]]"));
-    let close_suffix = if closed_later {
-        ""
-    } else if after_word.starts_with(']') {
-        "]"
-    } else {
-        "]]"
-    };
-
-    // 1. Check for wikilink completion: `[[...`
-    // A `[[` that a `]]` has already closed on this line is finished text, not a link being typed.
-    let open_bracket = line_prefix
-        .rfind("[[")
-        .filter(|idx| !line_prefix[idx + 2..].contains("]]"));
-    if let Some(open_bracket_idx) = open_bracket {
-        let inside_wikilink = &line_prefix[open_bracket_idx + 2..];
-        let inside_wikilink_start = line_start_offset + open_bracket_idx + 2;
-
-        // After `|` the user is writing the link's display text: nothing to complete.
-        if inside_wikilink.contains('|') {
-            return Some(CompletionResponse::Array(vec![]));
-        }
-
-        // Check if inside heading or block reference `[[doc#...` or `[[#...`
-        if let Some((target_doc_str, heading_or_block)) = inside_wikilink.split_once('#') {
-            let heading_or_block_start = inside_wikilink_start + target_doc_str.len() + 1;
-            let target_id = if target_doc_str.is_empty() {
-                &doc.id
-            } else if let Some(resolved) = state.index.resolve_link(target_doc_str) {
-                resolved
-            } else {
-                tracing::debug!(
-                    target_doc_str,
-                    "completion: returning candidates count=0 (target doc did not resolve)"
-                );
-                return Some(CompletionResponse::Array(vec![]));
-            };
-
-            if let Some(target_doc) = state.index.get_doc(target_id) {
-                if let Some(_block_prefix) = heading_or_block.strip_prefix('^') {
-                    // Block anchor completion: `[[doc#^...`. The replaced range includes the
-                    // typed `^` because every new text starts with its own.
-                    let range = range_at(heading_or_block_start, word_end);
-                    let items: Vec<CompletionItem> = target_doc
-                        .blocks
-                        .iter()
-                        .map(|b| {
-                            let new_text = format!("^{}{}", b.id, close_suffix);
-                            CompletionItem {
-                                label: format!("^{}", b.id),
-                                kind: Some(CompletionItemKind::VARIABLE),
-                                detail: Some("Block Anchor".to_string()),
-                                text_edit: Some(completion_text_edit(range, new_text)),
-                                filter_text: Some(format!("^{}", b.id)),
-                                ..Default::default()
-                            }
-                        })
-                        .collect();
-                    tracing::debug!(
-                        count = items.len(),
-                        "completion: returning candidates (block anchors)"
-                    );
-                    return Some(CompletionResponse::Array(items));
-                } else {
-                    // Heading completion: `[[doc#...`
-                    let range = range_at(heading_or_block_start, word_end);
-                    // A link to a heading that appears twice reaches the first one, so the later
-                    // copy is not a different target and is not offered.
-                    let mut seen_slugs = std::collections::HashSet::new();
-                    let mut items: Vec<CompletionItem> = target_doc
-                        .headings
-                        .iter()
-                        .filter(|h| seen_slugs.insert(h.slug.as_str()))
-                        .map(|h| {
-                            let new_text = format!("{}{}", h.text.trim(), close_suffix);
-                            CompletionItem {
-                                label: h.text.trim().to_string(),
-                                kind: Some(CompletionItemKind::FIELD),
-                                detail: Some(format!("Level {} Heading", h.level)),
-                                text_edit: Some(completion_text_edit(range, new_text)),
-                                ..Default::default()
-                            }
-                        })
-                        .collect();
-
-                    // If query is empty or starts with '^', also suggest blocks
-                    if heading_or_block.is_empty() {
-                        for b in &target_doc.blocks {
-                            let new_text = format!("^{}{}", b.id, close_suffix);
-                            items.push(CompletionItem {
-                                label: format!("^{}", b.id),
-                                kind: Some(CompletionItemKind::VARIABLE),
-                                detail: Some("Block Anchor".to_string()),
-                                text_edit: Some(completion_text_edit(range, new_text)),
-                                filter_text: Some(format!("^{}", b.id)),
-                                ..Default::default()
-                            });
-                        }
-                    }
-
-                    tracing::debug!(
-                        count = items.len(),
-                        "completion: returning candidates (headings/blocks for doc)"
-                    );
-                    return Some(CompletionResponse::Array(items));
-                }
-            }
-        } else {
-            // Document / Note completion
-            let range = range_at(inside_wikilink_start, word_end);
-
-            let mut candidates: Vec<Candidate> = Vec::new();
-            for d in state.index.documents() {
-                candidates.push(Candidate {
-                    doc: d,
-                    hit: Hit::Title,
-                });
-                for alias in &d.frontmatter.aliases {
-                    candidates.push(Candidate {
-                        doc: d,
-                        hit: Hit::Alias(alias),
-                    });
-                }
-                for h in &d.headings {
-                    let heading_text = h.text.trim();
-                    if heading_text.is_empty() {
-                        continue;
-                    }
-                    candidates.push(Candidate {
-                        doc: d,
-                        hit: Hit::Heading(heading_text),
-                    });
-                }
-            }
-
-            tracing::debug!(
-                count = candidates.len(),
-                "completion: returning candidates (documents/headings/aliases)"
-            );
-            let ranking = rank(candidates, limit, inside_wikilink);
-            let items = ranking
-                .items
-                .iter()
-                .map(|c| c.build(range, close_suffix))
-                .collect();
-            return Some(response_of(items, ranking.incomplete));
-        }
-    }
-
-    // 2. Check for Footnote completion: `[^...`
-    if let Some(open_fn_idx) = line_prefix.rfind("[^") {
-        let inside_fn = &line_prefix[open_fn_idx + 2..];
-        if !inside_fn.contains(']') {
-            let range = range_at(line_start_offset + open_fn_idx + 2, byte_offset);
-            let items: Vec<CompletionItem> = doc
-                .footnotes
-                .definitions
-                .iter()
-                .map(|f| CompletionItem {
-                    label: f.label.clone(),
-                    kind: Some(CompletionItemKind::REFERENCE),
-                    detail: Some("Footnote Definition".to_string()),
-                    text_edit: Some(completion_text_edit(range, f.label.clone())),
-                    ..Default::default()
-                })
-                .collect();
-            tracing::debug!(
-                count = items.len(),
-                "completion: returning candidates (footnotes)"
-            );
-            return Some(CompletionResponse::Array(items));
-        }
-    }
-
-    // 3. Check for Tag completion: `#...`
-    if let Some(hash_idx) = line_prefix.rfind('#') {
-        // A tag starts at the line start, after whitespace, or after an opening bracket/quote (the
-        // same set the parser accepts), and only tag characters have been typed since the `#`:
-        // `# Heading text|` is a heading marker, not a tag being typed.
-        let starts_a_tag = line_prefix[..hash_idx].chars().next_back().is_none_or(|c| {
-            c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\'' | '<' | '—' | '–')
-        });
-        let only_tag_characters = line_prefix[hash_idx + 1..]
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'));
-
-        if starts_a_tag && only_tag_characters {
-            let range = range_at(line_start_offset + hash_idx + 1, byte_offset);
-            let spellings = tag_spellings(state);
-            let items: Vec<CompletionItem> = state
-                .index
-                .all_tags()
-                .into_iter()
-                .map(|key| {
-                    // The index keys tags folded; complete with the spelling the vault uses.
-                    let tag_name = spellings.get(key).map_or(key, String::as_str);
-                    CompletionItem {
-                        label: format!("#{}", tag_name),
-                        kind: Some(CompletionItemKind::KEYWORD),
-                        detail: Some("Tag".to_string()),
-                        filter_text: Some(tag_name.to_string()),
-                        text_edit: Some(completion_text_edit(range, tag_name.to_string())),
-                        ..Default::default()
-                    }
-                })
-                .collect();
-            tracing::debug!(
-                count = items.len(),
-                "completion: returning candidates (tags)"
-            );
-            return Some(respond(items, limit, &line_prefix[hash_idx + 1..]));
-        }
-    }
-
-    None
+    contexts(&cursor)
+        .iter()
+        .find_map(|context| answer(context, &cursor, state, doc))
 }
 
 /// For every folded tag key, the spelling used most often across the vault (the alphabetically
@@ -2209,5 +2372,756 @@ aliases: [Twin]
             }
         }
         assert!(cases >= 1500, "{cases} cases");
+    }
+
+    // ---- where the cursor is: the answer must stay what it was (T2), against the function as it was ----
+
+    /// A vault with headings (one twice), blocks, aliases, a footnote, tags, and Turkish/emoji text.
+    const CONTEXT_NOTES: &[&str] = &[
+        "---\ntitle: Alpha\naliases: [Al, Alfa]\n---\n# Alpha\n\n## He\n\n## He\n\n## Özet\n\ntext ^blk\n\n#t1 #Ünlü\n\n[^1]: a note\n",
+        "# B\n\n## Head\n\n#t2\n",
+        "# İş\n\n## 😀 Emoji\n\nline ^x1\n",
+    ];
+
+    /// Every line the cursor may be on, in the shapes the completion looks at.
+    const CONTEXT_LINES: &[&str] = &[
+        "",
+        "   ",
+        "[[",
+        "[[a",
+        "[[a#",
+        "[[a#He",
+        "[[a#^",
+        "[[a#^b",
+        "[[#",
+        "[[#^",
+        "[[#Ope",
+        "[[a|",
+        "[[a|x",
+        "[[nope#",
+        "[[nope#x",
+        "[[a]]",
+        "[[a]] [[b",
+        "[[a] ",
+        "[[a [^1",
+        "x [[a b]]",
+        "x [[a b",
+        "[[a#h]] tail",
+        "[[a^b",
+        "[[a b|c]] x^2",
+        "[[Ol gu]] #t",
+        "[^",
+        "[^1",
+        "[^1]",
+        "[^1] #t",
+        "[^1 #t",
+        "#",
+        "#t",
+        "#Ünlü",
+        "# Heading",
+        "text #tag",
+        "a#b",
+        "(#t",
+        "\"#t",
+        "—#t",
+        "##",
+        "#t1 #",
+        "[[😀",
+        "😀[[a",
+        "[[😀 x]]",
+        "> [[a",
+        "- #t",
+    ];
+
+    fn ask_at(state: &SatzState, line: u32, character: u32) -> Option<CompletionResponse> {
+        completion(
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: "file:///open.md".parse().unwrap(),
+                    },
+                    position: Position::new(line, character),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+            state,
+        )
+    }
+
+    /// The function as it was before the cursor's context was found as data.
+    ///
+    fn reference_completion(
+        params: CompletionParams,
+        state: &SatzState,
+    ) -> Option<CompletionResponse> {
+        let uri = params.text_document_position.text_document.uri.as_str();
+        let pos = params.text_document_position.position;
+        tracing::debug!(uri, ?pos, "completion");
+
+        let (open_doc, doc) = state.doc_for_uri(uri)?;
+
+        // Byte-offset/text-scan against the LIVE rope, not `doc.line_index`: `doc` is the
+        // debounced (200-500ms) reparse snapshot, but completion re-fires immediately on every
+        // `[`/`#`/`^` keystroke, faster than that debounce can settle. Scanning stale text here
+        // corrupts the line-prefix/closing-bracket checks below -- e.g. producing a duplicated
+        // `]]` when a second wikilink is typed quickly on the same line right after a first one.
+        // Only the line the cursor is on is needed (copied once), not the whole document: every
+        // decision below looks at that line.
+        let line_number = (pos.line as usize).min(open_doc.rope.len_lines().saturating_sub(1));
+        let line_text = open_doc.rope.line(line_number).to_string();
+        let source: &str = line_text.trim_end_matches(['\r', '\n']);
+        let line_start_offset = 0usize;
+        // The column is in UTF-16 units; a column past the end means the end of the line, and one in the
+        // middle of a surrogate pair stays before that character.
+        let mut byte_offset = 0usize;
+        let mut units = 0u32;
+        for c in source.chars() {
+            if units + c.len_utf16() as u32 > pos.character {
+                break;
+            }
+            units += c.len_utf16() as u32;
+            byte_offset += c.len_utf8();
+        }
+        let line_no = line_number as u32;
+        let col16 = |byte: usize| source[..byte].encode_utf16().count() as u32;
+        let range_at = |start: usize, end: usize| {
+            Range::new(
+                Position::new(line_no, col16(start)),
+                Position::new(line_no, col16(end)),
+            )
+        };
+        let limit = state.config.lsp.completion_limit;
+
+        // Get prefix of the current line up to byte_offset
+        let line_prefix = &source[line_start_offset..byte_offset];
+
+        // The rest of the word the cursor is inside (`[[Ol|gu]]`) is part of what is being replaced,
+        // or the completion would leave it behind (`[[doc-bgu]]`). It ends at a bracket, `|`, `#` or `^`.
+        // Whitespace ends the word too, whichever comes first: text further along the line (`x^2`, a
+        // later `#tag`, a table `|`) is not part of what is being completed and must survive.
+        let tail = &source[byte_offset..];
+        let word_end = byte_offset
+            + tail
+                .find(|c: char| matches!(c, ']' | '|' | '#' | '^') || c.is_whitespace())
+                .unwrap_or(tail.len());
+        // Closing brackets after the word: none -> `]]`, one -> the missing `]`, both -> nothing.
+        // (The link may continue with `|display` or `#anchor` before its closing `]]`.)
+        let after_word = &source[word_end..];
+        let closed_later = after_word
+            .split("[[")
+            .next()
+            .is_some_and(|s| s.contains("]]"));
+        let close_suffix = if closed_later {
+            ""
+        } else if after_word.starts_with(']') {
+            "]"
+        } else {
+            "]]"
+        };
+
+        // 1. Check for wikilink completion: `[[...`
+        // A `[[` that a `]]` has already closed on this line is finished text, not a link being typed.
+        let open_bracket = line_prefix
+            .rfind("[[")
+            .filter(|idx| !line_prefix[idx + 2..].contains("]]"));
+        if let Some(open_bracket_idx) = open_bracket {
+            let inside_wikilink = &line_prefix[open_bracket_idx + 2..];
+            let inside_wikilink_start = line_start_offset + open_bracket_idx + 2;
+
+            // After `|` the user is writing the link's display text: nothing to complete.
+            if inside_wikilink.contains('|') {
+                return Some(CompletionResponse::Array(vec![]));
+            }
+
+            // Check if inside heading or block reference `[[doc#...` or `[[#...`
+            if let Some((target_doc_str, heading_or_block)) = inside_wikilink.split_once('#') {
+                let heading_or_block_start = inside_wikilink_start + target_doc_str.len() + 1;
+                let target_id = if target_doc_str.is_empty() {
+                    &doc.id
+                } else if let Some(resolved) = state.index.resolve_link(target_doc_str) {
+                    resolved
+                } else {
+                    tracing::debug!(
+                        target_doc_str,
+                        "completion: returning candidates count=0 (target doc did not resolve)"
+                    );
+                    return Some(CompletionResponse::Array(vec![]));
+                };
+
+                if let Some(target_doc) = state.index.get_doc(target_id) {
+                    if let Some(_block_prefix) = heading_or_block.strip_prefix('^') {
+                        // Block anchor completion: `[[doc#^...`. The replaced range includes the
+                        // typed `^` because every new text starts with its own.
+                        let range = range_at(heading_or_block_start, word_end);
+                        let items: Vec<CompletionItem> = target_doc
+                            .blocks
+                            .iter()
+                            .map(|b| {
+                                let new_text = format!("^{}{}", b.id, close_suffix);
+                                CompletionItem {
+                                    label: format!("^{}", b.id),
+                                    kind: Some(CompletionItemKind::VARIABLE),
+                                    detail: Some("Block Anchor".to_string()),
+                                    text_edit: Some(completion_text_edit(range, new_text)),
+                                    filter_text: Some(format!("^{}", b.id)),
+                                    ..Default::default()
+                                }
+                            })
+                            .collect();
+                        tracing::debug!(
+                            count = items.len(),
+                            "completion: returning candidates (block anchors)"
+                        );
+                        return Some(CompletionResponse::Array(items));
+                    } else {
+                        // Heading completion: `[[doc#...`
+                        let range = range_at(heading_or_block_start, word_end);
+                        // A link to a heading that appears twice reaches the first one, so the later
+                        // copy is not a different target and is not offered.
+                        let mut seen_slugs = std::collections::HashSet::new();
+                        let mut items: Vec<CompletionItem> = target_doc
+                            .headings
+                            .iter()
+                            .filter(|h| seen_slugs.insert(h.slug.as_str()))
+                            .map(|h| {
+                                let new_text = format!("{}{}", h.text.trim(), close_suffix);
+                                CompletionItem {
+                                    label: h.text.trim().to_string(),
+                                    kind: Some(CompletionItemKind::FIELD),
+                                    detail: Some(format!("Level {} Heading", h.level)),
+                                    text_edit: Some(completion_text_edit(range, new_text)),
+                                    ..Default::default()
+                                }
+                            })
+                            .collect();
+
+                        // If query is empty or starts with '^', also suggest blocks
+                        if heading_or_block.is_empty() {
+                            for b in &target_doc.blocks {
+                                let new_text = format!("^{}{}", b.id, close_suffix);
+                                items.push(CompletionItem {
+                                    label: format!("^{}", b.id),
+                                    kind: Some(CompletionItemKind::VARIABLE),
+                                    detail: Some("Block Anchor".to_string()),
+                                    text_edit: Some(completion_text_edit(range, new_text)),
+                                    filter_text: Some(format!("^{}", b.id)),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+
+                        tracing::debug!(
+                            count = items.len(),
+                            "completion: returning candidates (headings/blocks for doc)"
+                        );
+                        return Some(CompletionResponse::Array(items));
+                    }
+                }
+            } else {
+                // Document / Note completion
+                let range = range_at(inside_wikilink_start, word_end);
+
+                let mut candidates: Vec<Candidate> = Vec::new();
+                for d in state.index.documents() {
+                    candidates.push(Candidate {
+                        doc: d,
+                        hit: Hit::Title,
+                    });
+                    for alias in &d.frontmatter.aliases {
+                        candidates.push(Candidate {
+                            doc: d,
+                            hit: Hit::Alias(alias),
+                        });
+                    }
+                    for h in &d.headings {
+                        let heading_text = h.text.trim();
+                        if heading_text.is_empty() {
+                            continue;
+                        }
+                        candidates.push(Candidate {
+                            doc: d,
+                            hit: Hit::Heading(heading_text),
+                        });
+                    }
+                }
+
+                tracing::debug!(
+                    count = candidates.len(),
+                    "completion: returning candidates (documents/headings/aliases)"
+                );
+                let ranking = rank(candidates, limit, inside_wikilink);
+                let items = ranking
+                    .items
+                    .iter()
+                    .map(|c| c.build(range, close_suffix))
+                    .collect();
+                return Some(response_of(items, ranking.incomplete));
+            }
+        }
+
+        // 2. Check for Footnote completion: `[^...`
+        if let Some(open_fn_idx) = line_prefix.rfind("[^") {
+            let inside_fn = &line_prefix[open_fn_idx + 2..];
+            if !inside_fn.contains(']') {
+                let range = range_at(line_start_offset + open_fn_idx + 2, byte_offset);
+                let items: Vec<CompletionItem> = doc
+                    .footnotes
+                    .definitions
+                    .iter()
+                    .map(|f| CompletionItem {
+                        label: f.label.clone(),
+                        kind: Some(CompletionItemKind::REFERENCE),
+                        detail: Some("Footnote Definition".to_string()),
+                        text_edit: Some(completion_text_edit(range, f.label.clone())),
+                        ..Default::default()
+                    })
+                    .collect();
+                tracing::debug!(
+                    count = items.len(),
+                    "completion: returning candidates (footnotes)"
+                );
+                return Some(CompletionResponse::Array(items));
+            }
+        }
+
+        // 3. Check for Tag completion: `#...`
+        if let Some(hash_idx) = line_prefix.rfind('#') {
+            // A tag starts at the line start, after whitespace, or after an opening bracket/quote (the
+            // same set the parser accepts), and only tag characters have been typed since the `#`:
+            // `# Heading text|` is a heading marker, not a tag being typed.
+            let starts_a_tag = line_prefix[..hash_idx].chars().next_back().is_none_or(|c| {
+                c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\'' | '<' | '—' | '–')
+            });
+            let only_tag_characters = line_prefix[hash_idx + 1..]
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'));
+
+            if starts_a_tag && only_tag_characters {
+                let range = range_at(line_start_offset + hash_idx + 1, byte_offset);
+                let spellings = tag_spellings(state);
+                let items: Vec<CompletionItem> = state
+                    .index
+                    .all_tags()
+                    .into_iter()
+                    .map(|key| {
+                        // The index keys tags folded; complete with the spelling the vault uses.
+                        let tag_name = spellings.get(key).map_or(key, String::as_str);
+                        CompletionItem {
+                            label: format!("#{}", tag_name),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some("Tag".to_string()),
+                            filter_text: Some(tag_name.to_string()),
+                            text_edit: Some(completion_text_edit(range, tag_name.to_string())),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+                tracing::debug!(
+                    count = items.len(),
+                    "completion: returning candidates (tags)"
+                );
+                return Some(respond(items, limit, &line_prefix[hash_idx + 1..]));
+            }
+        }
+
+        None
+    }
+
+    #[test]
+    fn where_the_cursor_is_is_read_exactly_as_the_straightforward_version_read_it() {
+        let notes: Vec<String> = CONTEXT_NOTES.iter().map(|s| s.to_string()).collect();
+        let mut cases = 0usize;
+        // The line alone, in a longer note (LF), and in a longer note with CRLF line ends.
+        for shape in 0..3 {
+            for line in CONTEXT_LINES {
+                let (open_text, row) = match shape {
+                    0 => (line.to_string(), 0u32),
+                    1 => (
+                        format!("# Open\n\n^ob\n{line}\nlast\n\n[^1]: one\n[^long-label]: two\n"),
+                        3,
+                    ),
+                    _ => (
+                        format!(
+                            "# Open\r\n\r\n^ob\r\n{line}\r\nlast\r\n\r\n[^1]: one\r\n[^long-label]: two\r\n"
+                        ),
+                        3,
+                    ),
+                };
+                let mut state = state_from(&notes, &open_text);
+                let columns = line.encode_utf16().count() as u32;
+                for limit in [0usize, 2, 200] {
+                    state.config.lsp.completion_limit = limit;
+                    // Every column, and two beyond the end of the line.
+                    for column in 0..=columns + 2 {
+                        let got = ask_at(&state, row, column);
+                        let want = reference_completion(
+                            CompletionParams {
+                                text_document_position: TextDocumentPositionParams {
+                                    text_document: TextDocumentIdentifier {
+                                        uri: "file:///open.md".parse().unwrap(),
+                                    },
+                                    position: Position::new(row, column),
+                                },
+                                work_done_progress_params: Default::default(),
+                                partial_result_params: Default::default(),
+                                context: None,
+                            },
+                            &state,
+                        );
+                        assert_eq!(
+                            format!("{got:?}"),
+                            format!("{want:?}"),
+                            "shape {shape}, line {line:?}, column {column}, limit {limit}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert!(cases >= 3000, "{cases} cases");
+    }
+
+    // ---- the cursor's context as data (T2): decided without building a single item ----
+
+    /// The line (without the `‸` that marks the cursor) and the cursor's UTF-16 column.
+    fn line_and_column(marked: &str) -> (String, u32) {
+        let (before, after) = marked.split_once('‸').expect("a cursor marker");
+        (
+            format!("{before}{after}"),
+            before.encode_utf16().count() as u32,
+        )
+    }
+
+    fn contexts_of(marked: &str, check: impl FnOnce(Vec<CompletionContext>)) {
+        let (line, column) = line_and_column(marked);
+        check(contexts(&Cursor::new(&line, 0, column)));
+    }
+
+    fn cursor_of(marked: &str, check: impl FnOnce(Cursor)) {
+        let (line, column) = line_and_column(marked);
+        check(Cursor::new(&line, 0, column));
+    }
+
+    #[test]
+    fn each_kind_of_context_is_found_with_what_was_typed_and_where_it_starts() {
+        use CompletionContext::*;
+        contexts_of("[[‸", |c| {
+            assert_eq!(
+                c,
+                vec![Note {
+                    typed: "",
+                    start: 2
+                }]
+            );
+        });
+        // What follows the cursor is not "typed": only the text before it counts.
+        contexts_of("x [[Ol‸gu", |c| {
+            assert_eq!(
+                c,
+                vec![Note {
+                    typed: "Ol",
+                    start: 4
+                }]
+            );
+        });
+        contexts_of("[[a#‸", |c| {
+            assert_eq!(
+                c,
+                vec![Heading {
+                    target: "a",
+                    typed: "",
+                    start: 4
+                }]
+            );
+        });
+        contexts_of("[[a#He‸", |c| {
+            assert_eq!(
+                c,
+                vec![Heading {
+                    target: "a",
+                    typed: "He",
+                    start: 4
+                }]
+            );
+        });
+        contexts_of("[[a#^‸", |c| {
+            assert_eq!(
+                c,
+                vec![Block {
+                    target: "a",
+                    start: 4
+                }]
+            );
+        });
+        contexts_of("[[a#^bl‸", |c| {
+            assert_eq!(
+                c,
+                vec![Block {
+                    target: "a",
+                    start: 4
+                }]
+            );
+        });
+        contexts_of("[[a|‸", |c| assert_eq!(c, vec![DisplayText]));
+        contexts_of("[[a|shown te‸", |c| assert_eq!(c, vec![DisplayText]));
+        contexts_of("[^1‸", |c| assert_eq!(c, vec![Footnote { start: 2 }]));
+        contexts_of("[^‸", |c| assert_eq!(c, vec![Footnote { start: 2 }]));
+        contexts_of("#ta‸", |c| {
+            assert_eq!(
+                c,
+                vec![Tag {
+                    typed: "ta",
+                    start: 1
+                }]
+            );
+        });
+        contexts_of("#‸", |c| {
+            assert_eq!(
+                c,
+                vec![Tag {
+                    typed: "",
+                    start: 1
+                }]
+            )
+        });
+    }
+
+    #[test]
+    fn no_context_where_nothing_is_being_written() {
+        for marked in [
+            "‸",
+            "   ‸",
+            "plain text‸",
+            "[[a]] ‸",    // a link that is finished
+            "[^1]‸",      // a footnote reference that is finished
+            "# Heading‸", // a heading marker, not a tag
+            "a#b‸",       // a `#` inside a word
+            "##‸",        // the second `#` follows a `#`
+            "x#t‸",
+        ] {
+            contexts_of(marked, |c| assert_eq!(c, vec![], "{marked:?}"));
+        }
+    }
+
+    #[test]
+    fn a_tag_starts_after_whitespace_or_an_opening_bracket_or_quote() {
+        use CompletionContext::Tag;
+        for (marked, start) in [
+            ("a #t‸", 3),
+            ("(#t‸", 2),
+            ("\"#t‸", 2),
+            ("'#t‸", 2),
+            ("{#t‸", 2),
+            ("<#t‸", 2),
+            ("—#t‸", 4),
+            ("–#t‸", 4),
+        ] {
+            contexts_of(marked, |c| {
+                assert_eq!(c, vec![Tag { typed: "t", start }], "{marked:?}");
+            });
+        }
+        // Only tag characters may follow the `#`.
+        contexts_of("#a b‸", |c| assert_eq!(c, vec![]));
+        contexts_of("#a/b_c-d‸", |c| {
+            assert_eq!(
+                c,
+                vec![Tag {
+                    typed: "a/b_c-d",
+                    start: 1
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn a_context_that_cannot_answer_leaves_the_next_one_its_turn() {
+        use CompletionContext::*;
+        // The link comes first, a footnote after it, a tag after that.
+        contexts_of("[[a [^1‸", |c| {
+            assert_eq!(
+                c,
+                vec![
+                    Note {
+                        typed: "a [^1",
+                        start: 2
+                    },
+                    Footnote { start: 6 }
+                ]
+            );
+        });
+        // A `#` right after `[[` also opens a tag: it is asked when the heading context cannot
+        // answer.
+        contexts_of("[[#‸", |c| {
+            assert_eq!(
+                c,
+                vec![
+                    Heading {
+                        target: "",
+                        typed: "",
+                        start: 3
+                    },
+                    Tag {
+                        typed: "",
+                        start: 3
+                    }
+                ]
+            );
+        });
+        // A finished footnote reference does not hide a tag after it.
+        contexts_of("[^x] #t‸", |c| {
+            assert_eq!(
+                c,
+                vec![Tag {
+                    typed: "t",
+                    start: 6
+                }]
+            );
+        });
+        // A finished link does not hide a link being typed after it.
+        contexts_of("[[a]] [[b‸", |c| {
+            assert_eq!(
+                c,
+                vec![Note {
+                    typed: "b",
+                    start: 8
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn where_the_word_ends_and_what_closes_the_link() {
+        // (line with the cursor, where the word ends, the closing brackets it needs)
+        for (marked, word_end, closing) in [
+            ("[[a‸", 3, "]]"),
+            ("[[a‸]]", 3, ""),
+            ("[[a‸]", 3, "]"),
+            ("[[Ol‸gu]]", 6, ""),
+            ("[[a‸ x]]", 3, ""),
+            ("[[a‸ x [[b]]", 3, "]]"),
+            ("[[a‸|shown]]", 3, ""),
+            ("[[a‸#h]]", 3, ""),
+            ("[[a‸^b]]", 3, ""),
+            ("[[a‸ x^2", 3, "]]"),
+            ("[[a‸ |", 3, "]]"),
+            ("[[a‸\t|", 3, "]]"),
+        ] {
+            cursor_of(marked, |cursor| {
+                assert_eq!(cursor.word_end(), word_end, "{marked:?}");
+                assert_eq!(cursor.close_suffix(), closing, "{marked:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn columns_are_utf16_units_and_never_split_a_character() {
+        // 😀 is two UTF-16 units and four bytes.
+        let cursor = Cursor::new("😀x", 5, 1);
+        assert_eq!(cursor.at, 0, "the middle of a pair stays before it");
+        assert_eq!(Cursor::new("😀x", 5, 2).at, 4);
+        assert_eq!(Cursor::new("😀x", 5, 3).at, 5);
+        assert_eq!(Cursor::new("😀x", 5, 99).at, 5, "past the end is the end");
+        assert_eq!(Cursor::new("", 5, 3).at, 0);
+        // Multi-byte, one unit: `ü` is two bytes.
+        assert_eq!(Cursor::new("aüb", 0, 2).at, 3);
+        let cursor = Cursor::new("😀x", 5, 3);
+        assert_eq!(
+            cursor.range(0, 4),
+            Range::new(Position::new(5, 0), Position::new(5, 2))
+        );
+        assert_eq!(
+            cursor.range(4, 5),
+            Range::new(Position::new(5, 2), Position::new(5, 3))
+        );
+        assert_eq!(cursor.prefix(), "😀x");
+    }
+
+    /// A note that is not in the index (so it can point at an id the index lacks).
+    fn stranger() -> satz_core::Document {
+        parse_document("# Stranger\n\n## H\n\n^b1\n", Path::new("stranger.md"))
+    }
+
+    #[test]
+    fn a_reference_to_a_note_the_index_lacks_gives_no_answer_so_the_next_context_is_asked() {
+        let state = state_from(&[TARGET.1.to_string()], "");
+        let current = stranger();
+        let cursor = Cursor::new("[[#", 0, 3);
+        for context in [
+            CompletionContext::Heading {
+                target: "",
+                typed: "",
+                start: 3,
+            },
+            CompletionContext::Block {
+                target: "",
+                start: 3,
+            },
+        ] {
+            assert!(
+                answer(&context, &cursor, &state, &current).is_none(),
+                "{context:?}"
+            );
+        }
+        // A name nothing has is a definite empty answer, not a reason to go on.
+        for context in [
+            CompletionContext::Heading {
+                target: "no-such-note",
+                typed: "",
+                start: 3,
+            },
+            CompletionContext::Block {
+                target: "no-such-note",
+                start: 3,
+            },
+        ] {
+            match answer(&context, &cursor, &state, &current) {
+                Some(CompletionResponse::Array(items)) => assert!(items.is_empty()),
+                other => panic!("{context:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_footnote_replaces_only_what_is_before_the_cursor() {
+        // Unlike a link, what follows the cursor stays (`[^‸ab` -> `[^1ab`, not `[^1`).
+        let open = "[^1]: one\n\ntext [^‸ab";
+        let (items, incomplete) = complete_marked(&[TARGET], open, |_| {});
+        assert!(!incomplete);
+        assert_eq!(edited(&items, "1"), "[^1]: one\n\ntext [^1ab");
+    }
+
+    #[test]
+    fn a_column_past_the_end_of_a_crlf_line_is_the_end_of_its_text_not_after_the_carriage_return() {
+        let state = state_from(&[TARGET.1.to_string()], "[[a\r\nnext\r\n");
+        for column in [3u32, 4, 99] {
+            let Some(CompletionResponse::Array(items)) = ask_at(&state, 0, column) else {
+                panic!("no answer at column {column}");
+            };
+            let Some(CompletionTextEdit::Edit(edit)) = &items[0].text_edit else {
+                panic!("no edit");
+            };
+            assert_eq!(
+                edit.range,
+                Range::new(Position::new(0, 2), Position::new(0, 3)),
+                "column {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_display_text_context_answers_with_nothing_and_stops() {
+        let state = state_from(&[TARGET.1.to_string()], "");
+        let cursor = Cursor::new("[[a|", 0, 4);
+        match answer(
+            &CompletionContext::DisplayText,
+            &cursor,
+            &state,
+            &stranger(),
+        ) {
+            Some(CompletionResponse::Array(items)) => assert!(items.is_empty()),
+            other => panic!("{other:?}"),
+        }
     }
 }
