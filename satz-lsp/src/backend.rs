@@ -145,6 +145,38 @@ pub(crate) async fn refresh_semantic_tokens(client: &Client, state: &Arc<RwLock<
     }
 }
 
+/// Tells the client that what the open notes show may have changed under them: a pull client is
+/// asked to fetch again, a push client is sent the diagnostics of every open note.
+pub(crate) async fn refresh_open_documents(client: &Client, state: &Arc<RwLock<SatzState>>) {
+    let (supports_pull, uris) = {
+        let s = state.read().await;
+        (
+            s.client_supports_pull_diagnostics,
+            s.open_docs.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+    if supports_pull {
+        refresh_diagnostics(client, state).await;
+    } else {
+        for uri in uris {
+            publish_for(client, state, &uri).await;
+        }
+    }
+}
+
+/// The day changed under the open notes (midnight passed, or the daily-note settings changed): a
+/// `[[bugün]]` now reaches another note, so which daily note is an orphan, and how the links are
+/// coloured, may differ. The client is told once, after the request that noticed it is done with
+/// the state.
+async fn announce_daily_change(client: Client, state: Arc<RwLock<SatzState>>) {
+    // Everything the peers depend on is announced here; the next reparse has nothing to add.
+    state.write().await.clear_peers_dirty();
+    tokio::join!(
+        refresh_open_documents(&client, &state),
+        refresh_semantic_tokens(&client, &state)
+    );
+}
+
 /// What the server offers the client (the `capabilities` of the `initialize` response).
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
@@ -460,10 +492,19 @@ impl Backend {
         let mut state = self.state.write().await;
         state.refresh_stale_open_documents();
         // Midnight passed (or the daily settings changed): `[[bugün]]` means another note now.
-        state.sync_daily(today);
+        let day_moved = state.sync_daily(today);
         // Downgraded, not released and re-acquired: a `did_change` slipping in between would make
         // the state the caller reads stale again.
-        state.downgrade()
+        let read = state.downgrade();
+        if day_moved {
+            // Only the request that moves the day gets here (afterwards the index is current),
+            // so the client is told once. It cannot be told while this request holds the state.
+            tokio::spawn(announce_daily_change(
+                self.client.clone(),
+                self.state.clone(),
+            ));
+        }
+        read
     }
 
     pub fn new(client: Client, log_reload_handle: LogReloadHandle) -> Self {
@@ -663,6 +704,10 @@ impl LanguageServer for Backend {
 
         let peers = {
             let mut state = self.state.write().await;
+            // A note opened first thing after midnight is read on the new day: whether a daily
+            // note is an orphan depends on it. Moving the day marks the peers as changed, which
+            // `take_peer_refresh` below turns into their refresh.
+            state.sync_daily(chrono::Local::now().date_naive());
             state.open_document(&uri, &content, &path, version);
             state.take_peer_refresh(&uri, true)
         };
@@ -2561,5 +2606,372 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
         assert!(backend.state.read().await.is_indexing_complete());
         assert!(backend.pending_announcement.lock().unwrap().is_none());
+    }
+
+    // ---- the day changes under open notes (T3): what the client is told ----
+
+    /// The index still holds yesterday's date, as it does after midnight until a request moves it.
+    async fn make_the_day_stale(backend: &Backend) {
+        let mut state = backend.state.write().await;
+        let today = chrono::Local::now().date_naive();
+        let config = state.config.daily_note.clone();
+        state
+            .index
+            .set_daily(Some((config, today.pred_opt().unwrap())));
+    }
+
+    /// The index is up to date with today.
+    async fn make_the_day_current(backend: &Backend) {
+        let mut state = backend.state.write().await;
+        state.sync_daily(chrono::Local::now().date_naive());
+        state.clear_peers_dirty();
+    }
+
+    async fn hover_a(backend: &Backend) {
+        let _ = backend
+            .hover(HoverParams {
+                text_document_position_params: position_params("file:///a.md", 0, 3),
+                work_done_progress_params: Default::default(),
+            })
+            .await;
+    }
+
+    fn count_of(sent: &[(String, Option<String>)], method: &str, uri: Option<&str>) -> usize {
+        sent.iter()
+            .filter(|(m, u)| m == method && (uri.is_none() || u.as_deref() == uri))
+            .count()
+    }
+
+    /// Two open notes, the second one linking to the daily note by its alias.
+    async fn day_backend() -> (
+        Arc<Backend>,
+        tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) {
+        let (backend, mut from_server) = connected_backend().await;
+        backend
+            .did_open(open_params("file:///p.md", 1, "# P\n\n[[today]]\n"))
+            .await;
+        make_the_day_stale(&backend).await;
+        // What the handshake and the opening sent is not what is asserted below.
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+        (backend, from_server)
+    }
+
+    #[tokio::test]
+    async fn a_request_that_moves_the_day_tells_a_push_client_to_refresh_every_open_note() {
+        let (backend, mut from_server) = day_backend().await;
+
+        hover_a(&backend).await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+
+        for uri in ["file:///a.md", "file:///p.md"] {
+            assert_eq!(
+                count_of(&sent, "textDocument/publishDiagnostics", Some(uri)),
+                1,
+                "{uri}: {sent:?}"
+            );
+        }
+        assert_eq!(
+            count_of(&sent, "workspace/semanticTokens/refresh", None),
+            1,
+            "the client is asked for fresh colours: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_moves_the_day_tells_a_pull_client_to_fetch_again() {
+        let (backend, mut from_server) = day_backend().await;
+        backend.state.write().await.client_supports_pull_diagnostics = true;
+
+        hover_a(&backend).await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+
+        assert_eq!(
+            count_of(&sent, "workspace/diagnostic/refresh", None),
+            1,
+            "{sent:?}"
+        );
+        assert_eq!(
+            count_of(&sent, "workspace/semanticTokens/refresh", None),
+            1,
+            "{sent:?}"
+        );
+        assert_eq!(
+            count_of(&sent, "textDocument/publishDiagnostics", None),
+            0,
+            "a pull client is not sent diagnostics: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_on_the_same_day_tells_nobody_anything() {
+        let (backend, mut from_server) = day_backend().await;
+        make_the_day_current(&backend).await;
+
+        hover_a(&backend).await;
+        hover_a(&backend).await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            sent.is_empty(),
+            "nothing changed, nothing is sent: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_requests_that_meet_midnight_together_tell_the_client_once() {
+        let (backend, mut from_server) = day_backend().await;
+
+        tokio::join!(hover_a(&backend), hover_a(&backend));
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+
+        for uri in ["file:///a.md", "file:///p.md"] {
+            assert_eq!(
+                count_of(&sent, "textDocument/publishDiagnostics", Some(uri)),
+                1,
+                "{uri}: {sent:?}"
+            );
+        }
+        assert_eq!(
+            count_of(&sent, "workspace/semanticTokens/refresh", None),
+            1,
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_a_refresh_at_midnight_announced_is_not_announced_again_by_the_next_reparse() {
+        let (backend, mut from_server) = day_backend().await;
+        {
+            let mut state = backend.state.write().await;
+            state.config.lsp.reparse_debounce_ms = 40;
+            state.config.lsp.reparse_max_wait_ms = 40;
+        }
+        hover_a(&backend).await;
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+        assert!(
+            !backend.state.read().await.peers_dirty(),
+            "the refresh took the flag"
+        );
+
+        // An ordinary edit that changes nothing the neighbours depend on: only its own
+        // diagnostics go out.
+        backend
+            .did_change(change_params("file:///a.md", 2, "# A\n\ntext\n"))
+            .await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            count_of(
+                &sent,
+                "textDocument/publishDiagnostics",
+                Some("file:///p.md")
+            ),
+            0,
+            "{sent:?}"
+        );
+    }
+
+    /// What a note is told about its links on the day the index holds.
+    fn messages_on(
+        index: &mut satz_core::Index,
+        config: &satz_core::VaultConfig,
+        day: chrono::NaiveDate,
+        note: &str,
+    ) -> Vec<String> {
+        index.set_daily(Some((config.daily_note.clone(), day)));
+        let doc = index.get_doc(&satz_core::DocId::new(note)).unwrap();
+        compute_diagnostics(doc, index, config)
+            .iter()
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_day_the_index_holds_decides_which_daily_note_is_an_orphan() {
+        // `[[today]]` reaches the daily note of the day the index holds: on yesterday's date
+        // today's daily note has no backlink, on today's it has one.
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let daily = format!("daily/{}.md", today.format("%Y-%m-%d"));
+        let mut index = satz_core::Index::build(vec![
+            satz_core::parse_document(
+                "# P
+
+[[today]]
+",
+                std::path::Path::new("p.md"),
+            ),
+            satz_core::parse_document(
+                "# Entry
+",
+                std::path::Path::new(&daily),
+            ),
+        ]);
+        let config = satz_core::VaultConfig::default();
+
+        let on_yesterday = messages_on(&mut index, &config, yesterday, &daily);
+        let on_today = messages_on(&mut index, &config, today, &daily);
+        assert!(
+            on_yesterday.iter().any(|m| m.starts_with("Orphan note")),
+            "{on_yesterday:?}"
+        );
+        assert!(on_today.is_empty(), "{on_today:?}");
+    }
+
+    /// The messages of every `publishDiagnostics` sent for `quiet` without a pause, by document.
+    async fn diagnostics_meanwhile(
+        input: &mut (impl tokio::io::AsyncBufRead + Unpin),
+        quiet: std::time::Duration,
+    ) -> Vec<(String, Vec<String>)> {
+        let mut seen = Vec::new();
+        while let Ok(Some(frame)) = tokio::time::timeout(quiet, read_frame(input)).await {
+            if frame["method"] == "textDocument/publishDiagnostics" {
+                let uri = frame["params"]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let messages = frame["params"]["diagnostics"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|d| d["message"].as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                seen.push((uri, messages));
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_note_opened_after_midnight_is_read_on_the_new_day() {
+        let (backend, mut from_server) = connected_backend().await;
+        let today = chrono::Local::now().date_naive();
+        let daily = format!("{}.md", today.format("%Y-%m-%d"));
+        {
+            let mut state = backend.state.write().await;
+            state.index.replace_doc(satz_core::parse_document(
+                "# P
+
+[[today]]
+",
+                std::path::Path::new("p.md"),
+            ));
+        }
+        make_the_day_stale(&backend).await;
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+
+        // No request has come since midnight: today's daily note is opened first.
+        let uri = crate::convert::path_to_uri(&root().join("daily").join(&daily))
+            .unwrap()
+            .as_str()
+            .to_string();
+        backend
+            .did_open(open_params(
+                &uri, 1, "# Entry
+",
+            ))
+            .await;
+        let shown =
+            diagnostics_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+        let of_note: Vec<&Vec<String>> = shown
+            .iter()
+            .filter(|(u, _)| *u == uri)
+            .map(|(_, messages)| messages)
+            .collect();
+        assert!(!of_note.is_empty(), "{shown:?}");
+        assert!(
+            shown.iter().any(|(u, _)| u == "file:///a.md"),
+            "the note that was already open is told as well: {shown:?}"
+        );
+        assert!(
+            of_note.iter().all(|messages| messages.is_empty()),
+            "[[today]] links to it, so it is no orphan: {shown:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_only_refreshes_a_stale_buffer_does_not_announce_a_day_change() {
+        let (backend, mut from_server) = day_backend().await;
+        make_the_day_current(&backend).await;
+        {
+            let mut state = backend.state.write().await;
+            state.config.lsp.reparse_debounce_ms = 40;
+            state.config.lsp.reparse_max_wait_ms = 40;
+        }
+
+        backend
+            .did_change(change_params(
+                "file:///a.md",
+                2,
+                "# Renamed
+",
+            ))
+            .await;
+        hover_a(&backend).await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+
+        // The reparse that follows the edit announces once; the same day adds nothing.
+        assert_eq!(
+            count_of(&sent, "workspace/semanticTokens/refresh", None),
+            1,
+            "{sent:?}"
+        );
+        assert_eq!(
+            count_of(
+                &sent,
+                "textDocument/publishDiagnostics",
+                Some("file:///a.md")
+            ),
+            1,
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_note_that_appears_on_disk_refreshes_the_open_notes() {
+        let (backend, mut from_server) = connected_backend().await;
+        let vault = std::env::temp_dir().join(format!("satz_t3_watch_{}", std::process::id()));
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(
+            vault.join("new.md"),
+            "# New
+",
+        )
+        .unwrap();
+        {
+            // The vault is this folder, and the note that is open lies in it.
+            let mut state = backend.state.write().await;
+            state.set_vault_root(Some(vault.clone()));
+            state.open_document(
+                "file:///a.md",
+                "# A
+",
+                &vault.join("a.md"),
+                1,
+            );
+        }
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+
+        crate::watcher::process_file_event(
+            &vault.join("new.md"),
+            &vault,
+            &backend.state,
+            &backend.client,
+        )
+        .await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(500)).await;
+        let _ = std::fs::remove_dir_all(&vault);
+
+        assert_eq!(
+            count_of(
+                &sent,
+                "textDocument/publishDiagnostics",
+                Some("file:///a.md")
+            ),
+            1,
+            "the open note is told, a new note may resolve its links: {sent:?}"
+        );
     }
 }

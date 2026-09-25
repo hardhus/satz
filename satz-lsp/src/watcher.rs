@@ -160,7 +160,7 @@ impl Debouncer {
 
 /// Applies one debounced event. `true`: the first indexing is not finished yet, so the event was
 /// not applied and must be queued again.
-async fn process_file_event(
+pub(crate) async fn process_file_event(
     path: &Path,
     vault_root: &Path,
     state: &Arc<RwLock<SatzState>>,
@@ -236,21 +236,7 @@ async fn process_file_event(
         }
     }
 
-    let (supports_pull, uris) = {
-        let s = state.read().await;
-        (
-            s.client_supports_pull_diagnostics,
-            s.open_docs.keys().cloned().collect::<Vec<_>>(),
-        )
-    };
-
-    if supports_pull {
-        crate::backend::refresh_diagnostics(client, state).await;
-    } else {
-        for uri in uris {
-            crate::backend::publish_for(client, state, &uri).await;
-        }
-    }
+    crate::backend::refresh_open_documents(client, state).await;
     false
 }
 
