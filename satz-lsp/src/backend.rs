@@ -977,9 +977,9 @@ impl LanguageServer for Backend {
         // take versioned edits: it then refuses them if the user has typed since.
         let versioned = self.state.read().await.client_supports_document_changes;
         let edit = if versioned {
-            crate::handlers::execute_command::build_workspace_edit_versioned(&changes)
+            crate::handlers::execute_command::build_workspace_edit_versioned(changes)
         } else {
-            crate::handlers::execute_command::build_workspace_edit(&changes)
+            crate::handlers::execute_command::build_workspace_edit(changes)
         };
 
         let applied = match self.client.apply_edit(edit).await {

@@ -6,7 +6,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::convert::{line_edits_to_text_edits, path_to_uri};
-use crate::state::SatzState;
+use crate::state::{CacheUpdate, SatzState};
 use satz_core::formatter::diff::line_diff;
 
 pub const FORMAT_WORKSPACE_COMMAND: &str = "satz.formatWorkspace";
@@ -89,28 +89,24 @@ pub fn run_read_only_command(
     }
 }
 
-/// One document's computed formatting result: its client URI, the full replacement text (used to
-/// keep an open document's in-memory rope in sync after the client confirms the edit), and the
-/// minimal set of line-range `TextEdit`s that turn its current content into the formatted version.
+/// One document's formatting result, as it is sent with `workspace/applyEdit`: the URI the client
+/// knows it by, the minimal line-range `TextEdit`s that turn its current content into the
+/// formatted version, and the version of the open document they were computed against (`None`: a
+/// file on disk). The server never applies them to its own copy of an open document: the client
+/// applies them to its buffer and reports the change (see `execute_command` in `backend.rs`).
 pub struct FormatChange {
     pub uri: Uri,
-    pub formatted: String,
     pub edits: Vec<TextEdit>,
-    /// Version of the open document the edits were computed against (`None`: a file on disk).
     pub version: Option<i32>,
-    /// `content_hash` of the text the edits were computed against.
-    pub source_hash: u64,
-    /// The key of the open document in `SatzState::open_docs`, if it is open.
-    pub open_key: Option<String>,
 }
 
 /// Result of scanning the vault for formatting changes: the changes themselves (used to build
-/// the `WorkspaceEdit`), and any newly-computed `(content_hash, formatted_text)` pairs the caller
-/// should merge into `state.format_cache` — kept separate so this function only needs `&SatzState`
-/// rather than requiring a write lock just to compute what to send.
+/// the `WorkspaceEdit`), and what was learned about the texts that were formatted, for the caller
+/// to merge into `state.format_cache` (see `CacheUpdate`) — kept separate so this function only
+/// needs `&SatzState` rather than requiring a write lock just to compute what to send.
 pub struct FormatWorkspaceResult {
     pub changes: Vec<FormatChange>,
-    pub cache_updates: Vec<(u64, String)>,
+    pub cache_updates: Vec<CacheUpdate>,
 }
 
 /// Computes formatting changes for every indexed document whose formatted output differs from
@@ -149,45 +145,54 @@ pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
             continue; // known to be formatted already
         }
 
-        let formatted = match state.format_cache.get(hash) {
-            Some(cached) => cached.to_string(),
-            None => {
-                let computed =
-                    satz_core::formatter::format_document(source, &state.config.formatter);
-                cache_updates.push((hash, computed.clone()));
-                computed
-            }
+        // The text is borrowed from the cache, or computed here (and then moved into the cache
+        // update below, not copied).
+        let mut fresh: Option<String> = None;
+        let formatted: &str = match state.format_cache.get(hash) {
+            Some(cached) => cached,
+            None => &*fresh.insert(satz_core::formatter::format_document(
+                source,
+                &state.config.formatter,
+            )),
         };
 
         if formatted == source {
+            // Already formatted: remembered by its hash, without a copy of the text.
+            if fresh.is_some() {
+                cache_updates.push(CacheUpdate::Unchanged(hash));
+            }
             continue;
         }
 
         // The client is addressed with the URI it opened the document with.
         let uri = match open.and_then(|(_, open_doc)| open_doc.uri.parse::<Uri>().ok()) {
-            Some(uri) => uri,
+            Some(uri) => Some(uri),
             None => {
                 let doc_path = match state.vault_root() {
                     Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
                     _ => doc.path.clone(),
                 };
-                let Some(uri) = path_to_uri(&doc_path) else {
-                    continue;
-                };
-                uri
+                path_to_uri(&doc_path)
             }
         };
+        let Some(uri) = uri else {
+            // Nowhere to send it, but the text was worked out and is worth remembering.
+            if let Some(text) = fresh {
+                cache_updates.push(CacheUpdate::Formatted(hash, text));
+            }
+            continue;
+        };
 
-        let line_edits = line_diff(source, &formatted);
+        let line_edits = line_diff(source, formatted);
         let edits = line_edits_to_text_edits(line_index, &line_edits);
+        if let Some(text) = fresh {
+            cache_updates.push(CacheUpdate::Formatted(hash, text));
+        }
 
         changes.push(FormatChange {
             uri,
-            formatted,
             edits,
             version: open.map(|(_, open_doc)| open_doc.version),
-            source_hash: hash,
-            open_key: open.map(|(key, _)| key.clone()),
         });
     }
 
@@ -200,15 +205,15 @@ pub fn compute_format_changes(state: &SatzState) -> FormatWorkspaceResult {
 /// Like `build_workspace_edit`, as versioned document edits: an open document names the version its
 /// edits were computed against, so the client REJECTS them if the user has typed since, instead of
 // applying them to text they do not fit. Files on disk carry no version.
-pub fn build_workspace_edit_versioned(changes: &[FormatChange]) -> WorkspaceEdit {
+pub fn build_workspace_edit_versioned(changes: Vec<FormatChange>) -> WorkspaceEdit {
     let edits: Vec<TextDocumentEdit> = changes
-        .iter()
+        .into_iter()
         .map(|change| TextDocumentEdit {
             text_document: OptionalVersionedTextDocumentIdentifier {
-                uri: change.uri.clone(),
+                uri: change.uri,
                 version: change.version,
             },
-            edits: change.edits.iter().cloned().map(OneOf::Left).collect(),
+            edits: change.edits.into_iter().map(OneOf::Left).collect(),
         })
         .collect();
     WorkspaceEdit {
@@ -217,11 +222,12 @@ pub fn build_workspace_edit_versioned(changes: &[FormatChange]) -> WorkspaceEdit
     }
 }
 
-/// Builds the `WorkspaceEdit` to send via `workspace/applyEdit` from a set of format changes.
-pub fn build_workspace_edit(changes: &[FormatChange]) -> WorkspaceEdit {
+/// Builds the `WorkspaceEdit` to send via `workspace/applyEdit` from a set of format changes, which
+/// it takes over: nothing is copied.
+pub fn build_workspace_edit(changes: Vec<FormatChange>) -> WorkspaceEdit {
     let mut map: HashMap<Uri, Vec<TextEdit>> = HashMap::with_capacity(changes.len());
     for change in changes {
-        map.insert(change.uri.clone(), change.edits.clone());
+        map.insert(change.uri, change.edits);
     }
     WorkspaceEdit {
         changes: Some(map),
@@ -234,6 +240,7 @@ mod tests {
     use super::*;
     use satz_core::Index;
     use satz_core::parse_document;
+    use std::collections::HashMap;
     use std::path::Path;
 
     fn state_with(docs: Vec<satz_core::Document>) -> SatzState {
@@ -262,9 +269,22 @@ mod tests {
             "only the dirty document should need an edit"
         );
         assert!(result.changes[0].uri.as_str().ends_with("dirty.md"));
-        assert_eq!(result.changes[0].formatted, "Line 1\n\nLine 2\n");
-        // Both documents were freshly computed (cold cache), so both hashes get recorded.
+        assert_eq!(
+            crate::convert::apply_text_edits(
+                "Line 1   \n\n\n\nLine 2   ",
+                &result.changes[0].edits
+            ),
+            "Line 1\n\nLine 2\n"
+        );
+        // Both documents were freshly computed (cold cache), so both hashes get recorded: the
+        // dirty one with its formatted text, the clean one as "already formatted" without a copy.
         assert_eq!(result.cache_updates.len(), 2);
+        let unchanged = result
+            .cache_updates
+            .iter()
+            .filter(|u| matches!(u, CacheUpdate::Unchanged(_)))
+            .count();
+        assert_eq!(unchanged, 1);
     }
 
     #[test]
@@ -319,7 +339,7 @@ mod tests {
         let result = compute_format_changes(&state);
         assert_eq!(result.changes.len(), 2);
 
-        let edit = build_workspace_edit(&result.changes);
+        let edit = build_workspace_edit(result.changes);
         let map = edit.changes.expect("changes map expected");
         assert_eq!(map.len(), 2);
     }
@@ -354,7 +374,13 @@ mod tests {
 
         let result = compute_format_changes(&state);
         assert_eq!(result.changes.len(), 1);
-        assert_eq!(result.changes[0].formatted, "Line 1\n\nLine 2\n");
+        assert_eq!(
+            crate::convert::apply_text_edits(
+                "Line 1   \n\n\n\nLine 2   ",
+                &result.changes[0].edits
+            ),
+            "Line 1\n\nLine 2\n"
+        );
         // Served entirely from cache: nothing new to record.
         assert!(result.cache_updates.is_empty());
     }
@@ -366,9 +392,7 @@ mod tests {
 
         let first = compute_format_changes(&state);
         assert_eq!(first.cache_updates.len(), 1);
-        for (hash, formatted) in first.cache_updates {
-            state.format_cache.insert(hash, formatted);
-        }
+        state.apply_format_cache_updates(first.cache_updates);
 
         // Second call, same state (as if the client declined to apply / vault re-scanned):
         // every document should now be a cache hit.
@@ -585,14 +609,13 @@ mod tests {
         let result = compute_format_changes(&state);
         assert_eq!(result.changes.len(), 1);
         let change = &result.changes[0];
-        assert_eq!(change.formatted, "# A\n\ntyped just now\n\nmore\n");
         assert_eq!(change.version, Some(7));
-        assert_eq!(change.open_key.as_deref(), Some(uri.as_str()));
+        assert_eq!(change.uri.as_str(), uri);
         // The edits turn exactly the live text into the formatted text.
         let live = "# A\n\ntyped just now   \n\n\n\nmore   \n";
         assert_eq!(
             crate::convert::apply_text_edits(live, &change.edits),
-            change.formatted
+            "# A\n\ntyped just now\n\nmore\n"
         );
     }
 
@@ -609,7 +632,6 @@ mod tests {
         let result = compute_format_changes(&state);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].version, None);
-        assert_eq!(result.changes[0].open_key, None);
     }
 
     #[test]
@@ -617,10 +639,9 @@ mod tests {
         let live = "# A\r\n\r\ntyped   \r\n\r\n\r\n\r\nmore\r\n";
         let (state, _) = open_state("# A\n", live, 2);
         let change = &compute_format_changes(&state).changes[0];
-        assert_eq!(change.formatted, "# A\r\n\r\ntyped\r\n\r\nmore\r\n");
         assert_eq!(
             crate::convert::apply_text_edits(live, &change.edits),
-            change.formatted
+            "# A\r\n\r\ntyped\r\n\r\nmore\r\n"
         );
     }
 
@@ -642,7 +663,6 @@ mod tests {
             client_uri,
             "the open document's own URI"
         );
-        assert_eq!(change.open_key.as_deref(), Some(client_uri.as_str()));
     }
 
     #[test]
@@ -655,8 +675,9 @@ mod tests {
         ));
         let changes = compute_format_changes(&state).changes;
         assert_eq!(changes.len(), 2);
+        let again = compute_format_changes(&state).changes;
 
-        let edit = build_workspace_edit_versioned(&changes);
+        let edit = build_workspace_edit_versioned(changes);
         assert!(edit.changes.is_none(), "only the versioned form is used");
         let Some(DocumentChanges::Edits(edits)) = edit.document_changes else {
             panic!("expected versioned text document edits");
@@ -672,7 +693,7 @@ mod tests {
             assert!(e.edits.iter().all(|edit| matches!(edit, OneOf::Left(_))));
         }
         // The same text edits as the unversioned form, file for file.
-        let plain = build_workspace_edit(&changes).changes.unwrap();
+        let plain = build_workspace_edit(again).changes.unwrap();
         for e in &edits {
             let plain_edits = &plain[&e.text_document.uri];
             let versioned: Vec<_> = e
@@ -732,13 +753,294 @@ mod tests {
         let live = "# A\n\n\n\ntext   \n\n\nmore   \n";
         let (state, _) = open_state("# A\n", live, 2);
         let change = &compute_format_changes(&state).changes[0];
-        assert_eq!(
-            crate::convert::apply_text_edits(live, &change.edits),
-            change.formatted
-        );
+        let formatted = crate::convert::apply_text_edits(live, &change.edits);
+        assert_eq!(formatted, "# A\n\ntext\n\nmore\n");
         assert_ne!(
-            crate::convert::apply_text_edits(&change.formatted, &change.edits),
-            change.formatted
+            crate::convert::apply_text_edits(&formatted, &change.edits),
+            formatted
         );
+    }
+
+    // ---- what the workspace format sends and remembers must stay what it was ----
+
+    /// The result of the function as it was: a full formatted text in every change, and a copy of
+    /// every computed text for the cache.
+    struct RefChange {
+        uri: Uri,
+        formatted: String,
+        edits: Vec<TextEdit>,
+        version: Option<i32>,
+    }
+
+    struct RefResult {
+        changes: Vec<RefChange>,
+        cache_updates: Vec<(u64, String)>,
+    }
+
+    /// The function as it was before the change record was cut down to what is sent.
+    ///
+    fn reference_compute(state: &SatzState) -> RefResult {
+        tracing::debug!(
+            doc_count = state.index.doc_count(),
+            "compute_format_changes: starting"
+        );
+        if !state.formatting_allowed() {
+            return RefResult {
+                changes: Vec::new(),
+                cache_updates: Vec::new(),
+            };
+        }
+
+        let mut changes = Vec::new();
+        let mut cache_updates = Vec::new();
+
+        for doc in state.index.documents() {
+            // An open document is formatted from its LIVE buffer: the index holds the text of the last
+            // (debounced) reparse, which the user may already have typed past.
+            let open = state.open_doc_for_path(&doc.path);
+            let live_text: Option<String> = open.map(|(_, open_doc)| open_doc.rope.to_string());
+            let live_index: Option<satz_core::LineIndex> =
+                live_text.as_deref().map(satz_core::LineIndex::new);
+            let (source, hash, line_index) = match (&live_text, &live_index) {
+                (Some(text), Some(index)) => (text.as_str(), satz_core::content_hash(text), index),
+                _ => (doc.line_index.source(), doc.content_hash, &doc.line_index),
+            };
+            if state.format_cache.is_unchanged(hash) {
+                continue; // known to be formatted already
+            }
+
+            let formatted = match state.format_cache.get(hash) {
+                Some(cached) => cached.to_string(),
+                None => {
+                    let computed =
+                        satz_core::formatter::format_document(source, &state.config.formatter);
+                    cache_updates.push((hash, computed.clone()));
+                    computed
+                }
+            };
+
+            if formatted == source {
+                continue;
+            }
+
+            // The client is addressed with the URI it opened the document with.
+            let uri = match open.and_then(|(_, open_doc)| open_doc.uri.parse::<Uri>().ok()) {
+                Some(uri) => uri,
+                None => {
+                    let doc_path = match state.vault_root() {
+                        Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
+                        _ => doc.path.clone(),
+                    };
+                    let Some(uri) = path_to_uri(&doc_path) else {
+                        continue;
+                    };
+                    uri
+                }
+            };
+
+            let line_edits = line_diff(source, &formatted);
+            let edits = line_edits_to_text_edits(line_index, &line_edits);
+
+            changes.push(RefChange {
+                uri,
+                formatted,
+                edits,
+                version: open.map(|(_, open_doc)| open_doc.version),
+            });
+        }
+
+        RefResult {
+            changes,
+            cache_updates,
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const LINES: &[&str] = &[
+        "# Title",
+        "## Part   ",
+        "text   ",
+        "text",
+        "",
+        "",
+        "* item",
+        "- item",
+        "1. one",
+        "1. two",
+        "> quote  ",
+        "```",
+        "code   ",
+        "| a | b |",
+        "|---|---|",
+        "| 1 | 22 |",
+        "[[ link ]]   ",
+        "$x$ and `c`   ",
+        "İş ve ışık   ",
+    ];
+
+    fn random_text(rng: &mut Rng) -> String {
+        if rng.below(12) == 0 {
+            return String::new();
+        }
+        let lines: Vec<&str> = (0..1 + rng.below(9))
+            .map(|_| LINES[rng.below(LINES.len())])
+            .collect();
+        let eol = if rng.below(5) == 0 { "\r\n" } else { "\n" };
+        let mut text = lines.join(eol);
+        if rng.below(2) == 0 {
+            text.push_str(eol);
+        }
+        text
+    }
+
+    /// What one pass answers, in a form that does not depend on how the answer is stored:
+    /// per change its URI, version, edits and the text those edits make of `source`; per cache
+    /// update the hash and either `None` (already formatted) or the formatted text.
+    type Observed = (
+        Vec<(String, Option<i32>, Vec<TextEdit>, String)>,
+        Vec<(u64, Option<String>)>,
+    );
+
+    fn observe_reference(
+        result: &RefResult,
+        sources: &HashMap<String, String>,
+        by_hash: &HashMap<u64, String>,
+    ) -> Observed {
+        let changes = result
+            .changes
+            .iter()
+            .map(|c| {
+                let source = &sources[c.uri.as_str()];
+                let made = crate::convert::apply_text_edits(source, &c.edits);
+                assert_eq!(made, c.formatted, "the edits make the formatted text");
+                (c.uri.as_str().to_string(), c.version, c.edits.clone(), made)
+            })
+            .collect();
+        let updates = result
+            .cache_updates
+            .iter()
+            .map(|(hash, text)| {
+                (
+                    *hash,
+                    (by_hash.get(hash) != Some(text)).then(|| text.clone()),
+                )
+            })
+            .collect();
+        (changes, updates)
+    }
+
+    fn observe_now(
+        result: &FormatWorkspaceResult,
+        sources: &HashMap<String, String>,
+        by_hash: &HashMap<u64, String>,
+    ) -> Observed {
+        let changes = result
+            .changes
+            .iter()
+            .map(|c| {
+                let source = &sources[c.uri.as_str()];
+                (
+                    c.uri.as_str().to_string(),
+                    c.version,
+                    c.edits.clone(),
+                    crate::convert::apply_text_edits(source, &c.edits),
+                )
+            })
+            .collect();
+        let updates = result
+            .cache_updates
+            .iter()
+            .map(|update| match update {
+                CacheUpdate::Unchanged(hash) => (*hash, None),
+                CacheUpdate::Formatted(hash, text) => (*hash, Some(text.clone())),
+            })
+            .collect::<Vec<_>>();
+        let _ = by_hash;
+        (changes, updates)
+    }
+
+    #[test]
+    fn the_workspace_format_sends_and_remembers_what_it_always_did() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut passes, mut with_changes, mut with_open_buffers) = (0, 0, 0);
+        for round in 0..400 {
+            let notes = 1 + rng.below(12);
+            let mut docs = Vec::new();
+            let mut texts: Vec<(String, String)> = Vec::new();
+            for i in 0..notes {
+                let path = format!("d{}/n{i}.md", i % 3);
+                let text = random_text(&mut rng);
+                docs.push(parse_document(&text, Path::new(&path)));
+                texts.push((path, text));
+            }
+            let mut state = state_with(docs);
+            if rng.below(12) == 0 {
+                state.config.formatter.enabled = false;
+            }
+            // Without a vault root a note that is not open has no URI to be sent to: nothing is sent
+            // for it, but what was worked out is still remembered.
+            if rng.below(8) == 0 {
+                state.set_vault_root(None);
+            }
+
+            // Some notes are open, with a buffer that is ahead of the index.
+            let mut sources: HashMap<String, String> = HashMap::new();
+            for (path, indexed) in &texts {
+                let uri = uri_for(path);
+                let mut source = indexed.clone();
+                if rng.below(3) == 0 {
+                    let buffer = random_text(&mut rng);
+                    state.open_document(&uri, indexed, &root_dir().join(path), 1);
+                    let open = state.open_docs.get_mut(&uri).unwrap();
+                    open.rope = ropey::Rope::from_str(&buffer);
+                    open.version = 1 + rng.below(9) as i32;
+                    source = buffer;
+                    with_open_buffers += 1;
+                }
+                sources.insert(uri, source);
+            }
+            // The text of every hash, the way the cache pass used to look it up: what the index
+            // holds, and the buffer of every open note.
+            let mut by_hash: HashMap<u64, String> = state
+                .index
+                .documents()
+                .map(|d| (d.content_hash, d.line_index.source().to_string()))
+                .collect();
+            for open in state.open_docs.values() {
+                let text = open.rope.to_string();
+                by_hash.insert(satz_core::content_hash(&text), text);
+            }
+
+            // Three passes: nothing cached, then what the first pass remembered, then again.
+            for pass in 0..3 {
+                let now = compute_format_changes(&state);
+                let before = reference_compute(&state);
+                assert_eq!(
+                    observe_now(&now, &sources, &by_hash),
+                    observe_reference(&before, &sources, &by_hash),
+                    "round {round}, pass {pass}"
+                );
+                passes += 1;
+                with_changes += usize::from(!now.changes.is_empty());
+                state.apply_format_cache_updates(now.cache_updates);
+            }
+        }
+        assert!(passes >= 1200, "{passes} passes");
+        assert!(with_changes > 300, "{with_changes} passes had changes");
+        assert!(with_open_buffers > 500, "{with_open_buffers} open buffers");
     }
 }

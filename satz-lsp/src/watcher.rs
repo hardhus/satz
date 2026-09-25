@@ -865,10 +865,28 @@ mod tests {
 
     fn format_and_cache(state: &mut SatzState) -> Vec<String> {
         let result = crate::handlers::execute_command::compute_format_changes(state);
-        for (hash, formatted) in result.cache_updates {
-            state.format_cache.insert(hash, formatted);
+        for update in result.cache_updates {
+            match update {
+                crate::state::CacheUpdate::Unchanged(hash) => {
+                    state.format_cache.insert_unchanged(hash)
+                }
+                crate::state::CacheUpdate::Formatted(hash, formatted) => {
+                    state.format_cache.insert(hash, formatted)
+                }
+            }
         }
-        result.changes.into_iter().map(|c| c.formatted).collect()
+        // What each change makes of the (only) note.
+        let source = state
+            .index
+            .documents()
+            .next()
+            .map(|doc| doc.line_index.source().to_string())
+            .unwrap_or_default();
+        result
+            .changes
+            .iter()
+            .map(|c| crate::convert::apply_text_edits(&source, &c.edits))
+            .collect()
     }
 
     #[test]

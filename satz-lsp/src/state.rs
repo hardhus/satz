@@ -101,6 +101,16 @@ enum CachedFormat {
     Changed(String),
 }
 
+/// What a workspace-format pass learned about one text, for the cache: that the text is already
+/// formatted (nothing else is kept), or what it formats to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheUpdate {
+    /// The text with this content hash is already formatted.
+    Unchanged(u64),
+    /// The text with this content hash formats to this text.
+    Formatted(u64, String),
+}
+
 /// Cache mapping a document's content hash to what formatting it produced, used by
 /// `satz.formatWorkspace` to skip reformatting files whose content has not changed since the last
 /// workspace-format call. Already formatted documents are remembered without a copy of their text.
@@ -413,35 +423,24 @@ impl SatzState {
 
     /// Records what a workspace-format pass computed. Entries of documents that no longer exist
     /// (edited or deleted notes) are dropped first, so the cache capacity always goes to current
-    /// content; a result equal to its source is remembered as "already formatted" without a copy.
-    pub fn apply_format_cache_updates(&mut self, updates: Vec<(u64, String)>) {
-        // The text of an open document is its buffer, which may be newer than what the index holds.
-        let buffers: Vec<(u64, String)> = self
-            .open_docs
-            .values()
-            .map(|open| {
-                let text = open.rope.to_string();
-                (satz_core::content_hash(&text), text)
-            })
-            .collect();
+    /// content; a text that is already formatted is remembered as such without a copy.
+    pub fn apply_format_cache_updates(&mut self, updates: Vec<CacheUpdate>) {
+        // Every text a note has now: what the index holds, and, for an open note, its buffer (which
+        // may be newer than the index). Only the hashes are kept.
         let mut live: std::collections::HashSet<u64> =
             self.index.documents().map(|d| d.content_hash).collect();
-        live.extend(buffers.iter().map(|(hash, _)| *hash));
+        live.extend(
+            self.open_docs
+                .values()
+                .map(|open| satz_core::content_hash(&open.rope.to_string())),
+        );
         self.format_cache.retain_hashes(&live);
-        let mut sources: HashMap<u64, &str> = self
-            .index
-            .documents()
-            .map(|d| (d.content_hash, d.line_index.source()))
-            .collect();
-        sources.extend(buffers.iter().map(|(hash, text)| (*hash, text.as_str())));
-        for (hash, formatted) in updates {
-            if sources
-                .get(&hash)
-                .is_some_and(|source| *source == formatted)
-            {
-                self.format_cache.insert_unchanged(hash);
-            } else {
-                self.format_cache.insert(hash, formatted);
+        for update in updates {
+            match update {
+                CacheUpdate::Unchanged(hash) => self.format_cache.insert_unchanged(hash),
+                CacheUpdate::Formatted(hash, formatted) => {
+                    self.format_cache.insert(hash, formatted)
+                }
             }
         }
     }
@@ -1482,7 +1481,10 @@ gitignore = \"always\"
             1,
             "the dirty note still needs its edit"
         );
-        assert_eq!(again.changes[0].formatted, "Line 1\n\nLine 2\n");
+        assert_eq!(
+            crate::convert::apply_text_edits(DIRTY_A, &again.changes[0].edits),
+            "Line 1\n\nLine 2\n"
+        );
         assert!(again.cache_updates.is_empty());
         assert_eq!(state.format_cache.len(), 2);
     }
