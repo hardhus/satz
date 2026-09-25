@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::model::{DocId, Document, Link, LinkKind};
 use crate::slug::fold_key;
 
@@ -509,14 +511,23 @@ impl Index {
     /// Resolves `id`'s outgoing links against the current lookup tables and records them in
     /// `outgoing` + `backlinks`.
     fn add_doc_edges(&mut self, id: &DocId) {
+        let targets = self.doc_targets(id);
+        self.record_edges(id, targets);
+    }
+
+    /// The notes `id`'s links resolve to against the current lookup tables (each once).
+    fn doc_targets(&self, id: &DocId) -> HashSet<DocId> {
         let Some(doc) = self.docs.get(id) else {
-            return;
+            return HashSet::new();
         };
-        let targets: HashSet<DocId> = doc
-            .links
+        doc.links
             .iter()
             .filter_map(|link| self.link_target(doc, link))
-            .collect();
+            .collect()
+    }
+
+    /// Records `targets` as the notes `id` links to: in `outgoing`, and `id` in each one's `backlinks`.
+    fn record_edges(&mut self, id: &DocId, targets: HashSet<DocId>) {
         for target in &targets {
             self.backlinks
                 .entry(target.clone())
@@ -551,6 +562,12 @@ impl Index {
     /// Conflict rules (unchanged from the original `build`): the first document (by `DocId`) wins
     /// a stem; the last one wins a title/alias.
     pub(crate) fn rebuild_derived(&mut self, log_conflicts: bool) {
+        self.rebuild_derived_with(log_conflicts, rebuild_is_parallel(self.docs.len()));
+    }
+
+    /// `rebuild_derived`, with the choice of sharing the work between cores made by the caller (a
+    /// test asks for both and compares them). The tables come out the same either way.
+    pub(crate) fn rebuild_derived_with(&mut self, log_conflicts: bool, parallel: bool) {
         self.by_path.clear();
         self.by_path_folded.clear();
         self.by_stem.clear();
@@ -612,9 +629,20 @@ impl Index {
             }
         }
 
-        // Pass 2: resolve links.
-        for id in &ids {
-            self.add_doc_edges(id);
+        // Pass 2: resolve links. Which note each note's links reach only reads the tables that pass
+        // 1 filled, so it is worked out for all notes at once (on every core, for a vault big
+        // enough to make that worth it); what is recorded for it is then written note after note,
+        // in the order of `ids`.
+        let targets: Vec<HashSet<DocId>> = if parallel {
+            #[cfg(test)]
+            PARALLEL_REBUILDS.with(|n| n.set(n.get() + 1));
+            let this: &Index = self;
+            ids.par_iter().map(|id| this.doc_targets(id)).collect()
+        } else {
+            ids.iter().map(|id| self.doc_targets(id)).collect()
+        };
+        for (id, targets) in ids.iter().zip(targets) {
+            self.record_edges(id, targets);
         }
         self.revision += 1;
     }
@@ -733,6 +761,23 @@ fn strip_md_extension(name: &str) -> &str {
 }
 
 /// The key of `by_path_folded`: `/`-separated, without `.md`, case- and Unicode-folded.
+/// From this many notes on, rebuilding the derived tables shares the work between cores. Below
+/// it the threads cost more than they save: on a 4-core (8 threads) laptop, sequential against
+/// shared, best of many rounds: 50 notes 0.79x (slower), 100 notes 0.96x, 200 notes 1.59x, 400 notes
+/// 2.5x.
+const PARALLEL_REBUILD_FROM: usize = 200;
+
+#[cfg(test)]
+thread_local! {
+    /// How many rebuilds on this thread shared the work between cores (for the tests).
+    static PARALLEL_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a vault of `notes` notes is rebuilt on all cores.
+fn rebuild_is_parallel(notes: usize) -> bool {
+    notes >= PARALLEL_REBUILD_FROM
+}
+
 pub(crate) fn fold_path_key(path: &str) -> String {
     fold_key(strip_md_extension(&path.replace('\\', "/")))
 }
@@ -1405,5 +1450,351 @@ mod tests {
             }
         }
         assert_eq!(checked, 4 * 9 * 4 * 4);
+    }
+
+    // ---- rebuilding the derived tables: the same tables as the sequential rebuild made (4.2) ----
+
+    /// `rebuild_derived` as it was: one note after the other, tables filled and then links resolved.
+    ///
+    fn reference_rebuild(index: &mut Index, log_conflicts: bool) {
+        index.by_path.clear();
+        index.by_path_folded.clear();
+        index.by_stem.clear();
+        index.by_title_alias.clear();
+        index.backlinks.clear();
+        index.tags.clear();
+        index.outgoing.clear();
+
+        let mut ids: Vec<DocId> = index.docs.keys().cloned().collect();
+        ids.sort();
+
+        // Pass 1: lookup tables + tags, so pass 2 sees a complete index.
+        for id in &ids {
+            let doc = &index.docs[id];
+            let normalized_path = PathBuf::from(doc.path.to_string_lossy().replace('\\', "/"));
+            index
+                .by_path_folded
+                .entry(fold_path_key(&normalized_path.to_string_lossy()))
+                .or_insert_with(|| id.clone());
+            index.by_path.insert(normalized_path, id.clone());
+
+            let stem_key = doc
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(fold_key)
+                .unwrap_or_default();
+            if !stem_key.is_empty() {
+                match index.by_stem.entry(stem_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        if log_conflicts {
+                            tracing::warn!(
+                                "stem conflict: '{}' (keeping {:?}, ignoring {:?})",
+                                e.key(),
+                                e.get(),
+                                id
+                            );
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(id.clone());
+                    }
+                }
+            }
+
+            let title_and_aliases = std::iter::once(fold_key(&doc.title))
+                .chain(doc.frontmatter.aliases.iter().map(|a| fold_key(a)));
+            for key in title_and_aliases {
+                if log_conflicts && index.by_title_alias.get(&key).is_some_and(|o| o != id) {
+                    tracing::warn!(
+                        "title/alias conflict: '{}' (overwriting previous entry)",
+                        key
+                    );
+                }
+                index.by_title_alias.insert(key, id.clone());
+            }
+
+            for tag_key in Index::tag_keys(doc) {
+                index.tags.entry(tag_key).or_default().insert(id.clone());
+            }
+        }
+
+        // Pass 2: resolve links.
+        for id in &ids {
+            index.add_doc_edges(id);
+        }
+        index.revision += 1;
+    }
+
+    struct T42Rng(u64);
+
+    impl T42Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<'a>(&mut self, of: &[&'a str]) -> &'a str {
+            of[self.below(of.len())]
+        }
+    }
+
+    const T42_STEMS: &[&str] = &[
+        "alpha", "Alpha", "beta", "gamma", "Nota", "nota", "İş", "ışık", "delta", "2.0121", "x",
+        "index",
+    ];
+    const T42_FOLDERS: &[&str] = &["", "a/", "b/", "a/b/", "A/", "tlp/", "Books/"];
+    const T42_TITLES: &[&str] = &[
+        "Alpha",
+        "alpha",
+        "Beta",
+        "Gamma Delta",
+        "Nota",
+        "İş Notu",
+        "ışık",
+        "Same Title",
+        "same title",
+    ];
+    const T42_TAGS: &[&str] = &["rust", "Rust", "proje/x", "proje/y", "İş", "iş", "a-b"];
+
+    /// A vault of `n` notes made to clash: the same file name in different folders, names that differ
+    /// only in case, titles and aliases that are the same or are other notes' names, and links to all
+    /// of these.
+    fn t42_docs(rng: &mut T42Rng, n: usize) -> Vec<Document> {
+        let mut docs: Vec<Document> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for i in 0..n {
+            let path = format!(
+                "{}{}{}.md",
+                rng.pick(T42_FOLDERS),
+                rng.pick(T42_STEMS),
+                if rng.below(3) == 0 {
+                    i.to_string()
+                } else {
+                    String::new()
+                }
+            );
+            // The same path twice is one note; a path that differs only in case is another.
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let mut text = String::new();
+            if rng.below(2) == 0 {
+                text.push_str("---\n");
+                if rng.below(2) == 0 {
+                    text.push_str(&format!("title: {}\n", rng.pick(T42_TITLES)));
+                }
+                if rng.below(3) == 0 {
+                    text.push_str(&format!(
+                        "aliases: [{}, {}]\n",
+                        rng.pick(T42_TITLES),
+                        rng.pick(T42_STEMS)
+                    ));
+                }
+                if rng.below(2) == 0 {
+                    text.push_str(&format!(
+                        "tags: [{}, {}]\n",
+                        rng.pick(T42_TAGS),
+                        rng.pick(T42_TAGS)
+                    ));
+                }
+                text.push_str("---\n");
+            }
+            text.push_str(&format!("# {}\n\n", rng.pick(T42_TITLES)));
+            for _ in 0..rng.below(7) {
+                match rng.below(6) {
+                    0 => text.push_str(&format!("[[{}]] ", rng.pick(T42_TITLES))),
+                    1 => text.push_str(&format!("[[{}]] ", rng.pick(T42_STEMS))),
+                    2 => text.push_str(&format!(
+                        "[[{}{}]] ",
+                        rng.pick(T42_FOLDERS),
+                        rng.pick(T42_STEMS)
+                    )),
+                    3 => text.push_str(&format!(
+                        "[x]({}{}.md) ",
+                        rng.pick(&["", "../", "./", "a/", "../a/"]),
+                        rng.pick(T42_STEMS)
+                    )),
+                    4 => text.push_str(&format!("[[{}#Head]] ", rng.pick(T42_TITLES))),
+                    _ => text.push_str(&format!("#{} ", rng.pick(T42_TAGS))),
+                }
+            }
+            docs.push(doc(&path, &text));
+        }
+        docs
+    }
+
+    /// The tables the sequential rebuild makes for `docs`.
+    fn t42_reference_index(docs: &[Document], log_conflicts: bool) -> Index {
+        let mut index = Index::default();
+        for d in docs {
+            index.docs.insert(d.id.clone(), d.clone());
+        }
+        reference_rebuild(&mut index, log_conflicts);
+        index
+    }
+
+    #[test]
+    fn the_derived_tables_are_the_same_as_the_sequential_rebuild_made_them() {
+        let mut rng = T42Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut vaults, mut biggest, mut clashes) = (0, 0, 0usize);
+        for round in 0..260 {
+            // Small vaults, and some past the size where the work is shared between cores.
+            let n = match round % 20 {
+                0 => 300 + rng.below(500),
+                1 => 200 + rng.below(30),
+                _ => 2 + rng.below(40),
+            };
+            let docs = t42_docs(&mut rng, n);
+            let built = Index::build(docs.clone());
+            let reference = t42_reference_index(&docs, true);
+            assert_eq!(
+                built.snapshot(),
+                reference.snapshot(),
+                "round {round}: {} notes",
+                docs.len()
+            );
+            assert_eq!(
+                built.revision(),
+                reference.revision(),
+                "round {round}: revision"
+            );
+            vaults += 1;
+            biggest = biggest.max(docs.len());
+            clashes += docs.len().saturating_sub(built.by_stem.len());
+        }
+        assert_eq!(vaults, 260);
+        assert!(biggest >= 300, "the biggest vault had {biggest} notes");
+        assert!(
+            clashes > 500,
+            "{clashes} file names shared by several notes"
+        );
+    }
+
+    #[test]
+    fn rebuilding_again_gives_the_same_tables_every_time() {
+        let mut rng = T42Rng(0x0123_4567_89AB_CDEF);
+        for round in 0..30 {
+            let n = 250 + rng.below(200);
+            let docs = t42_docs(&mut rng, n);
+            let mut index = Index::build(docs);
+            let first = index.snapshot();
+            let revision = index.revision();
+            for again in 1..=4 {
+                index.rebuild_derived(false);
+                assert_eq!(index.snapshot(), first, "round {round}, rebuild {again}");
+                assert_eq!(index.revision(), revision + again);
+            }
+        }
+    }
+
+    #[test]
+    fn the_tables_stay_the_same_after_changes_that_rebuild_them() {
+        // A new note, a note removed and a note whose name changed each rebuild every table.
+        let mut rng = T42Rng(0xDEAD_BEEF_CAFE_F00D);
+        for round in 0..40 {
+            let n = 220 + rng.below(80);
+            let mut docs = t42_docs(&mut rng, n);
+            let mut index = Index::build(docs.clone());
+            for step in 0..3 {
+                match rng.below(3) {
+                    0 => {
+                        let new = doc(
+                            &format!("added-{round}-{step}.md"),
+                            &format!(
+                                "# {}\n\n[[{}]]\n",
+                                rng.pick(T42_TITLES),
+                                rng.pick(T42_TITLES)
+                            ),
+                        );
+                        docs.retain(|d| d.id != new.id);
+                        docs.push(new.clone());
+                        index.replace_doc(new);
+                    }
+                    1 if !docs.is_empty() => {
+                        let gone = docs.remove(rng.below(docs.len()));
+                        index.remove_doc(&gone.id);
+                    }
+                    _ if !docs.is_empty() => {
+                        let at = rng.below(docs.len());
+                        let text = format!("---\ntitle: {}\n---\n# X\n", rng.pick(T42_TITLES));
+                        let renamed = doc(docs[at].path.to_str().unwrap(), &text);
+                        docs[at] = renamed.clone();
+                        index.replace_doc(renamed);
+                    }
+                    _ => {}
+                }
+                assert_eq!(
+                    index.snapshot(),
+                    t42_reference_index(&docs, false).snapshot(),
+                    "round {round}, step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sharing_the_work_between_cores_or_not_gives_the_same_tables() {
+        let mut rng = T42Rng(0xFEED_FACE_0BAD_F00D);
+        for round in 0..80 {
+            let n = if round % 4 == 0 {
+                250 + rng.below(400)
+            } else {
+                2 + rng.below(60)
+            };
+            let docs = t42_docs(&mut rng, n);
+            let tables = |parallel: bool| {
+                let mut index = Index::default();
+                for d in &docs {
+                    index.docs.insert(d.id.clone(), d.clone());
+                }
+                index.rebuild_derived_with(false, parallel);
+                (index.snapshot(), index.revision())
+            };
+            let alone = tables(false);
+            assert_eq!(tables(true), alone, "round {round}: {} notes", docs.len());
+            assert_eq!(
+                alone.0,
+                t42_reference_index(&docs, false).snapshot(),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vault_is_rebuilt_on_all_cores_from_the_size_where_that_pays() {
+        assert!(!rebuild_is_parallel(0));
+        assert!(!rebuild_is_parallel(PARALLEL_REBUILD_FROM - 1));
+        assert!(rebuild_is_parallel(PARALLEL_REBUILD_FROM));
+        assert!(rebuild_is_parallel(10_000));
+    }
+
+    #[test]
+    fn big_vaults_are_rebuilt_on_all_cores_and_small_ones_are_not() {
+        let mut rng = T42Rng(0x1357_9BDF_2468_ACE0);
+        let count = || PARALLEL_REBUILDS.with(|n| n.get());
+        let before = count();
+        let small = Index::build(t42_docs(&mut rng, 20));
+        assert!(small.docs.len() < PARALLEL_REBUILD_FROM);
+        assert_eq!(count(), before, "a small vault is rebuilt on one core");
+
+        let big = Index::build(t42_docs(&mut rng, 700));
+        assert!(
+            big.docs.len() >= PARALLEL_REBUILD_FROM,
+            "{} notes",
+            big.docs.len()
+        );
+        assert_eq!(count(), before + 1, "a big vault is rebuilt on all cores");
+
+        // Every rebuild counts by the size of the vault at that moment.
+        let mut big = big;
+        big.replace_doc(doc("brand-new-note.md", "# Brand new\n"));
+        assert_eq!(count(), before + 2);
     }
 }
