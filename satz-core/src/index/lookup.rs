@@ -816,7 +816,13 @@ impl Index {
             self.rebuild_derived(false);
             return;
         }
+        self.replace_doc_keeping_identity(new_doc);
+    }
 
+    /// `replace_doc` for a document that is already in the index and keeps every key other notes
+    /// can link it by: only its own outgoing edges and its tags are refreshed.
+    fn replace_doc_keeping_identity(&mut self, new_doc: Document) {
+        let id = new_doc.id.clone();
         self.remove_doc_edges(&id);
         for tag_key in Self::tag_keys(&self.docs[&id]) {
             if let Some(set) = self.tags.get_mut(&tag_key) {
@@ -837,25 +843,60 @@ impl Index {
     /// Removes several documents with ONE rebuild of the derived tables (removing them one by one
     /// rebuilds after each, which is quadratic for a whole folder). The result is the same.
     pub fn remove_docs(&mut self, ids: &[DocId]) {
-        let mut removed = false;
-        for id in ids {
-            removed |= self.docs.remove(id).is_some();
-        }
-        if removed {
-            self.rebuild_derived(false);
-        }
+        self.apply_changes(ids, Vec::new());
     }
 
     /// Inserts or replaces several documents with ONE rebuild of the derived tables; the same result
     /// as calling `replace_doc` for each.
     pub fn replace_docs(&mut self, docs: Vec<Document>) {
-        if docs.is_empty() {
-            return;
+        self.apply_changes(&[], docs);
+    }
+
+    /// Takes the documents `remove` out of the index and puts `upsert` into it as one change: the
+    /// result is what `remove_doc` for each of `remove` and then `replace_doc` for each of `upsert`
+    /// would leave (a document that comes twice is the last one), with the derived tables rebuilt
+    /// once at most. Not at all when nothing is taken out and every document put in is already
+    /// there under every key other notes link it by (the common case of a batch of edits): then
+    /// only the edges and tags of those documents are refreshed.
+    ///
+    /// Returns whether the index changed: false for a batch that removes nothing that is there and
+    /// puts nothing in.
+    pub fn apply_changes(&mut self, remove: &[DocId], upsert: Vec<Document>) -> bool {
+        // The last of a document that comes more than once is the one that stays.
+        let mut last: HashMap<DocId, usize> = HashMap::with_capacity(upsert.len());
+        for (at, doc) in upsert.iter().enumerate() {
+            last.insert(doc.id.clone(), at);
         }
-        for doc in docs {
+        let upsert: Vec<Document> = upsert
+            .into_iter()
+            .enumerate()
+            .filter(|(at, doc)| last[&doc.id] == *at)
+            .map(|(_, doc)| doc)
+            .collect();
+
+        let removes_something = remove.iter().any(|id| self.docs.contains_key(id));
+        let keeps_identity = |index: &Index, doc: &Document| {
+            index
+                .docs
+                .get(&doc.id)
+                .is_some_and(|old| old.identity_keys() == doc.identity_keys())
+        };
+        if !removes_something && upsert.iter().all(|doc| keeps_identity(self, doc)) {
+            let changed = !upsert.is_empty();
+            for doc in upsert {
+                self.replace_doc_keeping_identity(doc);
+            }
+            return changed;
+        }
+
+        for id in remove {
+            self.docs.remove(id);
+        }
+        for doc in upsert {
             self.docs.insert(doc.id.clone(), doc);
         }
         self.rebuild_derived(false);
+        true
     }
 
     /// Removes a document from the index.
@@ -2406,5 +2447,271 @@ mod tests {
             nowhere >= 2 * 4 * 3 && elsewhere > 10,
             "{nowhere} and {elsewhere}"
         );
+    }
+
+    // ---- several documents in one change (5.1) ----
+
+    /// A batch as a watcher gets it from a burst of file events: notes that changed, appeared,
+    /// went, went that were never there, came twice, and went and came back.
+    struct T51Batch {
+        remove: Vec<DocId>,
+        upsert: Vec<Document>,
+    }
+
+    /// The text of `doc` with something added at the end: what it is called by does not change.
+    fn t51_edited(doc: &Document, rng: &mut T42Rng) -> Document {
+        let text = format!(
+            "{}\n\nmore [[{}]] and #{}\n",
+            doc.line_index.source(),
+            rng.pick(T42_TITLES),
+            rng.pick(T42_TAGS)
+        );
+        parse_document(&text, &doc.path)
+    }
+
+    /// The same note under another title: what links to it by name elsewhere changes.
+    fn t51_retitled(doc: &Document, rng: &mut T42Rng) -> Document {
+        let text = format!(
+            "---\ntitle: {}\n---\n# X\n\n[[{}]]\n",
+            rng.pick(T42_TITLES),
+            rng.pick(T42_STEMS)
+        );
+        parse_document(&text, &doc.path)
+    }
+
+    fn t51_some<'a>(docs: &'a [Document], rng: &mut T42Rng) -> &'a Document {
+        &docs[rng.below(docs.len())]
+    }
+
+    /// `kinds` says which of the sorts of change the batch may hold: 0 an edit, 1 a retitle, 2 a
+    /// new note, 3 a removal, 4 a removal of something that is not there, 5 an edit that comes
+    /// twice, 6 a removal and a new version of the same note.
+    fn t51_batch(docs: &[Document], rng: &mut T42Rng, round: usize, kinds: &[usize]) -> T51Batch {
+        let mut batch = T51Batch {
+            remove: Vec::new(),
+            upsert: Vec::new(),
+        };
+        for step in 0..1 + rng.below(9) {
+            let kind = kinds[rng.below(kinds.len())];
+            match kind {
+                0 => batch.upsert.push(t51_edited(t51_some(docs, rng), rng)),
+                1 => batch.upsert.push(t51_retitled(t51_some(docs, rng), rng)),
+                2 => batch.upsert.push(doc(
+                    &format!("new-{round}-{step}.md"),
+                    &format!(
+                        "# {}\n\n[[{}]]\n",
+                        rng.pick(T42_TITLES),
+                        rng.pick(T42_TITLES)
+                    ),
+                )),
+                3 => batch.remove.push(t51_some(docs, rng).id.clone()),
+                4 => batch
+                    .remove
+                    .push(DocId::new(format!("never-{round}-{step}.md"))),
+                5 => {
+                    let d = t51_some(docs, rng).clone();
+                    let (first, second) = (t51_edited(&d, rng), t51_retitled(&d, rng));
+                    if rng.below(2) == 0 {
+                        batch.upsert.extend([first, second]);
+                    } else {
+                        batch.upsert.extend([second, first]);
+                    }
+                }
+                _ => {
+                    let d = t51_some(docs, rng).clone();
+                    batch.remove.push(d.id.clone());
+                    batch.upsert.push(t51_edited(&d, rng));
+                }
+            }
+        }
+        batch
+    }
+
+    /// What `remove_doc` for each removal and then `replace_doc` for each note does: what a batch is
+    /// meant to be the same as.
+    fn t51_one_by_one(index: &mut Index, batch: &T51Batch) {
+        for id in &batch.remove {
+            index.remove_doc(id);
+        }
+        for doc in &batch.upsert {
+            index.replace_doc(doc.clone());
+        }
+    }
+
+    fn t51_notes(index: &Index) -> Vec<(String, u64)> {
+        let mut notes: Vec<(String, u64)> = index
+            .docs
+            .values()
+            .map(|d| (d.id.as_str().to_string(), d.content_hash))
+            .collect();
+        notes.sort();
+        notes
+    }
+
+    #[test]
+    fn a_batch_of_changes_leaves_what_the_changes_one_by_one_leave() {
+        let mut rng = T42Rng(0x5151_5151_A5A5_0001);
+        let (mut by_rebuild, mut by_edges, mut nothing) = (0, 0, 0);
+        for round in 0..300 {
+            let n = if round % 3 == 0 {
+                230 + rng.below(60)
+            } else {
+                3 + rng.below(40)
+            };
+            let docs = t42_docs(&mut rng, n);
+            if docs.is_empty() {
+                continue;
+            }
+            let kinds: &[usize] = match round % 5 {
+                0 => &[0],
+                1 => &[0, 4],
+                2 => &[0, 1, 2, 3, 4, 5, 6],
+                3 => &[2, 3, 6],
+                _ => &[4],
+            };
+            let batch = t51_batch(&docs, &mut rng, round, kinds);
+
+            let mut together = Index::build(docs.clone());
+            let mut one_by_one = Index::build(docs.clone());
+            let before = together.revision();
+            let changed = together.apply_changes(&batch.remove, batch.upsert.clone());
+            t51_one_by_one(&mut one_by_one, &batch);
+
+            assert_eq!(together.snapshot(), one_by_one.snapshot(), "round {round}");
+            assert_eq!(
+                t51_notes(&together),
+                t51_notes(&one_by_one),
+                "round {round}"
+            );
+            // What the tables hold is also what a rebuild from the notes makes.
+            let notes: Vec<Document> = together.docs.values().cloned().collect();
+            assert_eq!(
+                together.snapshot(),
+                t42_reference_index(&notes, false).snapshot(),
+                "round {round}"
+            );
+            let touched = together.revision() - before;
+            assert_eq!(changed, touched > 0, "round {round}");
+            match touched {
+                0 => nothing += 1,
+                1 => by_rebuild += 1,
+                _ => by_edges += 1,
+            }
+        }
+        assert!(
+            by_rebuild > 60 && by_edges > 30 && nothing > 20,
+            "{by_rebuild} rebuilt, {by_edges} edited in place, {nothing} did nothing"
+        );
+    }
+
+    #[test]
+    fn edits_that_keep_what_notes_are_called_by_are_made_in_place_and_others_rebuild_once() {
+        let mut rng = T42Rng(0x5151_5151_A5A5_0002);
+        let docs = t42_docs(&mut rng, 900);
+        let n = docs.len();
+        assert!(n >= 260, "{n}");
+
+        // Edits: every note is refreshed by itself, the tables are not rebuilt.
+        let mut index = Index::build(docs.clone());
+        let before = index.revision();
+        let edits: Vec<Document> = docs
+            .iter()
+            .take(250)
+            .map(|d| t51_edited(d, &mut rng))
+            .collect();
+        assert!(index.apply_changes(&[], edits.clone()));
+        assert_eq!(index.revision(), before + 250);
+        let mut expected = Index::build(docs.clone());
+        for d in edits {
+            expected.replace_doc(d);
+        }
+        assert_eq!(index.snapshot(), expected.snapshot());
+
+        // One note that changes name among them: one rebuild for all of it.
+        let mut index = Index::build(docs.clone());
+        let before = index.revision();
+        let mut upsert: Vec<Document> = docs
+            .iter()
+            .take(250)
+            .map(|d| t51_edited(d, &mut rng))
+            .collect();
+        upsert[100] = t51_retitled(&docs[100], &mut rng);
+        if docs[100].identity_keys() == upsert[100].identity_keys() {
+            upsert[100] = parse_document(
+                "---\ntitle: a title nobody had\n---\n# X\n",
+                &docs[100].path,
+            );
+        }
+        assert!(index.apply_changes(&[], upsert.clone()));
+        assert_eq!(index.revision(), before + 1);
+        let mut expected = Index::build(docs.clone());
+        for d in upsert {
+            expected.replace_doc(d);
+        }
+        assert_eq!(index.snapshot(), expected.snapshot());
+
+        // A whole folder gone and another one in: one rebuild, not two.
+        let mut index = Index::build(docs.clone());
+        let before = index.revision();
+        let gone: Vec<DocId> = docs.iter().take(100).map(|d| d.id.clone()).collect();
+        let fresh: Vec<Document> = (0..100)
+            .map(|i| doc(&format!("folder/n{i}.md"), &format!("# Fresh {i}\n")))
+            .collect();
+        assert!(index.apply_changes(&gone, fresh));
+        assert_eq!(index.revision(), before + 1);
+        assert_eq!(index.doc_count(), n - 100 + 100);
+    }
+
+    #[test]
+    fn a_batch_that_changes_nothing_says_so_and_leaves_the_index_alone() {
+        let mut rng = T42Rng(0x5151_5151_A5A5_0003);
+        let docs = t42_docs(&mut rng, 30);
+        let mut index = Index::build(docs);
+        let (snapshot, revision) = (index.snapshot(), index.revision());
+
+        assert!(!index.apply_changes(&[], Vec::new()));
+        assert!(!index.apply_changes(
+            &[DocId::new("never.md"), DocId::new("nor/this.md")],
+            Vec::new()
+        ));
+        index.remove_docs(&[DocId::new("never.md")]);
+        index.replace_docs(Vec::new());
+        assert_eq!((index.snapshot(), index.revision()), (snapshot, revision));
+    }
+
+    #[test]
+    fn the_last_version_of_a_note_that_comes_twice_is_the_one_that_stays() {
+        let first = doc("a.md", "# First\n");
+        let second = doc("a.md", "# Second\n\n[[b]]\n");
+        let other = doc("b.md", "# B\n");
+        for order in [
+            [first.clone(), second.clone()],
+            [second.clone(), first.clone()],
+        ] {
+            let mut index = Index::build(vec![other.clone()]);
+            assert!(index.apply_changes(&[], order.to_vec()));
+            let last = order[1].clone();
+            let mut expected = Index::build(vec![other.clone()]);
+            expected.replace_doc(order[0].clone());
+            expected.replace_doc(last.clone());
+            assert_eq!(index.snapshot(), expected.snapshot());
+            assert_eq!(
+                index.get_doc(&last.id).unwrap().content_hash,
+                last.content_hash
+            );
+        }
+    }
+
+    #[test]
+    fn the_removal_of_a_note_comes_before_the_notes_that_are_put_in() {
+        let a = doc("a.md", "# A\n");
+        let mut index = Index::build(vec![a.clone(), doc("b.md", "# B\n")]);
+        let again = doc("a.md", "# A again\n");
+        assert!(index.apply_changes(std::slice::from_ref(&a.id), vec![again.clone()]));
+        assert_eq!(
+            index.get_doc(&a.id).unwrap().content_hash,
+            again.content_hash
+        );
+        assert_eq!(index.doc_count(), 2);
     }
 }
