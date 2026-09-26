@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use tokio::sync::{RwLock, mpsc};
+use tokio::time::Instant;
 use tower_lsp_server::Client;
 
 use crate::state::SatzState;
@@ -93,36 +95,57 @@ pub fn spawn_watcher(
 ) -> WatcherHandle {
     tracing::debug!(vault_root = %vault_root.display(), "watcher: spawning");
     let handle = WatcherHandle::default();
-    let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
+    let (tx, rx) = mpsc::unbounded_channel::<PathBuf>();
 
     // 1. The file system thread
     spawn_notify_thread(vault_root.clone(), tx, handle.clone());
 
     // 2. Debounce and process events in tokio runtime
-    tokio::spawn(async move {
-        let debounce_duration = Duration::from_millis(200);
-        let mut pending = Debouncer::default();
+    tokio::spawn(run_debounce_loop(
+        rx,
+        vault_root,
+        state,
+        client,
+        DEBOUNCE_WINDOW,
+        DEBOUNCE_TICK,
+    ));
+    handle
+}
 
-        loop {
-            tokio::select! {
-                message = rx.recv() => match message {
-                    Some(path) => pending.push(path, Instant::now()),
-                    // The file system thread has ended (stopped, or it could not watch): so does this.
-                    None => break,
-                },
-                _ = tokio::time::sleep(Duration::from_millis(50)), if !pending.is_empty() => {
-                    let now = Instant::now();
-                    for path in pending.take_ready(now, debounce_duration) {
-                        // A change that arrives before the first index is complete waits for it.
-                        if process_file_event(&path, &vault_root, &state, &client).await {
-                            pending.push(path, Instant::now());
-                        }
-                    }
+/// How long a path must be quiet before its event is applied.
+const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
+/// How often the waiting paths are looked at.
+const DEBOUNCE_TICK: Duration = Duration::from_millis(50);
+
+/// Collects the paths `rx` delivers and applies each once it has been quiet for `window`, looking
+/// at the waiting paths every `tick`. Ends when `rx` is closed (the file system thread has ended:
+/// stopped, or it could not watch).
+pub(crate) async fn run_debounce_loop(
+    mut rx: mpsc::UnboundedReceiver<PathBuf>,
+    vault_root: PathBuf,
+    state: Arc<RwLock<SatzState>>,
+    client: Client,
+    window: Duration,
+    tick: Duration,
+) {
+    let mut pending = Debouncer::default();
+
+    loop {
+        tokio::select! {
+            message = rx.recv() => match message {
+                Some(path) => pending.push(path, Instant::now()),
+                None => break,
+            },
+            _ = tokio::time::sleep(tick), if !pending.is_empty() => {
+                let now = Instant::now();
+                let ready = pending.take_ready(now, window);
+                // A change that arrives before the first index is complete waits for it.
+                for path in process_batch(&ready, &vault_root, &state, &client).await {
+                    pending.push(path, Instant::now());
                 }
             }
         }
-    });
-    handle
+    }
 }
 
 /// Collects file system events and hands each path out once it has been quiet for a while, so a
@@ -160,84 +183,219 @@ impl Debouncer {
 
 /// Applies one debounced event. `true`: the first indexing is not finished yet, so the event was
 /// not applied and must be queued again.
+#[cfg(test)]
 pub(crate) async fn process_file_event(
     path: &Path,
     vault_root: &Path,
     state: &Arc<RwLock<SatzState>>,
     client: &Client,
 ) -> bool {
-    tracing::debug!(?path, "watcher: processing debounced event");
-    if !state.read().await.is_indexing_complete() {
-        return true;
-    }
-    if is_config_file(path, vault_root) {
-        use tower_lsp_server::ls_types::MessageType;
+    !process_batch(&[path.to_path_buf()], vault_root, state, client)
+        .await
+        .is_empty()
+}
 
-        let (outcome, warnings, restart_notice) = {
-            let mut s = state.write().await;
-            let before = s.config.gitignore_mode();
-            let outcome = reload_config(&mut s, vault_root);
-            let notice = gitignore_change_notice(before, s.config.gitignore_mode());
-            (outcome, s.config_warnings.clone(), notice)
-        };
-        match outcome {
-            ReloadOutcome::Reloaded => {
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        "satz: reloaded configuration from .satz.toml",
-                    )
-                    .await;
-                // Settings that were ignored must be seen: the rest applies, so nothing else would
-                // tell the user that one of them did nothing.
-                if !warnings.is_empty() {
-                    let message = crate::state::config_warnings_message(&warnings);
-                    client.log_message(MessageType::WARNING, &message).await;
-                    client.show_message(MessageType::WARNING, message).await;
-                }
-            }
-            ReloadOutcome::RevertedToDefaults => {
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        "satz: .satz.toml was removed; using default settings",
-                    )
-                    .await;
-            }
-            ReloadOutcome::Failed(error) => {
-                let message = crate::state::config_error_message(&error, "the previous");
+/// Applies the events of one debounce window together: what the disk says about all of them is read
+/// (on every core), put into the index under ONE write lock, with the derived tables rebuilt once
+/// at most, and the open notes are told once, however many events there were.
+///
+/// The paths that could not be applied yet (the first indexing is not finished) come back, to be
+/// queued again.
+pub(crate) async fn process_batch(
+    paths: &[PathBuf],
+    vault_root: &Path,
+    state: &Arc<RwLock<SatzState>>,
+    client: &Client,
+) -> Vec<PathBuf> {
+    tracing::debug!(count = paths.len(), "watcher: processing debounced events");
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    if !state.read().await.is_indexing_complete() {
+        return paths.to_vec();
+    }
+
+    // The configuration first: what is read next is read with the settings it brings.
+    let (config, notes): (Vec<&PathBuf>, Vec<&PathBuf>) = paths
+        .iter()
+        .partition(|path| is_config_file(path, vault_root));
+    let mut refresh = false;
+    if !config.is_empty() {
+        reload_config_and_tell(state, client, vault_root).await;
+        refresh = true;
+    }
+    let mut again = Vec::new();
+    if !notes.is_empty() {
+        let change = apply_disk_changes(&notes, vault_root, state).await;
+        if change == FsChange::Deferred {
+            again = notes.into_iter().cloned().collect();
+        }
+        refresh |= fs_change_needs_refresh(&change);
+    }
+
+    if refresh {
+        crate::backend::refresh_open_documents(client, state).await;
+    }
+    again
+}
+
+/// Re-reads `.satz.toml` and tells the user what came of it.
+async fn reload_config_and_tell(
+    state: &Arc<RwLock<SatzState>>,
+    client: &Client,
+    vault_root: &Path,
+) {
+    use tower_lsp_server::ls_types::MessageType;
+
+    let (outcome, warnings, restart_notice) = {
+        let mut s = state.write().await;
+        let before = s.config.gitignore_mode();
+        let outcome = reload_config(&mut s, vault_root);
+        let notice = gitignore_change_notice(before, s.config.gitignore_mode());
+        (outcome, s.config_warnings.clone(), notice)
+    };
+    match outcome {
+        ReloadOutcome::Reloaded => {
+            client
+                .log_message(
+                    MessageType::INFO,
+                    "satz: reloaded configuration from .satz.toml",
+                )
+                .await;
+            // Settings that were ignored must be seen: the rest applies, so nothing else would
+            // tell the user that one of them did nothing.
+            if !warnings.is_empty() {
+                let message = crate::state::config_warnings_message(&warnings);
                 client.log_message(MessageType::WARNING, &message).await;
                 client.show_message(MessageType::WARNING, message).await;
             }
         }
-        // The vault was read once, at startup, with the old setting.
-        if let Some(notice) = restart_notice {
-            client.log_message(MessageType::INFO, &notice).await;
-            client.show_message(MessageType::INFO, notice).await;
+        ReloadOutcome::RevertedToDefaults => {
+            client
+                .log_message(
+                    MessageType::INFO,
+                    "satz: .satz.toml was removed; using default settings",
+                )
+                .await;
         }
+        ReloadOutcome::Failed(error) => {
+            let message = crate::state::config_error_message(&error, "the previous");
+            client.log_message(MessageType::WARNING, &message).await;
+            client.show_message(MessageType::WARNING, message).await;
+        }
+    }
+    // The vault was read once, at startup, with the old setting.
+    if let Some(notice) = restart_notice {
+        client.log_message(MessageType::INFO, &notice).await;
+        client.show_message(MessageType::INFO, notice).await;
+    }
+}
+
+/// From this many paths on, what the disk says about them is read on every core.
+const PARALLEL_READ_FROM: usize = 8;
+
+/// What the disk says about a path that is not (known to be) a folder, or that it is one.
+enum Read {
+    Note(PreparedChange),
+    Folder,
+}
+
+/// Reads the notes among `paths` (a folder is only noted as one: whether it is worth reading is
+/// asked of the index first).
+fn read_paths(paths: &[PathBuf], vault_root: &Path) -> Vec<Read> {
+    let read = |path: &PathBuf| {
+        if path.is_dir() {
+            Read::Folder
+        } else {
+            Read::Note(prepare_file(path, vault_root))
+        }
+    };
+    if paths.len() >= PARALLEL_READ_FROM {
+        paths.par_iter().map(read).collect()
     } else {
-        // An existing folder the index already holds notes of says nothing new (saving a note makes
-        // some systems report its folder as modified too): its notes have their own events.
-        if path.is_dir() && !folder_event_is_news(&*state.read().await, path, vault_root) {
-            return false;
-        }
-        // Reading and parsing (a file, or a whole folder) happens before the lock is taken.
-        let (owned_path, owned_root) = (path.to_path_buf(), vault_root.to_path_buf());
-        let gitignore = state.read().await.config.gitignore_mode();
-        let prepared = tokio::task::spawn_blocking(move || {
-            prepare_fs_change(&owned_path, &owned_root, gitignore)
-        })
+        paths.iter().map(read).collect()
+    }
+}
+
+/// Reads the folders `paths` (each with the place it has in the window).
+fn read_folders(
+    folders: &[(usize, PathBuf)],
+    vault_root: &Path,
+    gitignore: satz_core::GitignoreMode,
+) -> Vec<(usize, PreparedChange)> {
+    let read = |(at, path): &(usize, PathBuf)| (*at, prepare_folder(path, vault_root, gitignore));
+    if folders.len() >= 2 {
+        folders.par_iter().map(read).collect()
+    } else {
+        folders.iter().map(read).collect()
+    }
+}
+
+/// Reads what the disk says about `paths` and puts it into the index.
+///
+/// Reading and parsing happen before the lock is taken (a note, or a whole folder); everything
+/// that is read goes into the index under one write lock.
+async fn apply_disk_changes(
+    paths: &[&PathBuf],
+    vault_root: &Path,
+    state: &Arc<RwLock<SatzState>>,
+) -> FsChange {
+    let gitignore = state.read().await.config.gitignore_mode();
+    let owned: Vec<PathBuf> = paths.iter().map(|path| (*path).clone()).collect();
+    let root = vault_root.to_path_buf();
+
+    let (read_of, read_root) = (owned.clone(), root.clone());
+    let mut reads = tokio::task::spawn_blocking(move || read_paths(&read_of, &read_root))
         .await
-        .unwrap_or(PreparedChange::Skip);
-        let mut s = state.write().await;
-        let change = apply_prepared(&mut s, path, prepared);
-        if !fs_change_needs_refresh(&change) {
-            return false;
+        .unwrap_or_else(|_| {
+            (0..owned.len())
+                .map(|_| Read::Note(PreparedChange::Skip))
+                .collect()
+        });
+
+    // An existing folder the index already holds notes of says nothing new (saving a note makes
+    // some systems report its folder as modified too): its notes have their own events.
+    let folders: Vec<usize> = (0..reads.len())
+        .filter(|&at| matches!(reads[at], Read::Folder))
+        .collect();
+    if !folders.is_empty() {
+        let news = {
+            let s = state.read().await;
+            let folder_paths: Vec<&Path> = folders.iter().map(|&at| owned[at].as_path()).collect();
+            folders_with_news(&s, &folder_paths, vault_root)
+        };
+        let mut to_read = Vec::new();
+        for (&at, news) in folders.iter().zip(news) {
+            if news {
+                to_read.push((at, owned[at].clone()));
+            } else {
+                reads[at] = Read::Note(PreparedChange::Skip);
+            }
+        }
+        let read = tokio::task::spawn_blocking(move || read_folders(&to_read, &root, gitignore))
+            .await
+            .unwrap_or_default();
+        for (at, prepared) in read {
+            reads[at] = Read::Note(prepared);
+        }
+        // A folder whose reading was lost is skipped, as it would have been on its own.
+        for read in reads.iter_mut() {
+            if matches!(read, Read::Folder) {
+                *read = Read::Note(PreparedChange::Skip);
+            }
         }
     }
 
-    crate::backend::refresh_open_documents(client, state).await;
-    false
+    let changes: Vec<(PathBuf, PreparedChange)> = owned
+        .into_iter()
+        .zip(reads)
+        .map(|(path, read)| match read {
+            Read::Note(prepared) => (path, prepared),
+            Read::Folder => (path, PreparedChange::Skip),
+        })
+        .collect();
+    let mut s = state.write().await;
+    apply_prepared_batch(&mut s, changes)
 }
 
 /// Whether the open documents' diagnostics can differ after this change: nothing happened to the
@@ -276,21 +434,39 @@ pub(crate) enum PreparedChange {
 }
 
 /// Reads what is on disk for `path` (a note, or a folder that appeared, moved or vanished).
+#[cfg(test)]
 pub(crate) fn prepare_fs_change(
+    path: &Path,
+    vault_root: &Path,
+    gitignore: satz_core::GitignoreMode,
+) -> PreparedChange {
+    if path.is_dir() {
+        prepare_folder(path, vault_root, gitignore)
+    } else {
+        prepare_file(path, vault_root)
+    }
+}
+
+/// The notes of a folder that exists (also a folder that happens to be named like a note,
+/// `x.md/`).
+fn prepare_folder(
     path: &Path,
     vault_root: &Path,
     gitignore: satz_core::GitignoreMode,
 ) -> PreparedChange {
     let rel_path = SatzState::get_rel_path(path, Some(vault_root));
     let rel = rel_path.to_string_lossy().replace('\\', "/");
-
-    if path.is_dir() {
-        // Also a folder that happens to be named like a note (`x.md/`).
-        return match satz_core::walk::walk_subtree_with(vault_root, path, gitignore) {
-            Ok(docs) => PreparedChange::Subtree { prefix: rel, docs },
-            Err(_) => PreparedChange::Skip,
-        };
+    match satz_core::walk::walk_subtree_with(vault_root, path, gitignore) {
+        Ok(docs) => PreparedChange::Subtree { prefix: rel, docs },
+        Err(_) => PreparedChange::Skip,
     }
+}
+
+/// What is on disk for a path that is not a folder: a note, or nothing.
+fn prepare_file(path: &Path, vault_root: &Path) -> PreparedChange {
+    let rel_path = SatzState::get_rel_path(path, Some(vault_root));
+    let rel = rel_path.to_string_lossy().replace('\\', "/");
+
     if satz_core::walk::is_markdown_path(path) {
         if !path.exists() {
             return PreparedChange::RemoveDoc(satz_core::DocId::new(rel));
@@ -312,118 +488,165 @@ pub(crate) fn prepare_fs_change(
 /// Whether an event for an existing folder can tell the index anything: only when it holds notes the
 /// index does not know yet (a folder created, moved in or copied in). Editors saving a note also
 /// make the OS report the folder as modified; re-reading every note in it for that is wasted work.
+#[cfg(test)]
 pub(crate) fn folder_event_is_news(state: &SatzState, folder: &Path, vault_root: &Path) -> bool {
-    let rel = SatzState::get_rel_path(folder, Some(vault_root))
-        .to_string_lossy()
-        .replace('\\', "/");
-    !state
-        .index
-        .documents()
-        .any(|doc| is_inside(doc.id.as_str(), &rel))
+    folders_with_news(state, &[folder], vault_root)[0]
 }
 
-/// Whether `id` is `prefix` itself or lies inside the folder `prefix`, ignoring case and spelling
-/// of separators (the event path and the indexed path may be spelled differently).
-fn is_inside(id: &str, prefix: &str) -> bool {
-    let id = satz_core::fold_key(id);
-    let prefix = satz_core::fold_key(prefix.trim_end_matches('/'));
-    id == prefix || id.starts_with(&format!("{prefix}/"))
+/// `folder_event_is_news` for several folders at once.
+///
+/// The notes' ids are folded as they are needed, and once: a folder the index holds notes of (the
+/// usual case, saving a note reports its folder) is found among the first few notes looked at, and
+/// folding an id is what costs.
+fn folders_with_news(state: &SatzState, folders: &[&Path], vault_root: &Path) -> Vec<bool> {
+    // One folder (nearly always): nothing to keep for a next one.
+    if let [folder] = folders {
+        let prefix = folded_prefix(&SatzState::get_rel_path(folder, Some(vault_root)));
+        let held = state
+            .index
+            .documents()
+            .any(|doc| is_inside_folded(&satz_core::fold_key(doc.id.as_str()), &prefix));
+        return vec![!held];
+    }
+    let ids: Vec<&satz_core::DocId> = state.index.documents().map(|doc| &doc.id).collect();
+    let mut folded: Vec<Option<String>> = vec![None; ids.len()];
+    folders
+        .iter()
+        .map(|folder| {
+            let prefix = folded_prefix(&SatzState::get_rel_path(folder, Some(vault_root)));
+            !(0..ids.len()).any(|at| {
+                let id = folded[at].get_or_insert_with(|| satz_core::fold_key(ids[at].as_str()));
+                is_inside_folded(id, &prefix)
+            })
+        })
+        .collect()
 }
 
-/// Puts a prepared change into the index. Open documents are owned by the editor's buffer, not by
-/// the file: they stay indexed when their file or folder disappears and are never overwritten by
-/// what is on disk.
-pub(crate) fn apply_prepared(
+/// The folded spelling of a folder's path relative to the vault, as `is_inside_folded` wants it.
+fn folded_prefix(rel: &Path) -> String {
+    satz_core::fold_key(
+        rel.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/'),
+    )
+}
+
+/// Whether the note `id` is `prefix` itself or lies inside the folder `prefix`, both already folded
+/// (`fold_key`): the event path and the indexed path may be spelled differently in case and in the
+/// separators, but they are compared as whole path components.
+fn is_inside_folded(id: &str, prefix: &str) -> bool {
+    id == prefix
+        || id
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Puts what was read for a window's paths into the index, as one change. Open documents are owned
+/// by the editor's buffer, not by the file: they stay indexed when their file or folder disappears
+/// and are never overwritten by what is on disk.
+///
+/// The paths come in the order they were reported in; a note that is named by more than one of them
+/// is what the last says. What a folder held is what the index held before the window.
+pub(crate) fn apply_prepared_batch(
     state: &mut SatzState,
-    path: &Path,
-    prepared: PreparedChange,
+    changes: Vec<(PathBuf, PreparedChange)>,
 ) -> FsChange {
     if !state.is_indexing_complete() {
         return FsChange::Deferred;
     }
-    let is_open = |state: &SatzState, id: &satz_core::DocId| {
-        state.open_docs.values().any(|open| {
-            let rel = SatzState::get_rel_path(&open.path, state.vault_root());
-            satz_core::fold_key(&rel.to_string_lossy().replace('\\', "/"))
-                == satz_core::fold_key(id.as_str())
-        })
-    };
-    match prepared {
-        PreparedChange::Skip => FsChange::Skipped,
-        PreparedChange::Doc(doc) => {
-            if state.is_open_path(path) {
-                return FsChange::Skipped;
+    let open = state.open_path_keys();
+    // `Some`: the note as it is on disk; `None`: gone.
+    let mut ops: std::collections::BTreeMap<satz_core::DocId, Option<satz_core::Document>> =
+        std::collections::BTreeMap::new();
+    // The notes of the index and their folded ids, worked out when a folder needs them.
+    let mut held: Option<Vec<(satz_core::DocId, String)>> = None;
+
+    for (path, prepared) in changes {
+        match prepared {
+            PreparedChange::Skip => {}
+            PreparedChange::Doc(doc) => {
+                if !open.contains(&state.path_key(&path)) {
+                    ops.insert(doc.id.clone(), Some(*doc));
+                }
             }
-            tracing::info!("Watcher: re-indexed {}", doc.id);
-            state.index.replace_doc(*doc);
-            FsChange::Reindexed
-        }
-        PreparedChange::RemoveDoc(id) => {
-            if state.is_open_path(path) {
-                return FsChange::Skipped;
+            PreparedChange::RemoveDoc(id) => {
+                if !open.contains(&state.path_key(&path)) {
+                    ops.insert(id, None);
+                }
             }
-            state.index.remove_doc(&id);
-            tracing::info!("Watcher: removed deleted document {}", id);
-            FsChange::Removed
-        }
-        PreparedChange::RemovePrefix(prefix) => {
-            let gone: Vec<satz_core::DocId> = state
-                .index
-                .documents()
-                .map(|d| d.id.clone())
-                .filter(|id| is_inside(id.as_str(), &prefix) && !is_open(state, id))
-                .collect();
-            state.index.remove_docs(&gone);
-            if gone.is_empty() {
-                FsChange::Skipped
-            } else {
-                tracing::info!(
-                    "Watcher: removed {} document(s) under {}",
-                    gone.len(),
-                    prefix
-                );
-                FsChange::Removed
+            PreparedChange::RemovePrefix(prefix) => {
+                let prefix = satz_core::fold_key(prefix.trim_end_matches('/'));
+                for (id, folded) in held_notes(&mut held, state) {
+                    if is_inside_folded(folded, &prefix) && !open.contains(folded) {
+                        ops.insert(id.clone(), None);
+                    }
+                }
             }
-        }
-        PreparedChange::Subtree { prefix, docs } => {
-            let mut changed = false;
-            let found: std::collections::HashSet<String> = docs
-                .iter()
-                .map(|d| satz_core::fold_key(d.id.as_str()))
-                .collect();
-            let stale: Vec<satz_core::DocId> = state
-                .index
-                .documents()
-                .map(|d| d.id.clone())
-                .filter(|id| {
-                    is_inside(id.as_str(), &prefix)
-                        && !found.contains(&satz_core::fold_key(id.as_str()))
-                        && !is_open(state, id)
-                })
-                .collect();
-            changed |= !stale.is_empty();
-            state.index.remove_docs(&stale);
-            let fresh: Vec<satz_core::Document> = docs
-                .into_iter()
-                .filter(|doc| !is_open(state, &doc.id))
-                .collect();
-            changed |= !fresh.is_empty();
-            state.index.replace_docs(fresh);
-            if changed {
-                tracing::info!("Watcher: re-indexed folder {}", prefix);
-                FsChange::Reindexed
-            } else {
-                FsChange::Skipped
+            PreparedChange::Subtree { prefix, docs } => {
+                let prefix = satz_core::fold_key(prefix.trim_end_matches('/'));
+                let folded: Vec<String> = docs
+                    .iter()
+                    .map(|doc| satz_core::fold_key(doc.id.as_str()))
+                    .collect();
+                // Every note the index holds in the folder goes, except the open ones; those the
+                // folder still has are put back right after (the later change of a note counts).
+                for (id, key) in held_notes(&mut held, state) {
+                    if is_inside_folded(key, &prefix) && !open.contains(key) {
+                        ops.insert(id.clone(), None);
+                    }
+                }
+                for (doc, key) in docs.into_iter().zip(&folded) {
+                    if !open.contains(key) {
+                        ops.insert(doc.id.clone(), Some(doc));
+                    }
+                }
             }
         }
     }
+
+    let (mut removed, mut upserted) = (Vec::new(), Vec::new());
+    for (id, op) in ops {
+        match op {
+            Some(doc) => upserted.push(doc),
+            // A note that is not in the index is not removed from it.
+            None if state.index.get_doc(&id).is_some() => removed.push(id),
+            None => {}
+        }
+    }
+    let (removes, puts) = (removed.len(), upserted.len());
+    state.index.apply_changes(&removed, upserted);
+    match (puts, removes) {
+        (0, 0) => FsChange::Skipped,
+        (0, _) => {
+            tracing::info!("Watcher: removed {removes} document(s)");
+            FsChange::Removed
+        }
+        _ => {
+            tracing::info!("Watcher: re-indexed {puts} document(s), removed {removes}");
+            FsChange::Reindexed
+        }
+    }
+}
+
+/// The notes of the index with their folded ids, made the first time they are asked for.
+fn held_notes<'a>(
+    held: &'a mut Option<Vec<(satz_core::DocId, String)>>,
+    state: &SatzState,
+) -> &'a [(satz_core::DocId, String)] {
+    held.get_or_insert_with(|| {
+        state
+            .index
+            .documents()
+            .map(|doc| (doc.id.clone(), satz_core::fold_key(doc.id.as_str())))
+            .collect()
+    })
 }
 
 /// Brings the index in line with a created/modified/deleted note or folder (reads, then applies).
 #[cfg(test)]
 pub(crate) fn apply_fs_change(state: &mut SatzState, vault_root: &Path, path: &Path) -> FsChange {
     let prepared = prepare_fs_change(path, vault_root, state.config.gitignore_mode());
-    apply_prepared(state, path, prepared)
+    apply_prepared_batch(state, vec![(path.to_path_buf(), prepared)])
 }
 
 /// Whether a file system event for `path` can change the index or the configuration: a note, the
@@ -1360,7 +1583,10 @@ today = [\"heute\"]
         let mut state = SatzState::default();
         state.set_indexing_complete(true);
         let before = state.index.revision();
-        let change = apply_prepared(&mut state, Path::new("/v/x.txt"), PreparedChange::Skip);
+        let change = apply_prepared_batch(
+            &mut state,
+            vec![(PathBuf::from("/v/x.txt"), PreparedChange::Skip)],
+        );
         assert_eq!(change, FsChange::Skipped);
         assert_eq!(state.index.revision(), before);
     }
@@ -1516,5 +1742,318 @@ today = [\"heute\"]
             &known,
             &v.0
         ));
+    }
+
+    // ---- which notes a folder holds, and which notes are open (5.1): the same answers, with less work ----
+
+    /// `is_inside` as it was: every call folds both sides and builds the prefix to look for.
+    fn reference_is_inside(id: &str, prefix: &str) -> bool {
+        let id = satz_core::fold_key(id);
+        let prefix = satz_core::fold_key(prefix.trim_end_matches('/'));
+        id == prefix || id.starts_with(&format!("{prefix}/"))
+    }
+
+    /// `folder_event_is_news` as it was.
+    fn reference_folder_event_is_news(state: &SatzState, folder: &Path, vault_root: &Path) -> bool {
+        let rel = SatzState::get_rel_path(folder, Some(vault_root))
+            .to_string_lossy()
+            .replace('\\', "/");
+        !state
+            .index
+            .documents()
+            .any(|doc| reference_is_inside(doc.id.as_str(), &rel))
+    }
+
+    /// The `is_open` of `apply_prepared` as it was: goes through every open document each time.
+    fn reference_is_open(state: &SatzState, id: &satz_core::DocId) -> bool {
+        state.open_docs.values().any(|open| {
+            let rel = SatzState::get_rel_path(&open.path, state.vault_root());
+            satz_core::fold_key(&rel.to_string_lossy().replace('\\', "/"))
+                == satz_core::fold_key(id.as_str())
+        })
+    }
+
+    struct T51Rng(u64);
+
+    impl T51Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+        fn pick<'a>(&mut self, of: &[&'a str]) -> &'a str {
+            of[self.below(of.len())]
+        }
+    }
+
+    /// Path components that differ in case, in how an accent is written, in length by a letter, and
+    /// in what folds to what (the dotted capital I).
+    const T51_PARTS: [&str; 10] = [
+        "a", "A", "ab", "aB", "é", "e\u{301}", "É", "İ", "x.md", "sub",
+    ];
+
+    fn t51_path(rng: &mut T51Rng) -> String {
+        (0..1 + rng.below(4))
+            .map(|_| rng.pick(&T51_PARTS))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    #[test]
+    fn a_folded_folder_test_answers_as_the_test_that_folded_every_time() {
+        let mut rng = T51Rng(0x5151_0000_0000_0001);
+        let (mut inside, mut outside) = (0, 0);
+        for _ in 0..6000 {
+            let id = t51_path(&mut rng);
+            // Mostly a folder the note may be in (some of its front, spelled another way), else
+            // any path; sometimes with the separator at the end.
+            let prefix = if rng.below(3) > 0 {
+                let parts: Vec<&str> = id.split('/').collect();
+                let take = rng.below(parts.len() + 1);
+                let mut prefix: Vec<String> = parts[..take]
+                    .iter()
+                    .map(|p| {
+                        if rng.below(3) == 0 {
+                            p.to_uppercase()
+                        } else {
+                            p.to_string()
+                        }
+                    })
+                    .collect();
+                if rng.below(4) == 0 {
+                    prefix.push(rng.pick(&T51_PARTS).to_string());
+                }
+                prefix.join("/")
+            } else {
+                t51_path(&mut rng)
+            };
+            let prefix = if rng.below(5) == 0 {
+                format!("{prefix}/")
+            } else {
+                prefix
+            };
+            let want = reference_is_inside(&id, &prefix);
+            let got = is_inside_folded(
+                &satz_core::fold_key(&id),
+                &folded_prefix(Path::new(&prefix)),
+            );
+            assert_eq!(got, want, "{id:?} in {prefix:?}");
+            if want {
+                inside += 1;
+            } else {
+                outside += 1;
+            }
+        }
+        assert!(
+            inside > 800 && outside > 800,
+            "{inside} inside, {outside} outside"
+        );
+        // The folder is the vault itself, or the path has the other separators.
+        assert_eq!(
+            reference_is_inside("a.md", ""),
+            is_inside_folded("a.md", &folded_prefix(Path::new("")))
+        );
+        assert_eq!(
+            folded_prefix(Path::new("Sub\\A")),
+            folded_prefix(Path::new("Sub/A"))
+        );
+    }
+
+    fn t51_state(rng: &mut T51Rng, root: &Path, open: usize, notes: usize) -> SatzState {
+        let mut state = SatzState::default();
+        state.set_vault_root(Some(root.to_path_buf()));
+        state.set_indexing_complete(true);
+        for i in 0..open {
+            let rel = t51_path(rng);
+            // The editor's spelling of the file: the vault's, or with the other separators.
+            let path = if rng.below(2) == 0 {
+                root.join(rel.replace('/', "\\"))
+            } else {
+                root.join(&rel)
+            };
+            state.open_document(&format!("file:///{i}"), "# Open\n", &path, 1);
+        }
+        for i in 0..notes {
+            let rel = format!("{}.md", t51_path(rng));
+            state.index.replace_doc(satz_core::parse_document(
+                &format!("# T{i}\n"),
+                Path::new(&rel),
+            ));
+        }
+        state
+    }
+
+    #[test]
+    fn asking_the_set_of_open_paths_answers_as_going_through_the_open_documents_did() {
+        let mut rng = T51Rng(0x5151_0000_0000_0002);
+        let root = PathBuf::from(if cfg!(windows) { "C:\\vault" } else { "/vault" });
+        let (mut open_hits, mut closed) = (0, 0);
+        for round in 0..300 {
+            let open = rng.below(6);
+            let state = t51_state(&mut rng, &root, open, 12);
+            let keys = state.open_path_keys();
+            for doc in state.index.documents() {
+                let want = reference_is_open(&state, &doc.id);
+                let got = keys.contains(&satz_core::fold_key(doc.id.as_str()));
+                assert_eq!(got, want, "round {round}: {:?}", doc.id);
+                open_hits += usize::from(want);
+                closed += usize::from(!want);
+            }
+            // A path as the watcher reports it, in either spelling and case.
+            for _ in 0..8 {
+                let rel = format!("{}.md", t51_path(&mut rng));
+                let path = if rng.below(2) == 0 {
+                    root.join(rel.replace('/', "\\"))
+                } else {
+                    root.join(&rel)
+                };
+                let want = state.open_docs.values().any(|open| {
+                    let key = |p: &Path| {
+                        satz_core::fold_key(
+                            &SatzState::get_rel_path(p, state.vault_root())
+                                .to_string_lossy()
+                                .replace('\\', "/"),
+                        )
+                    };
+                    key(&open.path) == key(&path)
+                });
+                assert_eq!(
+                    keys.contains(&state.path_key(&path)),
+                    want,
+                    "round {round}: {path:?}"
+                );
+                assert_eq!(state.is_open_path(&path), want, "round {round}: {path:?}");
+            }
+        }
+        assert!(
+            open_hits > 20 && closed > 1000,
+            "{open_hits} open, {closed} closed"
+        );
+    }
+
+    #[test]
+    fn folders_are_asked_about_together_as_they_were_asked_about_one_by_one() {
+        let mut rng = T51Rng(0x5151_0000_0000_0003);
+        let root = PathBuf::from(if cfg!(windows) { "C:\\vault" } else { "/vault" });
+        let (mut news, mut known) = (0, 0);
+        for round in 0..300 {
+            let notes = 1 + rng.below(20);
+            let state = t51_state(&mut rng, &root, 0, notes);
+            let folders: Vec<PathBuf> = (0..1 + rng.below(6))
+                .map(|_| root.join(t51_path(&mut rng)))
+                .collect();
+            let refs: Vec<&Path> = folders.iter().map(PathBuf::as_path).collect();
+            let together = folders_with_news(&state, &refs, &root);
+            for (folder, got) in folders.iter().zip(together) {
+                let want = reference_folder_event_is_news(&state, folder, &root);
+                assert_eq!(got, want, "round {round}: {folder:?}");
+                assert_eq!(folder_event_is_news(&state, folder, &root), want);
+                news += usize::from(want);
+                known += usize::from(!want);
+            }
+        }
+        assert!(news > 200 && known > 200, "{news} news, {known} known");
+    }
+
+    // ---- a batch of prepared changes ----
+
+    fn t51_note(text: &str) -> PreparedChange {
+        PreparedChange::Doc(Box::new(satz_core::parse_document(text, Path::new("a.md"))))
+    }
+
+    #[test]
+    fn a_batch_is_not_applied_before_the_first_indexing_is_done() {
+        let dir = temp_dir("batch-deferred");
+        let mut state = state_in(&dir);
+        state.set_indexing_complete(false);
+        let change = apply_prepared_batch(&mut state, vec![(dir.join("a.md"), t51_note("# A\n"))]);
+        assert_eq!(change, FsChange::Deferred);
+        assert!(ids(&state).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn of_several_events_for_one_note_in_a_batch_the_last_one_counts() {
+        let dir = temp_dir("batch-last");
+        let mut state = state_in(&dir);
+        let (first, second) = (dir.join("a.md"), dir.join("A.md"));
+        let gone = || PreparedChange::RemoveDoc(satz_core::DocId::new("a.md"));
+        let title = |state: &SatzState| {
+            state
+                .index
+                .get_doc(&satz_core::DocId::new("a.md"))
+                .map(|d| d.title.clone())
+        };
+
+        let change = apply_prepared_batch(
+            &mut state,
+            vec![
+                (first.clone(), t51_note("# First\n")),
+                (second.clone(), t51_note("# Second\n")),
+            ],
+        );
+        assert_eq!(change, FsChange::Reindexed);
+        assert_eq!(title(&state).as_deref(), Some("Second"));
+
+        // Removed and then written again: it stays. Written and then removed: it goes.
+        apply_prepared_batch(
+            &mut state,
+            vec![
+                (first.clone(), gone()),
+                (second.clone(), t51_note("# Third\n")),
+            ],
+        );
+        assert_eq!(title(&state).as_deref(), Some("Third"));
+        let change = apply_prepared_batch(
+            &mut state,
+            vec![(second, t51_note("# Fourth\n")), (first, gone())],
+        );
+        assert_eq!(change, FsChange::Removed);
+        assert_eq!(title(&state), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scan_of_a_folder_does_not_replace_an_open_note_and_still_brings_the_others() {
+        let dir = temp_dir("batch-subtree-open");
+        let mut state = state_in(&dir);
+        state.open_document(
+            "file:///sub/a.md",
+            "# Buffer
+",
+            &dir.join("sub").join("a.md"),
+            1,
+        );
+        let scanned = |path: &str, text: &str| satz_core::parse_document(text, Path::new(path));
+        let change = apply_prepared_batch(
+            &mut state,
+            vec![(
+                dir.join("sub"),
+                PreparedChange::Subtree {
+                    prefix: "sub".to_string(),
+                    docs: vec![
+                        scanned(
+                            "sub/a.md", "# Disk
+",
+                        ),
+                        scanned(
+                            "sub/b.md", "# B
+",
+                        ),
+                    ],
+                },
+            )],
+        );
+        assert_eq!(change, FsChange::Reindexed);
+        assert_eq!(ids(&state), vec!["sub/a.md", "sub/b.md"]);
+        assert_eq!(
+            state
+                .index
+                .get_doc(&satz_core::DocId::new("sub/a.md"))
+                .map(|d| d.title.as_str()),
+            Some("Buffer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

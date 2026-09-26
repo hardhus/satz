@@ -1000,6 +1000,7 @@ dependencies = [
  "chrono",
  "notify",
  "nucleo-matcher",
+ "rayon",
  "ropey",
  "satz-core",
  "serde_json",

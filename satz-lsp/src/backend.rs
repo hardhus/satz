@@ -133,6 +133,33 @@ pub(crate) async fn refresh_diagnostics(client: &Client, state: &Arc<RwLock<Satz
     }
 }
 
+/// Publishes the diagnostics of each of the notes `uris`: what a push client is sent when what
+/// they show may have changed.
+pub(crate) async fn publish_for_all(
+    client: &Client,
+    state: &Arc<RwLock<SatzState>>,
+    uris: &[String],
+) {
+    for uri in uris {
+        publish_for(client, state, uri).await;
+    }
+}
+
+/// Tells the client that the diagnostics of the notes `uris` may have changed: a pull client is
+/// asked to fetch them again, a push client is sent them.
+pub(crate) async fn send_diagnostics_refresh(
+    client: &Client,
+    state: &Arc<RwLock<SatzState>>,
+    supports_pull: bool,
+    uris: &[String],
+) {
+    if supports_pull {
+        refresh_diagnostics(client, state).await;
+    } else {
+        publish_for_all(client, state, uris).await;
+    }
+}
+
 /// Asks the client to fetch semantic tokens again.
 pub(crate) async fn refresh_semantic_tokens(client: &Client, state: &Arc<RwLock<SatzState>>) {
     if semantic_tokens_refresh_wanted(&*state.read().await) {
@@ -155,13 +182,7 @@ pub(crate) async fn refresh_open_documents(client: &Client, state: &Arc<RwLock<S
             s.open_docs.keys().cloned().collect::<Vec<_>>(),
         )
     };
-    if supports_pull {
-        refresh_diagnostics(client, state).await;
-    } else {
-        for uri in uris {
-            publish_for(client, state, &uri).await;
-        }
-    }
+    send_diagnostics_refresh(client, state, supports_pull, &uris).await;
 }
 
 /// The day changed under the open notes (midnight passed, or the daily-note settings changed): a
@@ -293,9 +314,7 @@ async fn announce_reparse(
 
     let plan = refresh_after_reparse(peers.dirty, peers.supports_pull);
     if plan.push_peers {
-        for other_uri in &peers.others {
-            publish_for(client, state_arc, other_uri).await;
-        }
+        publish_for_all(client, state_arc, &peers.others).await;
     }
     // Neither refresh waits for the other: a client that never answers one must not keep the
     // other from being sent.
@@ -391,9 +410,7 @@ async fn refresh_after_first_index(client: &Client, state_arc: &Arc<RwLock<SatzS
         )
     };
     if !supports_pull {
-        for uri in uris {
-            publish_for(client, state_arc, &uri).await;
-        }
+        publish_for_all(client, state_arc, &uris).await;
     }
     tokio::join!(refresh_semantic_tokens(client, state_arc), async {
         if supports_pull {
@@ -466,13 +483,13 @@ impl Backend {
         if !peers.dirty {
             return;
         }
-        if peers.supports_pull {
-            refresh_diagnostics(&self.client, &self.state).await;
-        } else {
-            for other_uri in &peers.others {
-                publish_for(&self.client, &self.state, other_uri).await;
-            }
-        }
+        send_diagnostics_refresh(
+            &self.client,
+            &self.state,
+            peers.supports_pull,
+            &peers.others,
+        )
+        .await;
     }
 
     /// Read access to a state whose index reflects every open buffer.
@@ -1110,7 +1127,7 @@ pub(crate) fn plan_refresh(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1760,7 +1777,7 @@ mod tests {
 
     // ---- what the client actually receives (a real JSON-RPC connection over an in-memory pipe) ----
 
-    async fn write_frame(
+    pub(crate) async fn write_frame(
         out: &mut (impl tokio::io::AsyncWrite + Unpin),
         message: serde_json::Value,
     ) {
@@ -1770,7 +1787,7 @@ mod tests {
         out.write_all(frame.as_bytes()).await.unwrap();
     }
 
-    async fn read_frame(
+    pub(crate) async fn read_frame(
         input: &mut (impl tokio::io::AsyncBufRead + Unpin),
     ) -> Option<serde_json::Value> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -1794,7 +1811,7 @@ mod tests {
     }
 
     /// Everything the server sends for `quiet` without a pause: `(method, uri of the document)`.
-    async fn sent_meanwhile(
+    pub(crate) async fn sent_meanwhile(
         input: &mut (impl tokio::io::AsyncBufRead + Unpin),
         quiet: std::time::Duration,
     ) -> Vec<(String, Option<String>)> {
@@ -1810,9 +1827,22 @@ mod tests {
 
     /// `shared_backend`'s setup (a.md open, indexing done) but with a connected push client
     /// (it announced no pull-diagnostics support) whose incoming messages can be read.
-    async fn connected_backend() -> (
+    pub(crate) async fn connected_backend() -> (
         Arc<Backend>,
         tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) {
+        let (backend, from_server, to_server) = connected_backend_io().await;
+        // Kept open for as long as the test (leaked: a closed pipe would end the server).
+        std::mem::forget(to_server);
+        (backend, from_server)
+    }
+
+    /// `connected_backend`, and the way back to the server as well: for a client that answers what
+    /// the server asks of it.
+    pub(crate) async fn connected_backend_io() -> (
+        Arc<Backend>,
+        tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
     ) {
         let client_slot = std::sync::Mutex::new(None);
         let (_layer, handle): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
@@ -1851,10 +1881,6 @@ mod tests {
             serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
         )
         .await;
-        // `client_write` stays open for as long as the test (leaked: a closed pipe would end the
-        // server).
-        std::mem::forget(client_write);
-
         let (_layer2, handle2): (_, LogReloadHandle) = reload::Layer::new(EnvFilter::new("off"));
         let backend = Arc::new(Backend::new(client, handle2));
         {
@@ -1863,7 +1889,7 @@ mod tests {
             state.set_indexing_complete(true);
             state.open_document("file:///a.md", "# A\n", &root().join("a.md"), 1);
         }
-        (backend, client_read)
+        (backend, client_read, client_write)
     }
 
     #[tokio::test]
@@ -2636,7 +2662,11 @@ mod tests {
             .await;
     }
 
-    fn count_of(sent: &[(String, Option<String>)], method: &str, uri: Option<&str>) -> usize {
+    pub(crate) fn count_of(
+        sent: &[(String, Option<String>)],
+        method: &str,
+        uri: Option<&str>,
+    ) -> usize {
         sent.iter()
             .filter(|(m, u)| m == method && (uri.is_none() || u.as_deref() == uri))
             .count()

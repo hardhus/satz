@@ -528,16 +528,30 @@ impl SatzState {
     /// The open document whose file is `path` (compared as `is_open_path` does), with the key it is
     /// stored under -- the URI the client opened it with.
     pub fn open_doc_for_path(&self, path: &Path) -> Option<(&String, &OpenDocument)> {
-        let root = self.vault_root.as_deref();
-        let key = |p: &Path| {
-            satz_core::slug::fold_key(
-                &Self::get_rel_path(p, root)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            )
-        };
-        let wanted = key(path);
-        self.open_docs.iter().find(|(_, d)| key(&d.path) == wanted)
+        let wanted = self.path_key(path);
+        self.open_docs
+            .iter()
+            .find(|(_, d)| self.path_key(&d.path) == wanted)
+    }
+
+    /// What `is_open_path` compares paths by: the path relative to the vault, with `/` for a
+    /// separator, in the folded spelling (`fold_key`).
+    pub fn path_key(&self, path: &Path) -> String {
+        satz_core::slug::fold_key(
+            &Self::get_rel_path(path, self.vault_root.as_deref())
+                .to_string_lossy()
+                .replace('\\', "/"),
+        )
+    }
+
+    /// The `path_key` of every open document, worked out once: for asking about many paths (or
+    /// notes) whether they are open, which `is_open_path` answers by going through every open
+    /// document each time.
+    pub fn open_path_keys(&self) -> std::collections::HashSet<String> {
+        self.open_docs
+            .values()
+            .map(|d| self.path_key(&d.path))
+            .collect()
     }
 
     /// The note a link of `doc` points at (`None`: external, footnote, no target at all, or the

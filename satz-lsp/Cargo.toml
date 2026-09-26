@@ -12,6 +12,7 @@ anyhow.workspace = true
 chrono.workspace = true
 notify.workspace = true
 nucleo-matcher.workspace = true
+rayon.workspace = true
 ropey.workspace = true
 satz-core.workspace = true
 serde_json.workspace = true
@@ -19,6 +20,9 @@ tokio.workspace = true
 tower-lsp-server.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "benchmark"
