@@ -971,10 +971,9 @@ impl LanguageServer for Backend {
             return Err(jsonrpc::Error::method_not_found());
         }
 
-        let result = {
-            let state = self.state.read().await;
-            crate::handlers::execute_command::compute_format_changes(&state)
-        };
+        // The state is not held while the notes are formatted: an edit typed meanwhile is not kept
+        // waiting for the whole vault.
+        let result = crate::handlers::execute_command::format_workspace(&self.state).await;
 
         if !result.cache_updates.is_empty() {
             let mut state = self.state.write().await;

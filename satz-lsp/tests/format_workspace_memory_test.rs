@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use satz_core::{Index, parse_document};
-use satz_lsp::handlers::execute_command::{build_workspace_edit_versioned, compute_format_changes};
+use satz_lsp::handlers::execute_command::{
+    build_workspace_edit_versioned, compute_format_changes, format_workspace,
+};
 use satz_lsp::state::{FormatCache, SatzState};
 
 struct Counting;
@@ -187,5 +189,42 @@ fn what_the_workspace_format_holds() {
         // The cache holds the hashes and, for a note that changes, its formatted text (which the
         // updates carried, so it is the same bytes), and nothing is copied on the way.
         assert!(ratio(applied.kept) < 0.05, "{:.2}", ratio(applied.kept));
+
+        // The same vault worked through the way the server does it: off the state lock, a slice of
+        // it at a time, on several threads. Only a slice of the notes is copied at any moment.
+        let (fresh, _) = state_of(3000, dirty);
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(fresh));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let (result, off_lock) = measure(|| runtime.block_on(format_workspace(&shared)));
+        println!(
+            "  format_workspace         peak {}  kept {}  ({} changes, {} cache updates)   peak/text {:.2}  kept/text {:.2}",
+            kib(off_lock.peak),
+            kib(off_lock.kept),
+            result.changes.len(),
+            result.cache_updates.len(),
+            ratio(off_lock.peak),
+            ratio(off_lock.kept),
+        );
+        if dirty {
+            assert_eq!(result.changes.len(), 3000);
+            assert!(
+                ratio(off_lock.kept) < 4.0,
+                "formatting off the lock holds {:.2}x the text of the notes",
+                ratio(off_lock.kept)
+            );
+        } else {
+            assert!(result.changes.is_empty());
+            assert!(
+                ratio(off_lock.peak) < 0.4 && ratio(off_lock.kept) < 0.4,
+                "formatting off the lock holds {:.2}x (peak) and {:.2}x (kept) the text of the notes",
+                ratio(off_lock.peak),
+                ratio(off_lock.kept)
+            );
+        }
+        drop(result);
+        drop(runtime);
     }
 }
