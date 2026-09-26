@@ -95,24 +95,18 @@ fn test_satz_resolve_command() {
 
 #[test]
 fn test_satz_daily_command() {
-    let temp_dir = std::env::temp_dir().join(format!("satz_daily_test_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&temp_dir);
+    let v = TempDir::new("daily_command");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
-        .args(["daily", temp_dir.to_str().unwrap()])
-        .output()
-        .expect("satz binary should execute");
+    let output = satz(&["daily", v.str()]);
 
     assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = out(&output);
     let path = std::path::PathBuf::from(stdout.trim());
     assert!(path.exists());
     assert!(path.to_string_lossy().ends_with(".md"));
 
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.contains("---"));
-
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
@@ -180,80 +174,47 @@ fn test_satz_graph_command() {
 
 #[test]
 fn test_satz_fmt_check_exits_1_on_dirty_file() {
-    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_check_test_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&temp_dir);
-    std::fs::write(
-        temp_dir.join("note.md"),
-        "# Title\n\nContent with   trailing spaces \t \nand _underscore italic_.\n",
-    )
-    .unwrap();
+    let v = TempDir::new("fmt_check_exit1");
+    v.write("note.md", DIRTY);
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
-        .args(["fmt", temp_dir.to_str().unwrap(), "--check"])
-        .output()
-        .expect("satz binary should execute");
+    let output = satz(&["fmt", v.str(), "--check"]);
 
     assert_eq!(output.status.code(), Some(1));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("note.md"));
+    assert!(out(&output).contains("note.md"));
 
     // --check must never write anything.
-    let content = std::fs::read_to_string(temp_dir.join("note.md")).unwrap();
+    let content = String::from_utf8(v.read("note.md")).unwrap();
     assert!(content.contains("_underscore italic_"));
-
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
 fn test_satz_fmt_write_actually_rewrites_dirty_file() {
-    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_write_test_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let file_path = temp_dir.join("note.md");
-    std::fs::write(
-        &file_path,
-        "# Title\n\nContent with   trailing spaces \t \nand _underscore italic_.\n",
-    )
-    .unwrap();
+    let v = TempDir::new("fmt_write_rewrites");
+    let file_path = v.write("note.md", DIRTY);
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
-        .args(["fmt", temp_dir.to_str().unwrap(), "--write"])
-        .output()
-        .expect("satz binary should execute");
+    let output = satz(&["fmt", v.str(), "--write"]);
 
     assert!(output.status.success());
 
     let content = std::fs::read_to_string(&file_path).unwrap();
-    assert_eq!(
-        content,
-        "# Title\n\nContent with   trailing spaces\nand *underscore italic*.\n"
-    );
+    assert_eq!(content, DIRTY_FORMATTED);
 
     // Running --check again on the now-clean file must succeed.
-    let recheck = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
-        .args(["fmt", temp_dir.to_str().unwrap(), "--check"])
-        .output()
-        .expect("satz binary should execute");
+    let recheck = satz(&["fmt", v.str(), "--check"]);
     assert!(recheck.status.success());
-
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
 fn test_satz_fmt_write_skips_io_for_already_clean_file() {
-    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_clean_test_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let file_path = temp_dir.join("note.md");
-    std::fs::write(&file_path, "# Title\n\nAlready clean content.\n").unwrap();
+    let v = TempDir::new("fmt_write_clean_io");
+    let file_path = v.write("note.md", "# Title\n\nAlready clean content.\n");
 
     let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
-        .args(["fmt", temp_dir.to_str().unwrap(), "--write"])
-        .output()
-        .expect("satz binary should execute");
+    let output = satz(&["fmt", v.str(), "--write"]);
 
     assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = out(&output);
     assert!(stdout.contains("0 file(s) formatted"));
     assert!(stdout.contains("1 file(s) already clean"));
 
@@ -262,8 +223,6 @@ fn test_satz_fmt_write_skips_io_for_already_clean_file() {
         mtime_before, mtime_after,
         "already-clean file must not be rewritten (mtime changed)"
     );
-
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -380,6 +339,48 @@ mod support {
 }
 
 use support::{DIRTY, DIRTY_FORMATTED, TempDir, err, out, satz, snapshot};
+
+// ---- the directories of these tests are removed when a test fails, too ----
+
+/// The whole point of `TempDir`: an assertion that fails ends the test by panicking, and the
+/// directory (with a read-only file deep inside, which a plain removal cannot delete on Windows)
+/// must still be gone.
+#[test]
+fn a_temp_dir_is_removed_even_when_the_test_that_made_it_panics() {
+    let mut made = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let v = TempDir::new("panics");
+        let file = v.write("deep/er/locked.md", "text");
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions).unwrap();
+        made = Some(v.path().to_path_buf());
+        panic!("the test fails here");
+    }));
+    assert!(result.is_err());
+    let path = made.expect("the directory was made before the panic");
+    assert!(!path.exists(), "{} was left behind", path.display());
+}
+
+/// A test of this file that makes its own directory the plain way is one whose directory stays
+/// behind when an assertion fails: the one place that does it is `TempDir`, which cleans up.
+#[test]
+fn no_test_of_this_file_makes_or_removes_a_directory_of_its_own() {
+    let source = include_str!("cli_test.rs");
+    // Written in two parts so that this test does not find itself.
+    let makes = concat!("std::env::", "temp_dir()");
+    let removes = concat!("remove_dir", "_all(");
+    assert_eq!(
+        source.matches(makes).count(),
+        1,
+        "a temp directory made outside `TempDir`"
+    );
+    assert_eq!(
+        source.matches(removes).count(),
+        1,
+        "a directory removed outside `TempDir`'s `Drop`, where a failed assertion skips it"
+    );
+}
 
 fn today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
@@ -866,24 +867,19 @@ fn daily_absolute_looking_folder_is_kept_inside_the_vault() {
 
 #[test]
 fn fmt_write_keeps_the_byte_order_mark() {
-    let temp_dir = std::env::temp_dir().join(format!("satz_fmt_bom_test_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let file_path = temp_dir.join("note.md");
+    let v = TempDir::new("fmt_bom");
+    let file_path = v.path().join("note.md");
     let mut before = vec![0xEF, 0xBB, 0xBF];
     before.extend_from_slice(b"---\ntitle: T\n---\n\n\n# Title  \n\ntext  \n");
     std::fs::write(&file_path, &before).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_satz"))
-        .args(["fmt", temp_dir.to_str().unwrap(), "--write"])
-        .output()
-        .expect("satz binary should execute");
+    let output = satz(&["fmt", v.str(), "--write"]);
     assert!(output.status.success());
 
     let after = std::fs::read(&file_path).unwrap();
     let mut expected = vec![0xEF, 0xBB, 0xBF];
     expected.extend_from_slice(b"---\ntitle: T\n---\n\n# Title\n\ntext\n");
     assert_eq!(after, expected);
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 // ---- `satz list`: filters combine with `--broken`, reasons are English ----

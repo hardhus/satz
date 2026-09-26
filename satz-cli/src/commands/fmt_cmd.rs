@@ -163,14 +163,29 @@ pub fn run_with_output(args: FmtArgs, out: &mut dyn Write) -> Result<Outcome> {
 mod tests {
     use super::*;
 
-    fn vault(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+    /// A vault directory that is removed when dropped, also when an assertion of the test fails.
+    struct Vault(PathBuf);
+
+    impl Vault {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Vault {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn vault(tag: &str, files: &[(&str, &str)]) -> Vault {
         let dir = std::env::temp_dir().join(format!("satz_fmt_unit_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         for (name, text) in files {
             fs::write(dir.join(name), text).unwrap();
         }
-        dir
+        Vault(dir)
     }
 
     fn args(path: &std::path::Path, check: bool) -> FmtArgs {
@@ -184,37 +199,33 @@ mod tests {
     #[test]
     fn check_reports_dirty_files_without_touching_them() {
         let dir = vault("dirty", &[("n.md", "# T  \n\ntext\n")]);
-        let outcome = run(args(&dir, true)).unwrap();
+        let outcome = run(args(dir.path(), true)).unwrap();
         assert_eq!(outcome, Outcome::NeedsFormatting);
         assert_eq!(
-            fs::read_to_string(dir.join("n.md")).unwrap(),
+            fs::read_to_string(dir.path().join("n.md")).unwrap(),
             "# T  \n\ntext\n"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn check_on_clean_files_is_clean() {
         let dir = vault("clean", &[("n.md", "# T\n\ntext\n")]);
-        assert_eq!(run(args(&dir, true)).unwrap(), Outcome::Clean);
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(run(args(dir.path(), true)).unwrap(), Outcome::Clean);
     }
 
     #[test]
     fn writing_formats_and_reports_clean() {
         let dir = vault("write", &[("n.md", "# T  \n\ntext\n")]);
-        assert_eq!(run(args(&dir, false)).unwrap(), Outcome::Clean);
+        assert_eq!(run(args(dir.path(), false)).unwrap(), Outcome::Clean);
         assert_eq!(
-            fs::read_to_string(dir.join("n.md")).unwrap(),
+            fs::read_to_string(dir.path().join("n.md")).unwrap(),
             "# T\n\ntext\n"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_empty_vault_is_clean() {
         let dir = vault("empty", &[]);
-        assert_eq!(run(args(&dir, true)).unwrap(), Outcome::Clean);
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(run(args(dir.path(), true)).unwrap(), Outcome::Clean);
     }
 }
