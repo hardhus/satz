@@ -2204,31 +2204,34 @@ pub(crate) mod tests {
 
     // ---- the first colours are right, and the refreshes do not wait for each other ----
 
-    #[tokio::test]
+    // The clock is virtual: it moves only when nothing else can run, so what is measured is the
+    // order of things, not the speed of the machine. `never` is decided by its 200 ms limit,
+    // `quick_one` by nothing at all, and the outer limit turns a `send_refresh` that stopped
+    // honouring its limit into a failure instead of a hang.
+    #[tokio::test(start_paused = true)]
     async fn a_refresh_that_is_never_answered_times_out_and_does_not_hold_back_another() {
-        let started = std::time::Instant::now();
-        let never = send_refresh(
-            "a",
-            std::future::pending::<Result<(), String>>(),
-            std::time::Duration::from_millis(200),
-        );
-        let quick_one = async {
-            let outcome = send_refresh(
-                "b",
-                async { Ok::<(), String>(()) },
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-            (outcome, started.elapsed())
+        use tokio::time::{Duration, Instant, timeout};
+        let started = Instant::now();
+        let both = async {
+            let never = send_refresh(
+                "a",
+                std::future::pending::<Result<(), String>>(),
+                Duration::from_millis(200),
+            );
+            let quick_one = async {
+                let outcome =
+                    send_refresh("b", async { Ok::<(), String>(()) }, Duration::from_secs(5)).await;
+                (outcome, started.elapsed())
+            };
+            tokio::join!(never, quick_one)
         };
-        let (never_outcome, (quick_outcome, quick_took)) = tokio::join!(never, quick_one);
+        let (never_outcome, (quick_outcome, quick_took)) = timeout(Duration::from_secs(60), both)
+            .await
+            .expect("a refresh that is never answered still ends at its own limit");
         assert_eq!(never_outcome, RefreshOutcome::TimedOut);
         assert_eq!(quick_outcome, RefreshOutcome::Answered);
-        assert!(
-            quick_took < std::time::Duration::from_millis(100),
-            "{quick_took:?}"
-        );
-        assert!(started.elapsed() >= std::time::Duration::from_millis(190));
+        assert_eq!(quick_took, Duration::ZERO, "the answered one waited");
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
     }
 
     #[tokio::test]
@@ -2299,6 +2302,47 @@ pub(crate) mod tests {
         SatzState::initialize_index(root)
     }
 
+    /// The first indexing of the one test that needs it to be held: it does not start until the
+    /// test opens the gate (so "still indexing" is a fact, not a race against a sleep) and gives
+    /// up on its own after 30 s, so a broken test cannot keep the runtime from shutting down.
+    /// One gate: only `a_first_indexing_slower_than_the_limit_does_not_hold_initialize_up` uses it.
+    static FIRST_INDEXING_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+        (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+    fn set_first_indexing_gate(open: bool) {
+        *FIRST_INDEXING_GATE.0.lock().unwrap() = open;
+        FIRST_INDEXING_GATE.1.notify_all();
+    }
+
+    /// Opens the gate when dropped, so a failed assertion does not leave the indexing held.
+    struct OpenGateOnDrop;
+    impl Drop for OpenGateOnDrop {
+        fn drop(&mut self) {
+            set_first_indexing_gate(true);
+        }
+    }
+
+    fn gated_job(root: PathBuf) -> anyhow::Result<SatzState> {
+        let (open, opened) = &FIRST_INDEXING_GATE;
+        let _ = opened
+            .wait_timeout_while(
+                open.lock().unwrap(),
+                std::time::Duration::from_secs(30),
+                |open| !*open,
+            )
+            .unwrap();
+        SatzState::initialize_index(root)
+    }
+
+    static NO_VAULT_JOB_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// The job of a server that has no vault folder: it must never be called.
+    fn counting_job(_root: PathBuf) -> anyhow::Result<SatzState> {
+        NO_VAULT_JOB_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("there is no vault to index")
+    }
+
     fn failing_job(_root: PathBuf) -> anyhow::Result<SatzState> {
         anyhow::bail!("the vault folder cannot be read")
     }
@@ -2354,31 +2398,35 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_first_indexing_slower_than_the_limit_does_not_hold_initialize_up() {
+        use std::time::Duration;
         let vault = VaultDir::new("slow", &[("a.md", "# A\n"), ("b.md", "# B\n")]);
-        let (backend, _service) =
-            fresh_backend(slow_job, std::time::Duration::from_millis(50)).await;
-        let started = std::time::Instant::now();
-        backend
-            .initialize(init_params(Some(&vault.0)))
-            .await
-            .unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(250),
-            "{:?}",
-            started.elapsed()
-        );
+        set_first_indexing_gate(false);
+        let _open_at_the_end = OpenGateOnDrop;
+        let (backend, _service) = fresh_backend(gated_job, Duration::from_millis(50)).await;
+        // The indexing cannot finish while the gate is shut, so `initialize` can only return by
+        // giving up its wait; the 10 s only turns an `initialize` that waits for the indexing
+        // into a failure instead of a hang.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            backend.initialize(init_params(Some(&vault.0))),
+        )
+        .await
+        .expect("initialize waited for an indexing that was held")
+        .unwrap();
         assert!(
             !backend.state.read().await.is_indexing_complete(),
             "still indexing"
         );
         // The indexing finishes in the background and the state becomes complete.
-        for _ in 0..100 {
-            if backend.state.read().await.is_indexing_complete() {
-                break;
+        set_first_indexing_gate(true);
+        let finished = async {
+            while !backend.state.read().await.is_indexing_complete() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(backend.state.read().await.is_indexing_complete());
+        };
+        tokio::time::timeout(Duration::from_secs(10), finished)
+            .await
+            .expect("the indexing never finished in the background");
         assert_eq!(backend.state.read().await.index.doc_count(), 2);
     }
 
@@ -2423,12 +2471,21 @@ pub(crate) mod tests {
         assert!(pending.as_ref().unwrap().failure.is_some());
     }
 
-    #[tokio::test]
+    // A virtual clock: it moves only when the runtime waits for a timer, so an `initialize` that
+    // slept or timed out for the 10 s it is allowed would show as 10 s here, however fast the
+    // machine is.
+    #[tokio::test(start_paused = true)]
     async fn without_a_vault_folder_initialize_does_not_wait_at_all() {
-        let (backend, _service) = fresh_backend(slow_job, std::time::Duration::from_secs(10)).await;
-        let started = std::time::Instant::now();
+        let (backend, _service) =
+            fresh_backend(counting_job, std::time::Duration::from_secs(10)).await;
+        let started = tokio::time::Instant::now();
         backend.initialize(init_params(None)).await.unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(
+            NO_VAULT_JOB_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "there is no folder to index"
+        );
         assert!(backend.state.read().await.is_indexing_complete());
         assert!(backend.pending_announcement.lock().unwrap().is_none());
     }

@@ -1895,12 +1895,12 @@ gitignore = \"always\"
         let mut state = open_state("# A\n");
         let big = format!("# A\n\n{}", "some words [[x]] and more\n".repeat(80_000));
         edit_buffer(&mut state, 2, &big);
-        let start = std::time::Instant::now();
         assert_eq!(state.refresh_stale_open_documents(), 1);
-        let first = start.elapsed();
-        let start = std::time::Instant::now();
-        assert_eq!(state.refresh_stale_open_documents(), 0);
-        assert!(start.elapsed() < first.max(std::time::Duration::from_millis(50)));
+        assert_eq!(
+            state.refresh_stale_open_documents(),
+            0,
+            "the second pass parsed the buffer again"
+        );
         assert!(links_of_a(&state).len() >= 80_000);
     }
 
