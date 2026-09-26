@@ -28,26 +28,6 @@ pub fn client_supports_document_changes(capabilities: &ClientCapabilities) -> bo
         .unwrap_or(false)
 }
 
-/// Whether the client answers `workspace/diagnostic/refresh` (LSP 3.17 `workspace.diagnostics.refreshSupport`).
-pub fn client_supports_diagnostic_refresh(capabilities: &ClientCapabilities) -> bool {
-    capabilities
-        .workspace
-        .as_ref()
-        .and_then(|w| w.diagnostics.as_ref())
-        .and_then(|d| d.refresh_support)
-        .unwrap_or(false)
-}
-
-/// Whether the client answers `workspace/semanticTokens/refresh`.
-pub fn client_supports_semantic_tokens_refresh(capabilities: &ClientCapabilities) -> bool {
-    capabilities
-        .workspace
-        .as_ref()
-        .and_then(|w| w.semantic_tokens.as_ref())
-        .and_then(|s| s.refresh_support)
-        .unwrap_or(false)
-}
-
 /// Logs a failed refresh request and says whether it succeeded. Nothing is retried: the client refetches on its own schedule anyway.
 pub(crate) fn refresh_succeeded<T, E: std::fmt::Display>(
     what: &str,
@@ -104,33 +84,17 @@ where
     }
 }
 
-/// Whether `workspace/diagnostic/refresh` is worth sending: to a client that pulls diagnostics.
-/// `refreshSupport` is not required: many clients answer the request (or ignore it harmlessly)
-/// without announcing it, and the refresh after the first indexing is what makes them fetch again.
-pub(crate) fn diagnostic_refresh_wanted(state: &SatzState) -> bool {
-    state.client_supports_pull_diagnostics
-}
-
-/// Whether `workspace/semanticTokens/refresh` is sent: always, to every client. The colours of a
-/// note opened during the first indexing are computed from an incomplete index (links look
-/// unresolved); this request is what makes the client ask again once it is complete. It must not
-/// depend on what the client announced (`refreshSupport`, or the semantic token capability): a
-/// client that announces neither but still answers it (Helix) would keep the wrong colours. A client
-/// that does not know the request just answers with an error, which is logged at debug level.
-pub(crate) fn semantic_tokens_refresh_wanted(_state: &SatzState) -> bool {
-    true
-}
-
-/// Asks a pull-diagnostics client to fetch again.
-pub(crate) async fn refresh_diagnostics(client: &Client, state: &Arc<RwLock<SatzState>>) {
-    if diagnostic_refresh_wanted(&*state.read().await) {
-        send_refresh(
-            "workspace/diagnostic/refresh",
-            client.send_request::<WorkspaceDiagnosticRefresh>(()),
-            REFRESH_TIMEOUT,
-        )
-        .await;
-    }
+/// Asks a pull-diagnostics client to fetch again. The caller has decided that the client pulls; what
+/// the client announced about refreshing does not matter: many clients answer the request (or ignore
+/// it harmlessly) without announcing `refreshSupport`, and the refresh after the first indexing is what
+/// makes them fetch again.
+pub(crate) async fn refresh_diagnostics(client: &Client) {
+    send_refresh(
+        "workspace/diagnostic/refresh",
+        client.send_request::<WorkspaceDiagnosticRefresh>(()),
+        REFRESH_TIMEOUT,
+    )
+    .await;
 }
 
 /// Publishes the diagnostics of each of the notes `uris`: what a push client is sent when what
@@ -154,22 +118,26 @@ pub(crate) async fn send_diagnostics_refresh(
     uris: &[String],
 ) {
     if supports_pull {
-        refresh_diagnostics(client, state).await;
+        refresh_diagnostics(client).await;
     } else {
         publish_for_all(client, state, uris).await;
     }
 }
 
-/// Asks the client to fetch semantic tokens again.
-pub(crate) async fn refresh_semantic_tokens(client: &Client, state: &Arc<RwLock<SatzState>>) {
-    if semantic_tokens_refresh_wanted(&*state.read().await) {
-        send_refresh(
-            "workspace/semanticTokens/refresh",
-            client.send_request::<SemanticTokensRefresh>(()),
-            REFRESH_TIMEOUT,
-        )
-        .await;
-    }
+/// Asks the client to fetch semantic tokens again: every client is sent this, whatever it announced.
+/// The colours of a note opened during the first indexing are computed from an incomplete index
+/// (links look unresolved); this request is what makes the client ask again once it is complete. It
+/// must not depend on what the client announced (`refreshSupport`, or the semantic token
+/// capability): a client that announces neither but still answers it (Helix) would keep the wrong
+/// colours. A client that does not know the request just answers with an error, which is logged at
+/// debug level.
+pub(crate) async fn refresh_semantic_tokens(client: &Client) {
+    send_refresh(
+        "workspace/semanticTokens/refresh",
+        client.send_request::<SemanticTokensRefresh>(()),
+        REFRESH_TIMEOUT,
+    )
+    .await;
 }
 
 /// Tells the client that what the open notes show may have changed under them: a pull client is
@@ -194,7 +162,7 @@ async fn announce_daily_change(client: Client, state: Arc<RwLock<SatzState>>) {
     state.write().await.clear_peers_dirty();
     tokio::join!(
         refresh_open_documents(&client, &state),
-        refresh_semantic_tokens(&client, &state)
+        refresh_semantic_tokens(&client)
     );
 }
 
@@ -318,18 +286,11 @@ async fn announce_reparse(
     }
     // Neither refresh waits for the other: a client that never answers one must not keep the
     // other from being sent.
-    tokio::join!(
-        async {
-            if plan.semantic_tokens {
-                refresh_semantic_tokens(client, state_arc).await;
-            }
-        },
-        async {
-            if plan.pull_diagnostics {
-                refresh_diagnostics(client, state_arc).await;
-            }
+    tokio::join!(refresh_semantic_tokens(client), async {
+        if plan.pull_diagnostics {
+            refresh_diagnostics(client).await;
         }
-    );
+    });
 }
 
 /// Which folder the server indexes, and which of the client's workspace folders it leaves out.
@@ -412,9 +373,9 @@ async fn refresh_after_first_index(client: &Client, state_arc: &Arc<RwLock<SatzS
     if !supports_pull {
         publish_for_all(client, state_arc, &uris).await;
     }
-    tokio::join!(refresh_semantic_tokens(client, state_arc), async {
+    tokio::join!(refresh_semantic_tokens(client), async {
         if supports_pull {
-            refresh_diagnostics(client, state_arc).await;
+            refresh_diagnostics(client).await;
         }
     });
 }
@@ -614,10 +575,6 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             state.client_supports_pull_diagnostics = supports_pull;
             state.client_supports_document_changes = supports_document_changes;
-            state.client_supports_diagnostic_refresh =
-                client_supports_diagnostic_refresh(&params.capabilities);
-            state.client_supports_semantic_tokens_refresh =
-                client_supports_semantic_tokens_refresh(&params.capabilities);
         }
 
         tracing::debug!(?vault_root, "initialize: resolved vault root");
@@ -1088,15 +1045,14 @@ impl LanguageServer for Backend {
     }
 }
 
-/// What to tell the client after an open document has been re-parsed.
+/// What to tell the client after an open document has been re-parsed. (`workspace/semanticTokens/
+/// refresh` is not part of the plan: every client is sent it.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RefreshPlan {
     /// Send `workspace/diagnostic/refresh` so a pull client fetches the new results.
     pub pull_diagnostics: bool,
     /// Publish diagnostics for the other open documents (push clients).
     pub push_peers: bool,
-    /// Send `workspace/semanticTokens/refresh`.
-    pub semantic_tokens: bool,
 }
 
 /// Decides the notifications after a debounced re-parse.
@@ -1104,24 +1060,12 @@ pub(crate) struct RefreshPlan {
 /// The client fetches diagnostics and tokens right after each edit -- before the debounced
 /// re-parse has updated the index -- so it always holds results one edit old. A pull client is
 /// therefore asked to fetch again after EVERY re-parse (not only when other documents are
-/// affected), and semantic tokens are refreshed too. A push client already gets its own
+/// affected), and so is the colouring of every client. A push client already gets its own
 /// document's diagnostics published; other documents only when what they depend on changed.
 pub(crate) fn refresh_after_reparse(peers_dirty: bool, supports_pull: bool) -> RefreshPlan {
-    plan_refresh(peers_dirty, supports_pull, true, true)
-}
-
-/// Like `refresh_after_reparse`, for a client that may not understand the refresh requests: they
-/// are only planned when it said it does (the client then fetches on its own schedule).
-pub(crate) fn plan_refresh(
-    peers_dirty: bool,
-    supports_pull: bool,
-    refresh_diagnostics: bool,
-    refresh_semantic_tokens: bool,
-) -> RefreshPlan {
     RefreshPlan {
-        pull_diagnostics: supports_pull && refresh_diagnostics,
+        pull_diagnostics: supports_pull,
         push_peers: peers_dirty && !supports_pull,
-        semantic_tokens: refresh_semantic_tokens,
     }
 }
 
@@ -1144,18 +1088,6 @@ pub(crate) mod tests {
         assert!(!clean.pull_diagnostics && !clean.push_peers);
         let dirty = refresh_after_reparse(true, false);
         assert!(!dirty.pull_diagnostics && dirty.push_peers);
-    }
-
-    #[test]
-    fn semantic_tokens_are_refreshed_after_every_reparse() {
-        for peers_dirty in [false, true] {
-            for supports_pull in [false, true] {
-                assert!(
-                    refresh_after_reparse(peers_dirty, supports_pull).semantic_tokens,
-                    "peers_dirty={peers_dirty} supports_pull={supports_pull}"
-                );
-            }
-        }
     }
 
     // ---- the server's advertised commands and how execute_command answers them ----
@@ -1424,84 +1356,6 @@ pub(crate) mod tests {
     }
 
     // ---- refresh requests only go to clients that said they understand them ----
-
-    fn caps_with(
-        diagnostics: Option<Option<bool>>,
-        semantic_tokens: Option<Option<bool>>,
-    ) -> ClientCapabilities {
-        ClientCapabilities {
-            workspace: Some(WorkspaceClientCapabilities {
-                diagnostics: diagnostics.map(|refresh_support| {
-                    DiagnosticWorkspaceClientCapabilities { refresh_support }
-                }),
-                semantic_tokens: semantic_tokens.map(|refresh_support| {
-                    SemanticTokensWorkspaceClientCapabilities { refresh_support }
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn refresh_support_is_read_from_the_client_capabilities() {
-        let nothing = ClientCapabilities::default();
-        assert!(!client_supports_diagnostic_refresh(&nothing));
-        assert!(!client_supports_semantic_tokens_refresh(&nothing));
-        // A workspace section without the entries.
-        let empty = caps_with(None, None);
-        assert!(!client_supports_diagnostic_refresh(&empty));
-        assert!(!client_supports_semantic_tokens_refresh(&empty));
-        // The entries without the flag, and with it false.
-        for flag in [None, Some(false)] {
-            let caps = caps_with(Some(flag), Some(flag));
-            assert!(!client_supports_diagnostic_refresh(&caps), "{flag:?}");
-            assert!(!client_supports_semantic_tokens_refresh(&caps), "{flag:?}");
-        }
-        // Each one independently.
-        let only_diag = caps_with(Some(Some(true)), Some(Some(false)));
-        assert!(client_supports_diagnostic_refresh(&only_diag));
-        assert!(!client_supports_semantic_tokens_refresh(&only_diag));
-        let only_tokens = caps_with(None, Some(Some(true)));
-        assert!(!client_supports_diagnostic_refresh(&only_tokens));
-        assert!(client_supports_semantic_tokens_refresh(&only_tokens));
-    }
-
-    #[test]
-    fn a_refresh_is_planned_only_when_the_client_supports_it() {
-        for peers_dirty in [false, true] {
-            for supports_pull in [false, true] {
-                for refresh_diag in [false, true] {
-                    for refresh_tokens in [false, true] {
-                        let plan =
-                            plan_refresh(peers_dirty, supports_pull, refresh_diag, refresh_tokens);
-                        let label = format!(
-                            "dirty={peers_dirty} pull={supports_pull} diag={refresh_diag} tokens={refresh_tokens}"
-                        );
-                        assert_eq!(
-                            plan.pull_diagnostics,
-                            supports_pull && refresh_diag,
-                            "{label}"
-                        );
-                        assert_eq!(plan.push_peers, peers_dirty && !supports_pull, "{label}");
-                        assert_eq!(plan.semantic_tokens, refresh_tokens, "{label}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_old_planning_function_assumes_a_client_that_supports_everything() {
-        for peers_dirty in [false, true] {
-            for supports_pull in [false, true] {
-                assert_eq!(
-                    refresh_after_reparse(peers_dirty, supports_pull),
-                    plan_refresh(peers_dirty, supports_pull, true, true)
-                );
-            }
-        }
-    }
 
     #[test]
     fn a_failed_refresh_request_is_reported_not_swallowed() {
@@ -2348,60 +2202,6 @@ pub(crate) mod tests {
         assert!(answer.is_ok(), "completion waited for a re-parse");
     }
 
-    // ---- the colour refresh does not depend on what the client announces ----
-
-    fn state_with(pull: bool, diag_refresh: bool, tokens_refresh: bool) -> SatzState {
-        let mut state = SatzState::default();
-        state.client_supports_pull_diagnostics = pull;
-        state.client_supports_diagnostic_refresh = diag_refresh;
-        state.client_supports_semantic_tokens_refresh = tokens_refresh;
-        state
-    }
-
-    #[test]
-    fn every_client_is_asked_to_fetch_semantic_tokens_again_whatever_it_announced() {
-        // A note opened during the first indexing is coloured from an incomplete index (its links
-        // look unresolved); this request after indexing is what fixes the colours. Before the
-        // clean-up it was sent unconditionally, and a client that does not announce
-        // `refreshSupport` (Helix) then never got it: the links stayed uncoloured on first open.
-        for pull in [false, true] {
-            for diag_refresh in [false, true] {
-                for tokens_refresh in [false, true] {
-                    assert!(
-                        semantic_tokens_refresh_wanted(&state_with(
-                            pull,
-                            diag_refresh,
-                            tokens_refresh
-                        )),
-                        "pull={pull} diag_refresh={diag_refresh} tokens_refresh={tokens_refresh}"
-                    );
-                }
-            }
-        }
-        assert!(
-            semantic_tokens_refresh_wanted(&SatzState::default()),
-            "a client that announced nothing"
-        );
-    }
-
-    #[test]
-    fn the_refresh_after_indexing_and_the_one_after_a_reparse_both_include_semantic_tokens() {
-        for peers_dirty in [false, true] {
-            for supports_pull in [false, true] {
-                assert!(refresh_after_reparse(peers_dirty, supports_pull).semantic_tokens);
-                assert!(plan_refresh(peers_dirty, supports_pull, true, true).semantic_tokens);
-            }
-        }
-    }
-
-    #[test]
-    fn a_pull_client_is_refreshed_even_without_announcing_it_and_a_push_client_never() {
-        assert!(diagnostic_refresh_wanted(&state_with(true, false, false)));
-        assert!(diagnostic_refresh_wanted(&state_with(true, true, true)));
-        assert!(!diagnostic_refresh_wanted(&state_with(false, true, true)));
-        assert!(!diagnostic_refresh_wanted(&SatzState::default()));
-    }
-
     // ---- the first colours are right, and the refreshes do not wait for each other ----
 
     #[tokio::test]
@@ -3001,6 +2801,127 @@ pub(crate) mod tests {
             ),
             1,
             "the open note is told, a new note may resolve its links: {sent:?}"
+        );
+    }
+
+    // ---- the refresh requests need nothing from the client's announcements, nor from the state ----
+
+    #[tokio::test]
+    async fn the_refresh_requests_do_not_wait_for_the_state() {
+        // A writer holds the state (an edit being applied, a reparse taking its turn). Asking the
+        // client to fetch again is not something the state has a say in: the requests go out.
+        let (backend, mut from_server) = connected_backend().await;
+        backend.state.write().await.client_supports_pull_diagnostics = true;
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+
+        let writer = backend.state.write().await;
+        let client = backend.client.clone();
+        let asking = tokio::spawn(async move {
+            tokio::join!(
+                refresh_semantic_tokens(&client),
+                refresh_diagnostics(&client)
+            )
+        });
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(400)).await;
+        drop(writer);
+        asking.abort();
+
+        assert_eq!(
+            count_of(&sent, "workspace/semanticTokens/refresh", None),
+            1,
+            "{sent:?}"
+        );
+        assert_eq!(
+            count_of(&sent, "workspace/diagnostic/refresh", None),
+            1,
+            "{sent:?}"
+        );
+    }
+
+    /// What a client is sent after the note it has open was edited and the reparse went through:
+    /// `(publishDiagnostics for the note, workspace/diagnostic/refresh, workspace/semanticTokens/refresh)`.
+    /// The client announced nothing about refreshing (the handshake of `connected_backend`).
+    async fn sent_after_a_reparse(pull: bool) -> (usize, usize, usize) {
+        let (backend, mut from_server) = connected_backend().await;
+        backend
+            .did_open(open_params("file:///p.md", 1, "# P\n\n[[a]]\n"))
+            .await;
+        {
+            let mut state = backend.state.write().await;
+            state.client_supports_pull_diagnostics = pull;
+            state.config.lsp.reparse_debounce_ms = 40;
+            state.config.lsp.reparse_max_wait_ms = 40;
+        }
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+
+        backend
+            .did_change(change_params("file:///a.md", 2, "# Renamed\n"))
+            .await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(400)).await;
+        (
+            count_of(&sent, "textDocument/publishDiagnostics", None),
+            count_of(&sent, "workspace/diagnostic/refresh", None),
+            count_of(&sent, "workspace/semanticTokens/refresh", None),
+        )
+    }
+
+    #[tokio::test]
+    async fn after_a_reparse_every_client_is_asked_for_fresh_colours_and_gets_the_diagnostics_its_way()
+     {
+        // Whatever the client said about refreshing (here: nothing), it is asked to fetch the colours
+        // again (Helix does not announce it and still answers). A pull client is asked to fetch the
+        // diagnostics again; a push client is sent them: its own note's and the other open one's.
+        let (published, diagnostic_refreshes, colour_refreshes) = sent_after_a_reparse(false).await;
+        assert_eq!(
+            (published, diagnostic_refreshes, colour_refreshes),
+            (2, 0, 1),
+            "push client"
+        );
+        let (published, diagnostic_refreshes, colour_refreshes) = sent_after_a_reparse(true).await;
+        assert_eq!(
+            (published, diagnostic_refreshes, colour_refreshes),
+            (0, 1, 1),
+            "pull client"
+        );
+    }
+
+    /// What the client is sent when the first indexing has finished while a note was already open:
+    /// `(publishDiagnostics, workspace/diagnostic/refresh, workspace/semanticTokens/refresh)`. The
+    /// client announced nothing about refreshing.
+    async fn sent_after_the_first_indexing(pull: bool) -> (usize, usize, usize) {
+        let (backend, mut from_server) = connected_backend().await;
+        backend.state.write().await.client_supports_pull_diagnostics = pull;
+        let _ = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(300)).await;
+
+        // The requests wait for an answer that never comes (up to `REFRESH_TIMEOUT`): what is
+        // counted is what was sent.
+        let (client, state) = (backend.client.clone(), backend.state.clone());
+        let asking = tokio::spawn(async move { refresh_after_first_index(&client, &state).await });
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(400)).await;
+        asking.abort();
+        (
+            count_of(
+                &sent,
+                "textDocument/publishDiagnostics",
+                Some("file:///a.md"),
+            ),
+            count_of(&sent, "workspace/diagnostic/refresh", None),
+            count_of(&sent, "workspace/semanticTokens/refresh", None),
+        )
+    }
+
+    #[tokio::test]
+    async fn after_the_first_indexing_every_client_is_asked_for_fresh_colours_and_gets_the_diagnostics_its_way()
+     {
+        assert_eq!(
+            sent_after_the_first_indexing(false).await,
+            (1, 0, 1),
+            "push client"
+        );
+        assert_eq!(
+            sent_after_the_first_indexing(true).await,
+            (0, 1, 1),
+            "pull client"
         );
     }
 }

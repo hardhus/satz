@@ -93,7 +93,7 @@ pub fn debounce_delay(
 }
 
 /// What is remembered about one content hash.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum CachedFormat {
     /// The document is already formatted: nothing needs to be kept.
     Unchanged,
@@ -117,7 +117,7 @@ pub enum CacheUpdate {
 /// Once at capacity, new distinct hashes are not cached (existing entries keep serving hits);
 /// `retain_hashes` is how entries of documents that no longer exist are dropped, so the capacity
 /// always goes to current content.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FormatCache {
     entries: HashMap<u64, CachedFormat>,
     capacity: usize,
@@ -214,12 +214,6 @@ pub struct SatzState {
     /// Counts configuration changes (reload, first load): part of every diagnostics result id.
     pub config_revision: u64,
 
-    /// Whether the client answers `workspace/diagnostic/refresh`.
-    pub client_supports_diagnostic_refresh: bool,
-
-    /// Whether the client answers `workspace/semanticTokens/refresh`.
-    pub client_supports_semantic_tokens_refresh: bool,
-
     /// Flag indicating that open document identity keys changed and peers need diagnostic refresh
     peers_dirty: bool,
 
@@ -233,10 +227,6 @@ pub struct SatzState {
     /// diagnostics rather than that false positive — the `workspace/diagnostic/refresh` push
     /// sent once indexing finishes will make the client re-pull the real results.
     indexing_complete: bool,
-}
-
-pub fn identity_keys(d: &satz_core::Document) -> std::collections::HashSet<String> {
-    d.identity_keys()
 }
 
 /// Everything about a document that OTHER open documents' diagnostics depend on: the keys they can
@@ -405,9 +395,6 @@ impl SatzState {
         new_state.client_supports_pull_diagnostics = self.client_supports_pull_diagnostics;
         new_state.client_supports_document_changes = self.client_supports_document_changes;
         new_state.config_revision = self.config_revision + 1;
-        new_state.client_supports_diagnostic_refresh = self.client_supports_diagnostic_refresh;
-        new_state.client_supports_semantic_tokens_refresh =
-            self.client_supports_semantic_tokens_refresh;
         new_state.open_docs = std::mem::take(&mut self.open_docs);
         for doc in new_state.open_docs.values() {
             let rel_path = Self::get_rel_path(&doc.path, new_state.vault_root.as_deref());
@@ -507,8 +494,6 @@ impl SatzState {
             client_supports_pull_diagnostics: false,
             client_supports_document_changes: false,
             config_revision: 0,
-            client_supports_diagnostic_refresh: false,
-            client_supports_semantic_tokens_refresh: false,
             peers_dirty: false,
             format_cache,
             indexing_complete: true,
@@ -859,8 +844,8 @@ mod tests {
             Path::new("doc.md"),
         );
 
-        let keys1 = identity_keys(&doc1);
-        let keys2 = identity_keys(&doc2);
+        let keys1 = doc1.identity_keys();
+        let keys2 = doc2.identity_keys();
 
         assert_ne!(keys1, keys2);
         assert!(keys1.contains("eski baslik") || keys1.contains("eski başlık"));
@@ -2124,10 +2109,10 @@ gitignore = \"always\"
     fn a_finished_index_keeps_what_the_client_can_do() {
         let mut state = SatzState::default();
         state.client_supports_pull_diagnostics = true;
-        state.client_supports_diagnostic_refresh = true;
+        state.client_supports_document_changes = true;
         state.finish_indexing(Ok(SatzState::default()), Path::new("/vault"));
         assert!(state.client_supports_pull_diagnostics);
-        assert!(state.client_supports_diagnostic_refresh);
+        assert!(state.client_supports_document_changes);
     }
 
     // ---- a config with mistakes: the rest applies, the mistakes are reported ----
