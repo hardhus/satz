@@ -94,16 +94,21 @@ satz resolve --vault . "[[TLP]]"
 
 satz resolve --vault . "note#Some Heading"
 # notes/note.md:14
+
+satz resolve --vault . "[[note#^quote]]"
+# notes/note.md:31
 ```
 
-Accepts the target with or without surrounding `[[` `]]`, and with or without a `#heading` suffix. Resolution order matches `Index::resolve_link`: exact relative path → path with `.md` appended → filename stem → title/alias (case- and Unicode-fold-insensitive). If a `#heading` suffix is given and a matching heading is found, output is `path:line` (1-indexed); otherwise just `path`.
+Accepts a wikilink target as it is written in a note: with or without surrounding `[[` `]]`, with a `#heading` or a `#^block` suffix, with a `|shown` display part (`[[note|shown]]`, and `\|` inside a table cell) and with the `!` of an embed (`![[note]]`). It is read by the same parser the language server uses, so a link means the same here as in the editor. Resolution order matches `Index::resolve_link`: exact relative path → path with `.md` appended → filename stem → title/alias (case- and Unicode-fold-insensitive).
+
+If a `#heading` or `#^block` suffix is given and the note has it, the output is `path:line` (1-indexed): a heading is found as in the editor (by its text or its slug, ignoring case, spacing and punctuation, `ı` and `i` counting as one letter; the first of equal headings), a block by its id (any case), and the line is the heading's, or the line the `^id` stands on (the last line of a paragraph). Otherwise, and for an empty `#` or `#^`, just `path`.
 
 If the target can't be resolved at all, `satz` exits with status `1` and prints `not found: <target>` to stderr. Note that relative daily aliases (`[[bugün]]` etc., see [`docs/configuration.md`](configuration.md)) are **not** resolved by this command — only by the LSP.
 
 | Arg | Default | Meaning |
 |---|---|---|
 | `-v, --vault <path>` | `.` | Vault root. |
-| `target` (positional) | — | Required. The wikilink target to resolve. |
+| `target` (positional) | — | Required. The wikilink target to resolve: `note`, `[[note#Heading]]`, `[[note#^block]]`, `[[note\|shown]]`, `![[note]]`. |
 
 ## `satz daily [path]`
 

@@ -1450,6 +1450,48 @@ fn resolve_of_an_unknown_target_exits_1_with_the_target_on_stderr_and_no_stdout(
 }
 
 #[test]
+fn resolve_reads_a_target_as_the_language_server_reads_a_link() {
+    let v = resolve_vault("resolve_forms");
+    v.write("k.md", "# K\n\ntext ^kb\n");
+    let shown = |rel: &str| v.path().join(rel).display().to_string();
+    // What is copied out of a note: the display part, the embed mark, a block anchor.
+    for (target, expected) in [
+        ("[[b|shown]]", shown("b.md")),
+        ("![[b]]", shown("b.md")),
+        ("![[b|300]]", shown("b.md")),
+        ("[[h#Heading|shown]]", format!("{}:3", shown("h.md"))),
+        ("[[k#^kb]]", format!("{}:3", shown("k.md"))),
+        ("k#^KB", format!("{}:3", shown("k.md"))),
+        // a block the note does not have: the note
+        ("[[k#^nope]]", shown("k.md")),
+    ] {
+        let o = satz(&["resolve", "-v", v.str(), target]);
+        assert_eq!(o.status.code(), Some(0), "{target:?}: {}", err(&o));
+        assert_eq!(out(&o), format!("{expected}\n"), "{target:?}");
+        assert_eq!(err(&o), "", "{target:?}");
+    }
+    // A note that is not there is reported by its name, without the display part or the anchor.
+    for target in [
+        "[[nothing|x]]",
+        "![[nothing]]",
+        "![[nothing#h|x]]",
+        "[[nothing#^kb]]",
+    ] {
+        let o = satz(&["resolve", "-v", v.str(), target]);
+        assert_eq!(o.status.code(), Some(1), "{target:?}");
+        assert_eq!(out(&o), "", "{target:?}");
+        assert_eq!(err(&o), "not found: nothing\n", "{target:?}");
+    }
+    // A target that names nothing the parser reads as a link (`[[|x]]`: only a display part) has
+    // no note to report either.
+    for target in ["[[|x]]", "|x", "[[|x#h]]"] {
+        let o = satz(&["resolve", "-v", v.str(), target]);
+        assert_eq!(o.status.code(), Some(1), "{target:?}");
+        assert_eq!(err(&o), "not found: \n", "{target:?}");
+    }
+}
+
+#[test]
 fn resolve_reports_found_and_not_found_as_an_outcome_and_writes_only_what_it_found() {
     use satz_cli::commands::resolve_cmd::{Outcome, ResolveArgs, run_with_output};
     let v = resolve_vault("resolve_outcome");
