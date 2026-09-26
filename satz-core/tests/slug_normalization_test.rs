@@ -62,18 +62,45 @@ fn plain_ascii_and_already_composed_text_is_unchanged() {
 }
 
 #[test]
-fn a_very_long_decomposed_string_is_folded_quickly() {
+fn a_very_long_decomposed_string_is_folded_correctly() {
     let text = "u\u{308}".repeat(100_000);
-    let start = std::time::Instant::now();
     let key = fold_key(&text);
     let slug = slugify(&text);
     assert_eq!(key.chars().count(), 100_000);
     assert_eq!(slug, "ü".repeat(100_000));
-    assert!(
-        start.elapsed() < std::time::Duration::from_millis(500),
-        "{:?}",
-        start.elapsed()
-    );
+}
+
+type Fold = fn(&str) -> String;
+
+/// The best of `runs` timings of `fold` over `pairs` decomposed letters.
+fn best_time_of(fold: Fold, pairs: usize, runs: usize) -> std::time::Duration {
+    let text = "u\u{308}".repeat(pairs);
+    (0..runs)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            std::hint::black_box(fold(std::hint::black_box(&text)));
+            start.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
+/// How the time grows is checked, not how long it takes: four times the text takes about four
+/// times as long (a quadratic fold would take about sixteen). Both sizes are timed on the same
+/// machine at the same moment and the best of five runs of each is compared, so a slow or busy
+/// machine slows both alike; the limit of ten sits between the two.
+#[test]
+fn folding_time_grows_in_step_with_the_length_of_the_text() {
+    let folds: [(&str, Fold); 2] = [("fold_key", fold_key), ("slugify", slugify)];
+    for (name, fold) in folds {
+        let small = best_time_of(fold, 10_000, 5);
+        let large = best_time_of(fold, 40_000, 5);
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(
+            ratio < 10.0,
+            "{name}: 4x the text took {ratio:.1}x the time ({small:?} -> {large:?})"
+        );
+    }
 }
 
 fn index_of(files: &[(&str, &str)]) -> Index {
