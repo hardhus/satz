@@ -431,10 +431,11 @@ fn replace_last_segment(target: &str, new_stem: &str) -> String {
         Some(i) => (&target[..=i], &target[i + 1..]),
         None => ("", target),
     };
-    let ext = if file.len() >= 3 && file[file.len() - 3..].eq_ignore_ascii_case(".md") {
-        &file[file.len() - 3..]
-    } else {
-        ""
+    // The last three BYTES are `.md` only if they start a letter: a name such as `Çalışma` or `İş`
+    // has a letter of two bytes there, and cutting it in the middle would panic.
+    let ext = match file.len().checked_sub(3).and_then(|cut| file.get(cut..)) {
+        Some(tail) if tail.eq_ignore_ascii_case(".md") => tail,
+        _ => "",
     };
     format!("{dir}{new_stem}{ext}")
 }
@@ -1201,6 +1202,84 @@ mod tests {
         assert_eq!(applied.renames[0].1, "new.md");
         let applied = v.rename("b.md", 0, 7, "new.md.md").unwrap();
         assert_eq!(applied.renames[0].1, "new.md.md");
+    }
+
+    #[test]
+    fn the_last_segment_is_replaced_and_the_extension_kept_whatever_the_letters() {
+        for (target, new_stem, expected) in [
+            ("a", "c", "c"),
+            ("a.md", "c", "c.md"),
+            ("sub/a.MD", "c", "sub/c.MD"),
+            ("sub\\a.md", "c", "sub\\c.md"),
+            ("md", "c", "c"),
+            (".md", "c", "c.md"),
+            ("a.m", "c", "c"),
+            // Letters of more than one byte where the last three bytes would start.
+            ("İş", "c", "c"),
+            ("Çalışma", "c", "c"),
+            ("çalışma.md", "c", "c.md"),
+            ("dir/İş.md", "c", "dir/c.md"),
+            ("dir/Öğrenci", "c", "dir/c"),
+            ("😀", "c", "c"),
+            ("a😀", "c", "c"),
+            ("日本語", "c", "c"),
+            ("日本語.md", "c", "c.md"),
+        ] {
+            assert_eq!(
+                replace_last_segment(target, new_stem),
+                expected,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_note_whose_name_ends_in_letters_of_more_than_one_byte_can_be_renamed() {
+        for name in ["İş", "Çalışma", "Öğrenci", "ışık", "日本語", "a😀"] {
+            // On a link with a heading the heading is renamed, on the others the note is.
+            for (link, expected, renames_the_file) in [
+                (format!("[[{name}]]"), "[[renamed]]".to_string(), true),
+                (
+                    format!("[[{name}#H]]"),
+                    format!("[[{name}#renamed]]"),
+                    false,
+                ),
+                (format!("![[{name}]]"), "![[renamed]]".to_string(), true),
+                (
+                    format!("[t]({name}.md)"),
+                    "[t](renamed.md)".to_string(),
+                    true,
+                ),
+            ] {
+                // (`vault` wants the paths as `'static`; a few leaked bytes in a test)
+                let note: &'static str = Box::leak(format!("{name}.md").into_boxed_str());
+                let text = format!(
+                    "Link {link}
+"
+                );
+                let v = vault(&[(note, "# X\n\n## H\n"), ("b.md", text.as_str())]);
+                let col = if link.starts_with('!') { 8 } else { 7 };
+                let applied = v
+                    .rename("b.md", 0, col, "renamed")
+                    .unwrap_or_else(|e| panic!("{link}: {e}"));
+                assert_eq!(
+                    applied.texts["b.md"],
+                    format!(
+                        "Link {expected}
+"
+                    ),
+                    "{link}"
+                );
+                assert_eq!(
+                    applied.renames.len(),
+                    usize::from(renames_the_file),
+                    "{link}"
+                );
+                if renames_the_file {
+                    assert_eq!(applied.renames[0].1, "renamed.md", "{link}");
+                }
+            }
+        }
     }
 
     #[test]
