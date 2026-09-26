@@ -165,6 +165,26 @@ fn names_a_non_heading_anchor(target: &Document, fragment: Option<&str>) -> bool
     })
 }
 
+/// What the resolution of `link` comes to for what the user is TOLD about it (a diagnostic, a
+/// colour, a hint): a Markdown link whose fragment is no heading but a real anchor (`[t](#top)`,
+/// `[t](note.md#custom-id)`: a viewer's own anchor, or an HTML id the note defines itself) is not a
+/// broken reference, so it counts as resolved. What the link IS (where go-to-definition leads,
+/// what hover shows, what a rename touches) is still the plain resolution.
+pub(crate) fn as_the_user_sees_it<'a>(
+    link: &satz_core::Link,
+    resolution: satz_core::LinkResolution<'a>,
+) -> satz_core::LinkResolution<'a> {
+    match resolution {
+        satz_core::LinkResolution::AnchorMissing { doc }
+            if link.kind == LinkKind::Markdown
+                && names_a_non_heading_anchor(doc, link.target_heading.as_deref()) =>
+        {
+            satz_core::LinkResolution::Resolved { doc, anchor: None }
+        }
+        other => other,
+    }
+}
+
 /// Whether a frontmatter block has a line that starts like a YAML key (`title:`, `my-key: value`).
 fn looks_like_yaml_keys(block: &str) -> bool {
     block.lines().any(|line| {
@@ -197,7 +217,10 @@ pub fn compute_diagnostics(
                     continue;
                 }
                 let range = byte_range_to_lsp(link.range, &doc.line_index);
-                match index.resolve_link_full_with_config(link, Some(doc), Some(config)) {
+                match as_the_user_sees_it(
+                    link,
+                    index.resolve_link_full_with_config(link, Some(doc), Some(config)),
+                ) {
                     satz_core::LinkResolution::DocMissing => {
                         let code = if link.kind == LinkKind::Embed {
                             "broken-embed"
@@ -218,14 +241,6 @@ pub fn compute_diagnostics(
                             ..Default::default()
                         });
                     }
-                    // `[t](#top)`, `[t](note.md#custom-id)`: a Markdown link's fragment may also name
-                    // a viewer's own anchor (`#top`) or an HTML id the note defines itself.
-                    satz_core::LinkResolution::AnchorMissing { doc: target }
-                        if link.kind == LinkKind::Markdown
-                            && names_a_non_heading_anchor(
-                                target,
-                                link.target_heading.as_deref(),
-                            ) => {}
                     satz_core::LinkResolution::AnchorMissing { .. } => {
                         let message = if let Some(h) = &link.target_heading {
                             if link.target_doc.is_empty() {

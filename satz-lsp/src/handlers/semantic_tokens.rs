@@ -213,10 +213,11 @@ pub fn semantic_tokens_full(
                     continue;
                 }
 
-                let token_type = match state.index.resolve_link_full_with_config(
+                let token_type = match crate::handlers::diagnostics::as_the_user_sees_it(
                     link,
-                    Some(doc),
-                    Some(&state.config),
+                    state
+                        .index
+                        .resolve_link_full_with_config(link, Some(doc), Some(&state.config)),
                 ) {
                     satz_core::LinkResolution::Resolved { .. } => 0,
                     satz_core::LinkResolution::AnchorMissing { .. }
@@ -231,7 +232,28 @@ pub fn semantic_tokens_full(
                 );
             }
             LinkKind::Embed => {
-                push_link_tokens(&mut raw_tokens, source, link, 4, split_link_display);
+                // An embed of something that is there has its own colour; one that is not is as
+                // broken as a link (the diagnostic and the hint say so too).
+                let token_type = if satz_core::model::link::is_external_target(&link.target_doc) {
+                    4
+                } else {
+                    match state.index.resolve_link_full_with_config(
+                        link,
+                        Some(doc),
+                        Some(&state.config),
+                    ) {
+                        satz_core::LinkResolution::Resolved { .. } => 4,
+                        satz_core::LinkResolution::AnchorMissing { .. }
+                        | satz_core::LinkResolution::DocMissing => 1,
+                    }
+                };
+                push_link_tokens(
+                    &mut raw_tokens,
+                    source,
+                    link,
+                    token_type,
+                    split_link_display,
+                );
             }
             // A `LinkKind::Footnote` in `doc.links` only ever exists for a `[^label]` reference
             // that already has a matching definition (pulldown-cmark leaves an undefined
@@ -601,5 +623,51 @@ mod tests {
         );
         assert_eq!(lf, crlf);
         assert_eq!(lf.len(), 4);
+    }
+
+    /// The type of the token that starts a note made of `link` alone (`doc-b.md` is next to it).
+    fn type_of_the_first_token(link: &str) -> u32 {
+        let data = decoded(&format!("{link}\n"));
+        let first = data
+            .iter()
+            .find(|t| t.0 == 0 && t.1 == 0)
+            .unwrap_or_else(|| panic!("no token at the start of {link}: {data:?}"));
+        first.3
+    }
+
+    #[test]
+    fn a_markdown_link_to_a_real_anchor_that_is_no_heading_is_coloured_as_resolved() {
+        // The diagnostics do not call `#top` broken; nor do the colours. A wikilink has no such
+        // rule, and a fragment that is nothing is still an unresolved link.
+        for (link, expected) in [
+            ("[t](doc-b.md#top)", 0),
+            ("[t](doc-b.md#TOP)", 0),
+            ("[t](#top)", 0),
+            ("[t](doc-b.md#nothing)", 1),
+            ("[t](#nothing)", 1),
+            ("[[doc-b#top]]", 1),
+            ("[t](ghost.md#top)", 1),
+        ] {
+            assert_eq!(type_of_the_first_token(link), expected, "{link}");
+        }
+    }
+
+    #[test]
+    fn an_embed_is_coloured_by_what_it_resolves_to() {
+        // `embed` (4) for an embed of something that is there, `unresolvedLink` (1) for one that
+        // is not (the diagnostic and the hint say so too), and an embed of an address elsewhere
+        // has nothing to resolve.
+        for (link, expected) in [
+            ("![[doc-b]]", 4),
+            ("![[doc-b#Doc B]]", 4),
+            ("![[doc-b|300]]", 4),
+            ("![[ghost]]", 1),
+            ("![[pic.png]]", 1),
+            ("![[doc-b#nothing]]", 1),
+            ("![[#nothing]]", 1),
+            ("![[https://example.com/x.png]]", 4),
+        ] {
+            assert_eq!(type_of_the_first_token(link), expected, "{link}");
+        }
     }
 }

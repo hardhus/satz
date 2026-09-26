@@ -43,7 +43,10 @@ pub fn inlay_hint(params: InlayHintParams, state: &SatzState) -> Option<Vec<Inla
                     continue;
                 }
 
-                let resolution = state.resolve(link, doc);
+                let resolution = crate::handlers::diagnostics::as_the_user_sees_it(
+                    link,
+                    state.resolve(link, doc),
+                );
                 if same_note
                     && !matches!(resolution, satz_core::LinkResolution::AnchorMissing { .. })
                 {
@@ -192,19 +195,28 @@ mod tests {
 
     /// `((line, col), label)` of every hint `inlay_hint` returns for `A_TEXT` in `range`.
     fn hints_in(range: Range) -> Vec<((u32, u32), String)> {
+        hints_of(A_TEXT, range)
+    }
+
+    /// The hints for `text`, a note `a.md` next to `b.md` (heading `Real`, block `blk`, and an HTML
+    /// anchor `custom`).
+    fn hints_of(text: &str, range: Range) -> Vec<((u32, u32), String)> {
         let rel_a = Path::new("a.md");
         let mut config = VaultConfig::default();
         config.lsp.inlay_hints.enable = true;
         let mut state = SatzState::default();
         state.index = Index::build(vec![
-            parse_document(A_TEXT, rel_a),
-            parse_document("# B\n\n## Real\n\ntext ^blk\n", Path::new("b.md")),
+            parse_document(text, rel_a),
+            parse_document(
+                "# B\n\n## Real\n\ntext ^blk\n\n<a id=\"custom\"></a>\n",
+                Path::new("b.md"),
+            ),
         ]);
         state.config = config;
         state.set_vault_root(Some(Path::new("").to_path_buf()));
         state.open_docs.insert(
             "file:///a.md".to_string(),
-            crate::state::OpenDocument::new("file:///a.md", rel_a.to_path_buf(), A_TEXT, 1),
+            crate::state::OpenDocument::new("file:///a.md", rel_a.to_path_buf(), text, 1),
         );
         let params = InlayHintParams {
             work_done_progress_params: Default::default(),
@@ -269,5 +281,25 @@ mod tests {
         assert_eq!(hints_in(exact), vec![((0, 5), " (B)".to_string())]);
         let just_before = Range::new(Position::new(0, 0), Position::new(0, 4));
         assert!(hints_in(just_before).is_empty());
+    }
+
+    #[test]
+    fn a_markdown_link_to_a_real_anchor_that_is_no_heading_is_not_flagged() {
+        // `#top` and an HTML id are anchors, the diagnostics do not call them broken, and neither
+        // does the hint. A wikilink has no such rule; a fragment that is nothing is still flagged.
+        let cases = [
+            ("[t](b.md#top)", vec![" (B)"]),
+            ("[t](b.md#TOP)", vec![" (B)"]),
+            ("[t](b.md#custom)", vec![" (B)"]),
+            ("[t](#top)", vec![]),
+            ("[t](b.md#nothing)", vec![" \u{26a0} heading not found"]),
+            ("[t](#nothing)", vec![" \u{26a0} heading not found"]),
+            ("[[b#top]]", vec![" \u{26a0} heading not found"]),
+        ];
+        for (link, expected) in cases {
+            let hints = hints_of(&format!("{link}\n"), whole_document());
+            let labels: Vec<&str> = hints.iter().map(|(_, l)| l.as_str()).collect();
+            assert_eq!(labels, expected, "{link}");
+        }
     }
 }
