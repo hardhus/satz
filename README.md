@@ -39,7 +39,7 @@ Full breakdowns: [`docs/cli.md`](docs/cli.md) and [`docs/lsp.md`](docs/lsp.md).
 
 ## Installation
 
-satz is not published to crates.io (`publish = false` — see [License](#license)). Build it from source:
+satz is not published to crates.io (`publish = false` — see [License](#license)). Build it from source, with Rust 1.88 or newer (the `rust-version` in `Cargo.toml`, built in CI on Linux, Windows and macOS):
 
 ```sh
 git clone https://github.com/hardhus/satz.git

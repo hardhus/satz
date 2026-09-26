@@ -23,5 +23,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
         if: matrix.os == 'ubuntu-latest'
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # `--locked`: the lock file is what is built and tested; a change that would have to
+      # rewrite it fails here instead of passing with a lock file nobody committed.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # The oldest Rust the project claims (`rust-version` in Cargo.toml) is built, so a newer
+  # language feature or std API cannot get in unnoticed. The version is read from Cargo.toml,
+  # not written here a second time.
+  msrv:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        shell: bash
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
