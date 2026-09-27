@@ -853,7 +853,10 @@ mod tests {
     }
 
     fn uri_of(rel: &str) -> String {
-        path_to_uri(&root().join(rel)).unwrap().as_str().to_string()
+        path_to_uri(&root().join(crate::convert::native_path(rel)))
+            .unwrap()
+            .as_str()
+            .to_string()
     }
 
     struct Vault {
@@ -866,7 +869,7 @@ mod tests {
         state.index = Index::build(
             files
                 .iter()
-                .map(|(rel, text)| parse_document(text, Path::new(rel)))
+                .map(|(rel, text)| parse_document(text, &crate::convert::native_path(rel)))
                 .collect(),
         );
         state.set_vault_root(Some(root()));
@@ -874,7 +877,12 @@ mod tests {
             let uri = uri_of(rel);
             state.open_docs.insert(
                 uri.clone(),
-                crate::state::OpenDocument::new(&uri, root().join(rel), *text, 1),
+                crate::state::OpenDocument::new(
+                    &uri,
+                    root().join(crate::convert::native_path(rel)),
+                    *text,
+                    1,
+                ),
             );
         }
         Vault {
@@ -1307,6 +1315,31 @@ mod tests {
         // Renaming a note to itself (or only its case) is not a collision.
         assert!(v.rename("b.md", 0, 7, "a").is_ok());
         assert!(v.rename("b.md", 0, 7, "A").is_ok());
+    }
+
+    #[test]
+    fn a_name_taken_in_a_folder_is_refused_there_too() {
+        // The note lives in a folder, so its path has the separator of the platform in it.
+        let v = vault(&[
+            (
+                "sub/deep/a.md",
+                "# A
+",
+            ),
+            (
+                "sub/deep/taken.md",
+                "# T
+",
+            ),
+            (
+                "b.md",
+                "Link [[sub/deep/a]]
+",
+            ),
+        ]);
+        let err = v.rename("b.md", 0, 12, "taken").err().unwrap();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(v.rename("b.md", 0, 12, "free").is_ok());
     }
 
     #[test]

@@ -1394,6 +1394,90 @@ gitignore = \"always\"
         );
     }
 
+    // ---- notes in a folder: the path has the separator of the platform, the id has `/` ----
+
+    /// The root of a vault (absolute on every platform).
+    fn folder_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("C:\\vault")
+        } else {
+            PathBuf::from("/vault")
+        }
+    }
+
+    #[test]
+    fn a_note_in_a_folder_is_found_by_its_uri_whatever_the_separator_of_its_path() {
+        let rel = crate::convert::native_path("sub/deep/a.md");
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![satz_core::parse_document(
+            "# A
+", &rel,
+        )]);
+        state.vault_root = Some(folder_root());
+        state.open_docs.insert(
+            "file:///x".to_string(),
+            OpenDocument::new(
+                "file:///x",
+                folder_root().join(&rel),
+                "# A
+",
+                1,
+            ),
+        );
+        let (_, doc) = state.doc_for_uri("file:///x").expect("open and indexed");
+        assert_eq!(doc.id.as_str(), "sub/deep/a.md");
+    }
+
+    #[test]
+    fn opening_a_note_in_a_folder_that_the_index_already_holds_changes_nothing_for_its_peers() {
+        let rel = crate::convert::native_path("sub/deep/a.md");
+        let text = "# A
+
+[[b]]
+";
+        let mut state = SatzState::default();
+        state.vault_root = Some(folder_root());
+        state.index = Index::build(vec![satz_core::parse_document(text, &rel)]);
+        state.open_document("file:///x", text, &folder_root().join(&rel), 1);
+        assert!(
+            !state.peers_dirty(),
+            "the note was found under its id: what it links to and offers has not changed"
+        );
+        // A note the index does not hold yet is a change, in the same folder or not.
+        let other = crate::convert::native_path("sub/deep/new.md");
+        state.open_document(
+            "file:///y",
+            "# New
+",
+            &folder_root().join(other),
+            1,
+        );
+        assert!(state.peers_dirty());
+    }
+
+    #[test]
+    fn closing_a_note_in_a_folder_that_is_as_the_index_has_it_changes_nothing_for_its_peers() {
+        let dir = scratch_dir("closefolder");
+        let rel = crate::convert::native_path("sub/deep/a.md");
+        let text = "# A
+
+[[b]]
+";
+        std::fs::create_dir_all(dir.join("sub").join("deep")).unwrap();
+        std::fs::write(dir.join(&rel), text).unwrap();
+        let mut state = SatzState::default();
+        state.vault_root = Some(dir.clone());
+        state.index = Index::build(vec![satz_core::parse_document(text, &rel)]);
+        state.open_document("file:///x", text, &dir.join(&rel), 1);
+        assert!(!state.peers_dirty());
+        state.close_document("file:///x");
+        assert!(
+            !state.peers_dirty(),
+            "the file is what the index held: nothing changed for the peers"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- the workspace-format cache: no stale entries, no copies of already formatted text ----
 
     fn state_with_docs(texts: &[(&str, &str)], capacity: usize) -> SatzState {

@@ -1204,6 +1204,55 @@ mod tests {
     }
 
     #[test]
+    fn a_note_in_a_folder_is_inserted_with_slashes_in_its_path() {
+        // The path of a note in a folder has the separator of the platform; a link has `/`.
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            parse_document("[[", Path::new("a.md")),
+            parse_document(
+                "# Deep
+",
+                &crate::convert::native_path("sub/deep/n.md"),
+            ),
+        ]);
+        state.set_vault_root(Some(vault_root()));
+        let uri = crate::convert::path_to_uri(&vault_root().join("a.md"))
+            .unwrap()
+            .as_str()
+            .to_string();
+        state.open_docs.insert(
+            uri.clone(),
+            crate::state::OpenDocument::new(&uri, vault_root().join("a.md"), "[[", 1),
+        );
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.parse().unwrap(),
+                },
+                position: Position::new(0, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let Some(CompletionResponse::Array(items)) = completion(params, &state) else {
+            panic!("expected the notes of the vault");
+        };
+        let inserted: Vec<String> = items
+            .iter()
+            .filter_map(|i| match &i.text_edit {
+                Some(CompletionTextEdit::Edit(edit)) => Some(edit.new_text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            inserted.iter().any(|t| t.starts_with("sub/deep/n")),
+            "{inserted:?}"
+        );
+        assert!(inserted.iter().all(|t| !t.contains('\\')), "{inserted:?}");
+    }
+
+    #[test]
     fn block_anchor_completion_yields_a_single_caret() {
         assert_eq!(accept("[[b#^§", "^my-block"), "[[b#^my-block]]");
         assert_eq!(accept("[[b#^my§", "^my-block"), "[[b#^my-block]]");

@@ -1791,6 +1791,75 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_diagnostics_of_an_open_note_in_a_folder_are_published() {
+        // The path of a note in a folder has the separator of the platform; its id has `/`.
+        let (backend, mut from_server) = connected_backend().await;
+        let uri =
+            crate::convert::path_to_uri(&root().join(crate::convert::native_path("sub/n.md")))
+                .unwrap()
+                .as_str()
+                .to_string();
+        backend
+            .did_open(open_params(
+                &uri,
+                1,
+                "# N
+
+[[missing]]
+",
+            ))
+            .await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(400)).await;
+        assert!(
+            sent.iter().any(|(method, target)| {
+                method == "textDocument/publishDiagnostics"
+                    && target.as_deref() == Some(uri.as_str())
+            }),
+            "{sent:?}"
+        );
+    }
+
+    /// Unlike an ordinary vault root, a UNC one (`\\server\share\...`) really does round-trip
+    /// through a URI with backslashes still in it (`convert::uri_to_path` puts them back for a
+    /// host it finds in the URI): the one case that puts `publish_for`'s own `\` -> `/` the same
+    /// way to work, an open note in a subfolder of it.
+    #[tokio::test]
+    async fn the_diagnostics_of_an_open_note_in_a_unc_folder_are_published() {
+        if !cfg!(windows) {
+            return; // UNC paths are a Windows concept; `uri_to_path` only builds one there.
+        }
+        let (backend, mut from_server) = connected_backend().await;
+        let unc_root = std::path::PathBuf::from("\\\\server\\share\\vault");
+        {
+            let mut state = backend.state.write().await;
+            state.set_vault_root(Some(unc_root.clone()));
+        }
+        let uri =
+            crate::convert::path_to_uri(&unc_root.join(crate::convert::native_path("sub/n.md")))
+                .unwrap()
+                .as_str()
+                .to_string();
+        backend
+            .did_open(open_params(
+                &uri,
+                1,
+                "# N
+
+[[missing]]
+",
+            ))
+            .await;
+        let sent = sent_meanwhile(&mut from_server, std::time::Duration::from_millis(400)).await;
+        assert!(
+            sent.iter().any(|(method, target)| {
+                method == "textDocument/publishDiagnostics"
+                    && target.as_deref() == Some(uri.as_str())
+            }),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn without_a_request_the_debounced_task_announces_once() {
         // The ordinary path, which must not change: typing, the debounce fires, one round of
         // notifications (no duplicate from the request-refresh debt).

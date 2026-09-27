@@ -37,7 +37,7 @@ fn judge(open: &str, files: &[(&str, &str)], config: VaultConfig) -> Verdict {
     state.index = Index::build(
         files
             .iter()
-            .map(|(p, t)| parse_document(t, Path::new(p)))
+            .map(|(p, t)| parse_document(t, &crate::convert::native_path(p)))
             .collect(),
     );
     state.config = config;
@@ -48,13 +48,13 @@ fn judge(open: &str, files: &[(&str, &str)], config: VaultConfig) -> Verdict {
     };
     state.set_vault_root(Some(root.clone()));
     let text = files.iter().find(|(p, _)| *p == open).unwrap().1;
-    let uri = crate::convert::path_to_uri(&root.join(open))
+    let uri = crate::convert::path_to_uri(&root.join(crate::convert::native_path(open)))
         .unwrap()
         .as_str()
         .to_string();
     state.open_docs.insert(
         uri.clone(),
-        OpenDocument::new(&uri, root.join(open), text, 1),
+        OpenDocument::new(&uri, root.join(crate::convert::native_path(open)), text, 1),
     );
     let doc = state
         .index
@@ -301,20 +301,20 @@ fn state_over(open: &str, files: &[(&str, &str)], config: VaultConfig) -> (SatzS
     state.index = Index::build(
         files
             .iter()
-            .map(|(p, t)| parse_document(t, Path::new(p)))
+            .map(|(p, t)| parse_document(t, &crate::convert::native_path(p)))
             .collect(),
     );
     state.config = config;
     let root = vault_root();
     state.set_vault_root(Some(root.clone()));
     let text = files.iter().find(|(p, _)| *p == open).unwrap().1;
-    let uri = crate::convert::path_to_uri(&root.join(open))
+    let uri = crate::convert::path_to_uri(&root.join(crate::convert::native_path(open)))
         .unwrap()
         .as_str()
         .to_string();
     state.open_docs.insert(
         uri.clone(),
-        OpenDocument::new(&uri, root.join(open), text, 1),
+        OpenDocument::new(&uri, root.join(crate::convert::native_path(open)), text, 1),
     );
     (state, uri)
 }
@@ -380,7 +380,7 @@ fn file_name_of(uri: &str) -> String {
 /// The file name a URI of the note `id` ends in (a name with letters outside ASCII is encoded).
 fn uri_name_of(id: &str) -> String {
     file_name_of(
-        crate::convert::path_to_uri(&vault_root().join(id))
+        crate::convert::path_to_uri(&vault_root().join(crate::convert::native_path(id)))
             .unwrap()
             .as_str(),
     )
@@ -975,7 +975,7 @@ fn random_vault(rng: &mut Xorshift) -> SatzState {
     state.index = Index::build(
         files
             .iter()
-            .map(|(p, t)| parse_document(t, Path::new(p)))
+            .map(|(p, t)| parse_document(t, &crate::convert::native_path(p)))
             .collect(),
     );
     state.config = daily_config();
@@ -983,20 +983,20 @@ fn random_vault(rng: &mut Xorshift) -> SatzState {
     let root = vault_root();
     state.set_vault_root(Some(root.clone()));
     for (path, text) in &files {
-        let uri = crate::convert::path_to_uri(&root.join(path))
+        let uri = crate::convert::path_to_uri(&root.join(crate::convert::native_path(path)))
             .unwrap()
             .as_str()
             .to_string();
         state.open_docs.insert(
             uri.clone(),
-            OpenDocument::new(&uri, root.join(path), text, 1),
+            OpenDocument::new(&uri, root.join(crate::convert::native_path(path)), text, 1),
         );
     }
     state
 }
 
 fn uri_of_note(id: &str) -> String {
-    crate::convert::path_to_uri(&vault_root().join(id))
+    crate::convert::path_to_uri(&vault_root().join(crate::convert::native_path(id)))
         .unwrap()
         .as_str()
         .to_string()
@@ -1017,6 +1017,8 @@ fn the_backlinks_of_the_index_the_code_lens_and_the_references_count_what_the_ha
         // Who links to whom, by what the handlers use (`link_target_doc`).
         let mut sources: BTreeMap<String, BTreeSet<String>> = Default::default();
         let mut links_to: BTreeMap<String, usize> = Default::default();
+        // The same, not counting the links a note has to itself.
+        let mut links_from_others: BTreeMap<String, usize> = Default::default();
         // The links that point at their own note in the index's tables: everything but a Markdown
         // link with no note in it (`[t](#H)`), which the tables never count as a link at all.
         let mut self_edges: BTreeSet<String> = Default::default();
@@ -1030,6 +1032,11 @@ fn the_backlinks_of_the_index_the_code_lens_and_the_references_count_what_the_ha
                     .or_default()
                     .insert(doc.id.as_str().to_string());
                 *links_to.entry(target.as_str().to_string()).or_default() += 1;
+                if *target != doc.id {
+                    *links_from_others
+                        .entry(target.as_str().to_string())
+                        .or_default() += 1;
+                }
                 checked_links += 1;
                 if *target == doc.id
                     && !(link.kind == LinkKind::Markdown && link.target_doc.is_empty())
@@ -1080,6 +1087,26 @@ fn the_backlinks_of_the_index_the_code_lens_and_the_references_count_what_the_ha
                 counted,
                 from_handlers.len(),
                 "round {round}: code lens of {id}"
+            );
+
+            // `satz.showBacklinks` lists every link of those notes, and no other.
+            let shown = crate::handlers::execute_command::show_backlinks(
+                &state,
+                &[serde_json::json!(uri_of_note(&id))],
+            )
+            .expect("a note that is open");
+            assert_eq!(
+                shown.len(),
+                links_from_others.get(&id).copied().unwrap_or(0),
+                "round {round}: backlinks listed for {id}"
+            );
+            assert_eq!(
+                shown
+                    .iter()
+                    .map(|l| l.uri.as_str().to_string())
+                    .collect::<BTreeSet<_>>(),
+                from_handlers.iter().map(|n| uri_of_note(n)).collect(),
+                "round {round}: the notes that backlinks are listed in for {id}"
             );
         }
         // References and highlights from a link that names a note (no anchor) count the links

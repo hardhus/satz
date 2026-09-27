@@ -712,6 +712,32 @@ mod tests {
             .to_string()
     }
 
+    /// Unlike an ordinary vault root, a UNC one (`\\server\share\...`) really does round-trip
+    /// through a URI with backslashes still in it (`convert::uri_to_path` puts them back for a
+    /// host it finds in the URI): the one case that puts `show_backlinks`'s own `\` -> `/` to
+    /// work, a target note in a subfolder of it.
+    #[test]
+    fn backlinks_are_listed_for_a_note_in_a_unc_folder() {
+        if !cfg!(windows) {
+            return; // UNC paths are a Windows concept; `uri_to_path` only builds one there.
+        }
+        let unc_root = std::path::PathBuf::from("\\\\server\\share\\vault");
+        let target = crate::convert::native_path("sub/deep/a.md");
+        let state = state_with(vec![
+            parse_document("# A\n", &target),
+            parse_document("# B\n\n[[sub/deep/a]]\n", Path::new("b.md")),
+        ]);
+        let mut state = state;
+        state.set_vault_root(Some(unc_root.clone()));
+        let uri = path_to_uri(&unc_root.join(&target))
+            .unwrap()
+            .as_str()
+            .to_string();
+        let found = show_backlinks(&state, &[serde_json::json!(uri)]).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].uri.as_str().ends_with("b.md"), "{found:?}");
+    }
+
     #[test]
     fn both_commands_are_advertised() {
         assert!(SUPPORTED_COMMANDS.contains(&FORMAT_WORKSPACE_COMMAND));

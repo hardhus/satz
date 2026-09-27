@@ -2015,6 +2015,28 @@ today = [\"heute\"]
     }
 
     #[test]
+    fn the_scan_of_a_folder_in_a_folder_names_it_and_its_notes_with_slashes() {
+        let dir = temp_dir("prepare-nested");
+        let folder = dir.join("sub").join("deep");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("a.md"),
+            "# A
+",
+        )
+        .unwrap();
+        let PreparedChange::Subtree { prefix, docs } =
+            prepare_fs_change(&folder, &dir, satz_core::GitignoreMode::default())
+        else {
+            panic!("a folder that exists is scanned as a folder");
+        };
+        assert_eq!(prefix, "sub/deep");
+        let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["sub/deep/a.md"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_scan_of_a_folder_does_not_replace_an_open_note_and_still_brings_the_others() {
         let dir = temp_dir("batch-subtree-open");
         let mut state = state_in(&dir);

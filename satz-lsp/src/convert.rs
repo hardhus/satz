@@ -153,6 +153,14 @@ pub fn line_edits_to_text_edits(
 /// Test helper: applies LSP `TextEdit`s (all expressed against `text`, as the protocol requires)
 /// and returns the resulting text, so tests can assert on what the user would actually end up
 /// with instead of only on the edits' `new_text`.
+/// A note path spelled the way the file system spells it: the components of `rel` (written with
+/// `/`) joined with the separator of the platform (`sub.md` on Windows). The paths the server
+/// gets from the file system are spelled like that; a literal `"sub/a.md"` is not.
+#[cfg(test)]
+pub(crate) fn native_path(rel: &str) -> PathBuf {
+    rel.split('/').collect()
+}
+
 #[cfg(test)]
 pub fn apply_text_edits(text: &str, edits: &[lsp::TextEdit]) -> String {
     let line_index = LineIndex::new(text);
