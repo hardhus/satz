@@ -31,6 +31,18 @@ pub fn byte_range_to_lsp(range: ByteRange, line_index: &LineIndex) -> lsp::Range
     }
 }
 
+/// Sorts locations the way a client expects to see references and backlinks in: by file, then by
+/// where in it, so the same set is presented the same way whichever handler built it.
+pub fn sort_locations(locations: &mut [lsp::Location]) {
+    locations.sort_by(|a, b| {
+        (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+            b.uri.as_str(),
+            b.range.start.line,
+            b.range.start.character,
+        ))
+    });
+}
+
 /// Converts a file URI string into a local filesystem `PathBuf`.
 ///
 /// Only `file:` URIs name local files: `untitled:` (an unsaved buffer), `https:` and the like give
@@ -190,6 +202,46 @@ pub fn apply_text_edits(text: &str, edits: &[lsp::TextEdit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loc(uri: &str, line: u32, character: u32) -> lsp::Location {
+        lsp::Location::new(
+            uri.parse().unwrap(),
+            lsp::Range::new(
+                lsp::Position::new(line, character),
+                lsp::Position::new(line, character),
+            ),
+        )
+    }
+
+    #[test]
+    fn sort_locations_orders_by_file_then_by_position_in_it() {
+        let mut locations = vec![
+            loc("file:///b.md", 0, 5),
+            loc("file:///a.md", 1, 0),
+            loc("file:///a.md", 0, 9),
+            loc("file:///a.md", 0, 2),
+        ];
+        sort_locations(&mut locations);
+        let order: Vec<(String, u32, u32)> = locations
+            .iter()
+            .map(|l| {
+                (
+                    l.uri.as_str().to_string(),
+                    l.range.start.line,
+                    l.range.start.character,
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("file:///a.md".to_string(), 0, 2),
+                ("file:///a.md".to_string(), 0, 9),
+                ("file:///a.md".to_string(), 1, 0),
+                ("file:///b.md".to_string(), 0, 5),
+            ]
+        );
+    }
 
     #[test]
     fn apply_text_edits_applies_several_edits_against_the_original_text() {

@@ -2,7 +2,7 @@ use satz_core::{DocId, Document, fold_key, slugify};
 use tower_lsp_server::ls_types::{Location, ReferenceParams};
 
 use crate::convert::byte_range_to_lsp;
-use crate::state::SatzState;
+use crate::state::{SatzState, SelfLinks};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CursorTarget {
@@ -108,31 +108,21 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                 locations.push(location);
             }
 
-            let mut candidate_ids: Vec<DocId> = state.index.backlinks_of(doc).cloned().collect();
-            if !candidate_ids.contains(doc) {
-                candidate_ids.push(doc.clone());
-            }
+            for src_doc in state.documents_linking_to(doc, SelfLinks::Include) {
+                let Some(src_uri) = state.doc_uri(src_doc) else {
+                    continue;
+                };
 
-            for src_id in &candidate_ids {
-                if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = state.doc_uri(src_doc) else {
-                        continue;
-                    };
-
-                    for link in &src_doc.links {
-                        let resolves_to_target = state.link_target_doc(src_doc, link) == Some(doc);
-
-                        if resolves_to_target
-                            && link
-                                .target_block
-                                .as_deref()
-                                .is_some_and(|b| b.eq_ignore_ascii_case(id))
-                        {
-                            locations.push(Location::new(
-                                src_uri.clone(),
-                                byte_range_to_lsp(link.range, &src_doc.line_index),
-                            ));
-                        }
+                for link in state.links_to(src_doc, doc) {
+                    if link
+                        .target_block
+                        .as_deref()
+                        .is_some_and(|b| b.eq_ignore_ascii_case(id))
+                    {
+                        locations.push(Location::new(
+                            src_uri.clone(),
+                            byte_range_to_lsp(link.range, &src_doc.line_index),
+                        ));
                     }
                 }
             }
@@ -155,36 +145,27 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                 locations.push(location);
             }
 
-            let mut candidate_ids: Vec<DocId> = state.index.backlinks_of(doc).cloned().collect();
-            if !candidate_ids.contains(doc) {
-                candidate_ids.push(doc.clone());
-            }
+            for src_doc in state.documents_linking_to(doc, SelfLinks::Include) {
+                let Some(src_uri) = state.doc_uri(src_doc) else {
+                    continue;
+                };
 
-            for src_id in &candidate_ids {
-                if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = state.doc_uri(src_doc) else {
-                        continue;
-                    };
-
-                    for link in &src_doc.links {
-                        let resolves_to_target = state.link_target_doc(src_doc, link) == Some(doc);
-
-                        // A reference belongs to the first heading it matches; a later
-                        // duplicate owns none. (An unresolved heading falls back to the slug.)
-                        let owns_link = link.target_heading.as_deref().is_some_and(|th| {
-                            match (heading_index, target_doc_opt) {
-                                (Some(i), Some(target_doc)) => {
-                                    target_doc.resolve_heading(th) == Some(i)
-                                }
-                                _ => slugify(th) == *slug,
+                for link in state.links_to(src_doc, doc) {
+                    // A reference belongs to the first heading it matches; a later duplicate
+                    // owns none. (An unresolved heading falls back to the slug.)
+                    let owns_link = link.target_heading.as_deref().is_some_and(|th| {
+                        match (heading_index, target_doc_opt) {
+                            (Some(i), Some(target_doc)) => {
+                                target_doc.resolve_heading(th) == Some(i)
                             }
-                        });
-                        if resolves_to_target && owns_link {
-                            locations.push(Location::new(
-                                src_uri.clone(),
-                                byte_range_to_lsp(link.range, &src_doc.line_index),
-                            ));
+                            _ => slugify(th) == *slug,
                         }
+                    });
+                    if owns_link {
+                        locations.push(Location::new(
+                            src_uri.clone(),
+                            byte_range_to_lsp(link.range, &src_doc.line_index),
+                        ));
                     }
                 }
             }
@@ -203,29 +184,16 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                 locations.push(location);
             }
 
-            let mut candidate_ids: Vec<DocId> =
-                state.index.backlinks_of(target_doc_id).cloned().collect();
-            if !candidate_ids.contains(target_doc_id) {
-                candidate_ids.push(target_doc_id.clone());
-            }
+            for src_doc in state.documents_linking_to(target_doc_id, SelfLinks::Include) {
+                let Some(src_uri) = state.doc_uri(src_doc) else {
+                    continue;
+                };
 
-            for src_id in &candidate_ids {
-                if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = state.doc_uri(src_doc) else {
-                        continue;
-                    };
-
-                    for link in &src_doc.links {
-                        let resolves_to_target =
-                            state.link_target_doc(src_doc, link) == Some(target_doc_id);
-
-                        if resolves_to_target {
-                            locations.push(Location::new(
-                                src_uri.clone(),
-                                byte_range_to_lsp(link.range, &src_doc.line_index),
-                            ));
-                        }
-                    }
+                for link in state.links_to(src_doc, target_doc_id) {
+                    locations.push(Location::new(
+                        src_uri.clone(),
+                        byte_range_to_lsp(link.range, &src_doc.line_index),
+                    ));
                 }
             }
         }
@@ -239,13 +207,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
         locations.retain(|loc| loc != declaration);
     }
 
-    locations.sort_by(|a, b| {
-        (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
-            b.uri.as_str(),
-            b.range.start.line,
-            b.range.start.character,
-        ))
-    });
+    crate::convert::sort_locations(&mut locations);
     locations.dedup();
 
     Some(locations)

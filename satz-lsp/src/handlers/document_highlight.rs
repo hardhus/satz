@@ -181,12 +181,11 @@ pub fn document_highlight(
                 }
             }
             // Highlight any links in this document pointing to this heading
-            for link in &doc.links {
-                if state.link_target_doc(doc, link) == Some(target_doc)
-                    && link
-                        .target_heading
-                        .as_deref()
-                        .is_some_and(|th| slugify(th) == *slug)
+            for link in state.links_to(doc, target_doc) {
+                if link
+                    .target_heading
+                    .as_deref()
+                    .is_some_and(|th| slugify(th) == *slug)
                 {
                     push(link.range, DocumentHighlightKind::READ);
                 }
@@ -203,22 +202,19 @@ pub fn document_highlight(
                 push(b.range, DocumentHighlightKind::WRITE);
             }
             // Highlight any links in this document pointing to this block
-            for link in &doc.links {
-                if state.link_target_doc(doc, link) == Some(target_doc)
-                    && link
-                        .target_block
-                        .as_deref()
-                        .is_some_and(|b| b.eq_ignore_ascii_case(id))
+            for link in state.links_to(doc, target_doc) {
+                if link
+                    .target_block
+                    .as_deref()
+                    .is_some_and(|b| b.eq_ignore_ascii_case(id))
                 {
                     push(link.range, DocumentHighlightKind::READ);
                 }
             }
         }
         HighlightTarget::Doc(ref target_doc) => {
-            for link in &doc.links {
-                if state.link_target_doc(doc, link) == Some(target_doc) {
-                    push(link.range, DocumentHighlightKind::READ);
-                }
+            for link in state.links_to(doc, target_doc) {
+                push(link.range, DocumentHighlightKind::READ);
             }
         }
         HighlightTarget::Broken(ref key) => {

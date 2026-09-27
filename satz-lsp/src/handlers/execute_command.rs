@@ -12,7 +12,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::convert::{line_edits_to_text_edits, path_to_uri};
-use crate::state::{CacheUpdate, SatzState};
+use crate::state::{CacheUpdate, SatzState, SelfLinks};
 use satz_core::config::FormatterConfig;
 use satz_core::formatter::diff::line_diff;
 
@@ -42,35 +42,18 @@ pub fn show_backlinks(
     }
 
     let mut locations = Vec::new();
-    for source_id in state.index.incoming_from_others(&target) {
-        let Some(source) = state.index.get_doc(source_id) else {
-            continue;
-        };
+    for source in state.documents_linking_to(&target, SelfLinks::Exclude) {
         let Some(source_uri) = state.doc_uri(source) else {
             continue;
         };
-        for link in &source.links {
-            let points_here = matches!(
-                state.resolve(link, source),
-                satz_core::LinkResolution::Resolved { doc, .. }
-                    | satz_core::LinkResolution::AnchorMissing { doc } if doc.id == target
-            ) && link.kind != satz_core::LinkKind::Footnote
-                && !link.target_doc.is_empty();
-            if points_here {
-                locations.push(Location::new(
-                    source_uri.clone(),
-                    crate::convert::byte_range_to_lsp(link.range, &source.line_index),
-                ));
-            }
+        for link in state.links_to(source, &target) {
+            locations.push(Location::new(
+                source_uri.clone(),
+                crate::convert::byte_range_to_lsp(link.range, &source.line_index),
+            ));
         }
     }
-    locations.sort_by(|a, b| {
-        (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
-            b.uri.as_str(),
-            b.range.start.line,
-            b.range.start.character,
-        ))
-    });
+    crate::convert::sort_locations(&mut locations);
     Ok(locations)
 }
 

@@ -360,11 +360,7 @@ pub fn compute_diagnostics(
     });
 
     if !is_moc
-        && index
-            .backlinks_of(&doc.id)
-            .filter(|id| *id != &doc.id)
-            .count()
-            == 0
+        && index.incoming_from_others(&doc.id).next().is_none()
         && (!doc.links.is_empty() || !doc.headings.is_empty())
     {
         diagnostics.push(lsp::Diagnostic {

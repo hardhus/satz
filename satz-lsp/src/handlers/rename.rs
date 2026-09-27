@@ -6,7 +6,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::convert::{byte_range_to_lsp, path_to_uri};
-use crate::state::SatzState;
+use crate::state::{SatzState, SelfLinks};
 use satz_core::ByteRange;
 use satz_core::model::{Document, Heading, LinkKind};
 
@@ -189,23 +189,15 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
     // Scoped to backlinks + target
-    let mut candidate_ids: std::collections::HashSet<&satz_core::DocId> =
-        state.index.backlinks_of(target_id).collect();
-    candidate_ids.insert(target_id);
-
-    for src_id in candidate_ids {
-        let Some(src_doc) = state.index.get_doc(src_id) else {
-            continue;
-        };
+    for src_doc in state.documents_linking_to(target_id, SelfLinks::Include) {
         let Some(src_url) = state.doc_uri(src_doc) else {
             continue;
         };
 
-        for l in &src_doc.links {
+        for l in state.links_to(src_doc, target_id) {
             // Only links that name the FILE stop working; one that reaches the note through its
             // title or an alias keeps resolving and is not touched.
             if !l.target_doc.is_empty()
-                && state.link_target_doc(src_doc, l) == Some(target_id)
                 && names_file(&l.target_doc, &target_doc.path)
                 && let Some(new_link_text) = rewritten_link(
                     src_doc.line_index.source(),
@@ -276,20 +268,12 @@ fn rename_heading(
     }
 
     // The links (scoped to backlinks + the defining document itself).
-    let mut candidate_ids: std::collections::HashSet<&satz_core::DocId> =
-        state.index.backlinks_of(target_id).collect();
-    candidate_ids.insert(target_id);
-
-    for src_id in candidate_ids {
-        let Some(src_doc) = state.index.get_doc(src_id) else {
-            continue;
-        };
+    for src_doc in state.documents_linking_to(target_id, SelfLinks::Include) {
         let Some(src_url) = state.doc_uri(src_doc) else {
             continue;
         };
 
-        for l in &src_doc.links {
-            let matches_doc = state.link_target_doc(src_doc, l) == Some(target_id);
+        for l in state.links_to(src_doc, target_id) {
             // A reference belongs to the FIRST heading that matches it; a later duplicate owns none.
             let matches_heading = l.target_heading.as_deref().is_some_and(|th| {
                 target_doc
@@ -297,8 +281,7 @@ fn rename_heading(
                     .is_some_and(|i| target_doc.headings[i].range == heading.range)
             });
 
-            if matches_doc
-                && matches_heading
+            if matches_heading
                 && let Some(new_link_text) = rewritten_link(
                     src_doc.line_index.source(),
                     l,

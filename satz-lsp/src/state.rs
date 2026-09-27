@@ -289,6 +289,18 @@ pub struct ReparseJob {
     pub version: i32,
 }
 
+/// Whether a note that links to itself counts as one of "the notes that link to it", for
+/// `SatzState::documents_linking_to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfLinks {
+    /// The tables' own rule (`backlinks_of`): a note that links to itself is one of its own
+    /// backlinks.
+    Include,
+    /// What is reported to a user as "notes that link here" (`incoming_from_others`): a link a
+    /// note has to itself is not read as someone else referencing it.
+    Exclude,
+}
+
 /// `path`, as an absolute path: joined onto `root`, or `path` itself when there is no root. Every
 /// call site this replaces used to guard the join with `!path.is_absolute()` first, as if an
 /// already-absolute `path` had to be protected from `root` -- but `Path::join` already discards
@@ -577,6 +589,41 @@ impl SatzState {
             | satz_core::LinkResolution::AnchorMissing { doc } => Some(&doc.id),
             satz_core::LinkResolution::DocMissing => None,
         }
+    }
+
+    /// The links of `doc` that resolve to `target` -- what `references`, `document_highlight` and
+    /// `rename` each rewrite or report, filtered further by what they are (a link to the whole
+    /// note, to one of its headings, to one of its blocks).
+    pub fn links_to<'a>(
+        &'a self,
+        doc: &'a satz_core::Document,
+        target: &'a satz_core::DocId,
+    ) -> impl Iterator<Item = &'a satz_core::Link> + 'a {
+        doc.links
+            .iter()
+            .filter(move |link| self.link_target_doc(doc, link) == Some(target))
+    }
+
+    /// The indexed documents that link to `target`: exactly `target` itself (once, whether or not
+    /// it links to itself) plus everything `backlinks_of` names, or -- with `SelfLinks::Exclude`
+    /// -- the notes users are told link to it, `incoming_from_others`. A document `backlinks_of`
+    /// names but the index no longer holds (should not happen; the tables are kept in step with
+    /// it) is skipped rather than panicking.
+    pub fn documents_linking_to<'a>(
+        &'a self,
+        target: &'a satz_core::DocId,
+        self_links: SelfLinks,
+    ) -> impl Iterator<Item = &'a satz_core::Document> + 'a {
+        let ids: Box<dyn Iterator<Item = &'a satz_core::DocId>> = match self_links {
+            SelfLinks::Include => Box::new(
+                self.index
+                    .backlinks_of(target)
+                    .filter(move |id| *id != target)
+                    .chain(std::iter::once(target)),
+            ),
+            SelfLinks::Exclude => Box::new(self.index.incoming_from_others(target)),
+        };
+        ids.filter_map(move |id| self.index.get_doc(id))
     }
 
     /// The open document for `uri` together with its entry in the index (`None` when it is not open
@@ -938,6 +985,66 @@ mod tests {
         rootless.set_vault_root(None);
         assert_eq!(rootless.doc_path(&doc), doc.path);
         assert!(rootless.doc_uri(&doc).is_none());
+    }
+
+    // ---- `documents_linking_to`/`links_to`: one place for "who links to this note" ----
+
+    fn linking_state() -> SatzState {
+        let mut state = SatzState::default();
+        state.index = Index::build(vec![
+            satz_core::parse_document("# A\n\n[[a]] self-link, [[b]]\n", Path::new("a.md")),
+            satz_core::parse_document("# B\n\n[[a]] and [[a#Nope]]\n", Path::new("b.md")),
+            satz_core::parse_document("# C\n\nno links here\n", Path::new("c.md")),
+        ]);
+        state
+    }
+
+    #[test]
+    fn documents_linking_to_include_has_the_target_exactly_once_even_with_a_self_link() {
+        let state = linking_state();
+        let a = satz_core::DocId::new("a.md");
+        let mut ids: Vec<&str> = state
+            .documents_linking_to(&a, SelfLinks::Include)
+            .map(|d| d.id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["a.md", "b.md"],
+            "a links to itself once, b links to it once"
+        );
+    }
+
+    #[test]
+    fn documents_linking_to_exclude_drops_the_self_link() {
+        let state = linking_state();
+        let a = satz_core::DocId::new("a.md");
+        let ids: Vec<&str> = state
+            .documents_linking_to(&a, SelfLinks::Exclude)
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["b.md"]);
+
+        let c = satz_core::DocId::new("c.md");
+        assert_eq!(
+            state.documents_linking_to(&c, SelfLinks::Exclude).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn links_to_finds_only_the_links_that_resolve_to_the_target() {
+        let state = linking_state();
+        let a_doc = state.index.get_doc(&satz_core::DocId::new("a.md")).unwrap();
+        let a = satz_core::DocId::new("a.md");
+        // `[[a]]` resolves to a, `[[b]]` does not.
+        assert_eq!(state.links_to(a_doc, &a).count(), 1);
+        let b = satz_core::DocId::new("b.md");
+        assert_eq!(state.links_to(a_doc, &b).count(), 1);
+
+        let b_doc = state.index.get_doc(&satz_core::DocId::new("b.md")).unwrap();
+        // `[[a]]` and `[[a#Nope]]` both resolve to a (a missing heading still names the note).
+        assert_eq!(state.links_to(b_doc, &a).count(), 2);
     }
 
     #[test]
