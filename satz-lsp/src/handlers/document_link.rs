@@ -1,6 +1,6 @@
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams, Uri};
 
-use crate::convert::{byte_range_to_lsp, path_to_uri};
+use crate::convert::byte_range_to_lsp;
 use crate::state::SatzState;
 use satz_core::model::LinkKind;
 
@@ -36,12 +36,7 @@ pub fn document_link(params: DocumentLinkParams, state: &SatzState) -> Option<Ve
                     doc: target_doc, ..
                 }
                 | satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
-                    let target_path = match state.vault_root() {
-                        Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
-                        _ => target_doc.path.clone(),
-                    };
-
-                    if let Some(url) = path_to_uri(&target_path) {
+                    if let Some(url) = state.doc_uri(target_doc) {
                         links.push(DocumentLink {
                             range,
                             target: Some(url),

@@ -172,10 +172,7 @@ pub fn code_action(params: CodeActionParams, state: &SatzState) -> Option<CodeAc
             }
             satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
                 if let Some(heading_name) = &link.target_heading {
-                    let target_path = match state.vault_root() {
-                        Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
-                        _ => target_doc.path.clone(),
-                    };
+                    let target_path = state.doc_path(target_doc);
                     if let Some(target_uri) = path_to_uri(&target_path) {
                         let source = target_doc.line_index.source();
                         let end_pos = target_doc.line_index.byte_to_position(source.len());

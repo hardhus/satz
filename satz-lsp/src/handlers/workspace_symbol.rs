@@ -5,7 +5,7 @@ use tower_lsp_server::ls_types::{
     WorkspaceSymbolResponse,
 };
 
-use crate::convert::{byte_range_to_lsp, path_to_uri};
+use crate::convert::byte_range_to_lsp;
 use crate::rank::Ranker;
 use crate::state::SatzState;
 
@@ -176,13 +176,7 @@ impl<'a> Places<'a> {
         let state = self.state;
         self.uris
             .entry(doc.id.as_str())
-            .or_insert_with(|| {
-                let doc_path = match state.vault_root() {
-                    Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-                    _ => doc.path.clone(),
-                };
-                path_to_uri(&doc_path)
-            })
+            .or_insert_with(|| state.doc_uri(doc))
             .clone()
     }
 
@@ -392,11 +386,7 @@ mod tests {
         let mut scored_symbols: Vec<(u32, SymbolInformation)> = Vec::new();
 
         for doc in candidate_docs {
-            let doc_path = match state.vault_root() {
-                Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-                _ => doc.path.clone(),
-            };
-            let doc_uri = match path_to_uri(&doc_path) {
+            let doc_uri = match state.doc_uri(doc) {
                 Some(u) => u,
                 None => continue,
             };

@@ -1,7 +1,7 @@
 use satz_core::{Document, Frontmatter, Index, LinkKind, VaultConfig};
 use tower_lsp_server::ls_types as lsp;
 
-use crate::convert::{byte_range_to_lsp, path_to_uri};
+use crate::convert::byte_range_to_lsp;
 use crate::state::SatzState;
 
 /// Computes the pull-mode `textDocument/diagnostic` report for a single open document.
@@ -98,11 +98,7 @@ pub fn pull_workspace_report(
     let result_id = diagnostics_result_id(state);
     let mut items = Vec::new();
     for doc in state.index.documents() {
-        let doc_path = match state.vault_root() {
-            Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-            _ => doc.path.clone(),
-        };
-        let Some(uri) = path_to_uri(&doc_path) else {
+        let Some(uri) = state.doc_uri(doc) else {
             continue;
         };
         let version = state
@@ -748,7 +744,7 @@ mod tests {
     }
 
     fn uri_of(state: &SatzState, rel: &str) -> String {
-        path_to_uri(&state.vault_root().unwrap().join(rel))
+        crate::convert::path_to_uri(&state.vault_root().unwrap().join(rel))
             .unwrap()
             .as_str()
             .to_string()

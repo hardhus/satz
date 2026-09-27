@@ -1,9 +1,7 @@
-use std::path::Path;
-
 use satz_core::{DocId, Document, fold_key, slugify};
-use tower_lsp_server::ls_types::{Location, ReferenceParams, Uri};
+use tower_lsp_server::ls_types::{Location, ReferenceParams};
 
-use crate::convert::{byte_range_to_lsp, path_to_uri};
+use crate::convert::byte_range_to_lsp;
 use crate::state::SatzState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,14 +64,6 @@ fn cursor_target(doc: &Document, off: usize, state: &SatzState) -> Option<Cursor
     Some(CursorTarget::Doc(doc.id.clone()))
 }
 
-fn doc_uri(doc: &Document, vault_root: Option<&Path>) -> Option<Uri> {
-    let doc_path = match vault_root {
-        Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-        _ => doc.path.clone(),
-    };
-    path_to_uri(&doc_path)
-}
-
 pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec<Location>> {
     let uri = params.text_document_position.text_document.uri.as_str();
     let pos = params.text_document_position.position;
@@ -94,7 +84,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
             let prefix = format!("{}/", clean_query);
 
             for tagged_doc in state.index.docs_with_tag(tag_name) {
-                let Some(u) = doc_uri(tagged_doc, state.vault_root()) else {
+                let Some(u) = state.doc_uri(tagged_doc) else {
                     continue;
                 };
                 for t in &tagged_doc.tags {
@@ -111,7 +101,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
         CursorTarget::Block { ref doc, ref id } => {
             if let Some(target_doc) = state.index.get_doc(doc)
                 && let Some(b) = target_doc.resolve_block(id).map(|i| &target_doc.blocks[i])
-                && let Some(u) = doc_uri(target_doc, state.vault_root())
+                && let Some(u) = state.doc_uri(target_doc)
             {
                 let location = Location::new(u, byte_range_to_lsp(b.range, &target_doc.line_index));
                 declaration = Some(location.clone());
@@ -125,7 +115,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
             for src_id in &candidate_ids {
                 if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = doc_uri(src_doc, state.vault_root()) else {
+                    let Some(src_uri) = state.doc_uri(src_doc) else {
                         continue;
                     };
 
@@ -158,7 +148,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
                     Some(i) => target_doc.headings.get(i),
                     None => target_doc.headings.iter().find(|h| &h.slug == slug),
                 }
-                && let Some(u) = doc_uri(target_doc, state.vault_root())
+                && let Some(u) = state.doc_uri(target_doc)
             {
                 let location = Location::new(u, byte_range_to_lsp(h.range, &target_doc.line_index));
                 declaration = Some(location.clone());
@@ -172,7 +162,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
             for src_id in &candidate_ids {
                 if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = doc_uri(src_doc, state.vault_root()) else {
+                    let Some(src_uri) = state.doc_uri(src_doc) else {
                         continue;
                     };
 
@@ -201,7 +191,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
         }
         CursorTarget::Doc(ref target_doc_id) => {
             if let Some(target_doc) = state.index.get_doc(target_doc_id)
-                && let Some(u) = doc_uri(target_doc, state.vault_root())
+                && let Some(u) = state.doc_uri(target_doc)
             {
                 let range = if let Some(h) = target_doc.headings.first() {
                     byte_range_to_lsp(h.range, &target_doc.line_index)
@@ -221,7 +211,7 @@ pub fn find_references(params: ReferenceParams, state: &SatzState) -> Option<Vec
 
             for src_id in &candidate_ids {
                 if let Some(src_doc) = state.index.get_doc(src_id) {
-                    let Some(src_uri) = doc_uri(src_doc, state.vault_root()) else {
+                    let Some(src_uri) = state.doc_uri(src_doc) else {
                         continue;
                     };
 

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use ropey::Rope;
 use satz_core::{Index, VaultConfig, walk_vault_with};
-use tower_lsp_server::ls_types::TextDocumentContentChangeEvent;
+use tower_lsp_server::ls_types::{TextDocumentContentChangeEvent, Uri};
 
 use std::time::Instant;
 use tokio::task::JoinHandle;
@@ -287,6 +287,18 @@ pub struct ReparseJob {
     pub rel_path: PathBuf,
     pub content: String,
     pub version: i32,
+}
+
+/// `path`, as an absolute path: joined onto `root`, or `path` itself when there is no root. Every
+/// call site this replaces used to guard the join with `!path.is_absolute()` first, as if an
+/// already-absolute `path` had to be protected from `root` -- but `Path::join` already discards
+/// `root` for an absolute `path` (and, on Windows, for one that merely carries its own drive or
+/// root), so the guard never changed the result; the test below tries every shape that guard
+/// distinguished (relative, `/abs`, a drive root, a UNC path, root-relative `\x`, drive-relative
+/// `C:x`, no root, empty) and none of them do. A free function, not a method, for the handful of
+/// callers that have a vault root without a whole `SatzState` at hand.
+pub fn absolute_path(path: &Path, root: Option<&Path>) -> PathBuf {
+    root.map_or_else(|| path.to_path_buf(), |root| root.join(path))
 }
 
 impl SatzState {
@@ -574,6 +586,19 @@ impl SatzState {
         Some((open_doc, self.index.get_doc(&doc_id)?))
     }
 
+    /// `doc.path`, made absolute against the vault root: as it is on disk. Every handler that
+    /// sends the client a file location (a definition, a link target, a rename, a diagnostic's
+    /// document) starts here, so they agree on where a note actually is.
+    pub fn doc_path(&self, doc: &satz_core::Document) -> PathBuf {
+        absolute_path(&doc.path, self.vault_root())
+    }
+
+    /// The URI a client would open `doc` with (`None`: `doc.path` cannot be turned into a file
+    /// URI, e.g. a relative path with no vault root to anchor it to).
+    pub fn doc_uri(&self, doc: &satz_core::Document) -> Option<Uri> {
+        crate::convert::path_to_uri(&self.doc_path(doc))
+    }
+
     pub fn get_rel_path(path: &Path, root: Option<&Path>) -> PathBuf {
         let Some(root) = root else {
             return path.to_path_buf();
@@ -831,6 +856,88 @@ mod tests {
             let rel_win = SatzState::get_rel_path(path_win, Some(root_win));
             assert_eq!(rel_win, PathBuf::from("projeler\\proje1.md"));
         }
+    }
+
+    // ---- `absolute_path`/`doc_path`/`doc_uri`: where a note is, whatever `doc.path` is relative to ----
+
+    #[test]
+    fn absolute_path_joins_a_relative_path_onto_the_root_and_leaves_everything_else_alone() {
+        let root = Path::new("/vault");
+        assert_eq!(
+            absolute_path(Path::new("a.md"), Some(root)),
+            PathBuf::from("/vault/a.md")
+        );
+        assert_eq!(
+            absolute_path(Path::new("/elsewhere/a.md"), Some(root)),
+            PathBuf::from("/elsewhere/a.md"),
+            "already absolute: the root is not applied"
+        );
+        assert_eq!(
+            absolute_path(Path::new("a.md"), None),
+            PathBuf::from("a.md"),
+            "no root: the path is returned as given"
+        );
+        assert_eq!(
+            absolute_path(Path::new(""), Some(root)),
+            PathBuf::from("/vault")
+        );
+
+        if cfg!(windows) {
+            let root = Path::new("C:\\vault");
+            assert_eq!(
+                absolute_path(Path::new("sub\\a.md"), Some(root)),
+                PathBuf::from("C:\\vault\\sub\\a.md")
+            );
+            // `C:\x` (a drive root) and `\\server\share\x` (UNC) are absolute: `join` discards
+            // `root` for them on its own.
+            for already_absolute in ["C:\\x.md", "\\\\server\\share\\x.md"] {
+                assert_eq!(
+                    absolute_path(Path::new(already_absolute), Some(root)),
+                    PathBuf::from(already_absolute),
+                    "{already_absolute}"
+                );
+            }
+            // `\x` (root-relative: "wherever the current drive is") and `C:x` (drive-relative: "the
+            // working directory of that drive") are NOT absolute -- but `join` special-cases a
+            // second path that already has its own root or its own prefix, and neither ends up
+            // under `root` either.
+            assert_eq!(
+                absolute_path(Path::new("\\x.md"), Some(root)),
+                PathBuf::from("C:\\x.md"),
+                "root-relative: the drive of `root`, not `root` itself"
+            );
+            assert_eq!(
+                absolute_path(Path::new("C:x.md"), Some(root)),
+                PathBuf::from("C:x.md"),
+                "drive-relative, and already names the drive `root` is on: unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn doc_path_and_doc_uri_agree_with_absolute_path() {
+        let doc = satz_core::parse_document("# A\n", Path::new("sub/a.md"));
+        let mut state = SatzState::default();
+        state.set_vault_root(Some(if cfg!(windows) {
+            PathBuf::from("C:\\vault")
+        } else {
+            PathBuf::from("/vault")
+        }));
+        assert_eq!(
+            state.doc_path(&doc),
+            absolute_path(&doc.path, state.vault_root())
+        );
+        assert!(
+            state.doc_uri(&doc).unwrap().as_str().ends_with("/sub/a.md"),
+            "{:?}",
+            state.doc_uri(&doc)
+        );
+
+        // No vault root: `doc.path` is relative, so there is nowhere to open it from.
+        let mut rootless = SatzState::default();
+        rootless.set_vault_root(None);
+        assert_eq!(rootless.doc_path(&doc), doc.path);
+        assert!(rootless.doc_uri(&doc).is_none());
     }
 
     #[test]

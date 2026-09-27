@@ -47,11 +47,7 @@ pub fn show_backlinks(
         let Some(source) = state.index.get_doc(source_id) else {
             continue;
         };
-        let source_path = match state.vault_root() {
-            Some(root) if !source.path.is_absolute() => root.join(&source.path),
-            _ => source.path.clone(),
-        };
-        let Some(source_uri) = path_to_uri(&source_path) else {
+        let Some(source_uri) = state.doc_uri(source) else {
             continue;
         };
         for link in &source.links {
@@ -257,13 +253,7 @@ pub(crate) fn format_one(
         .and_then(|uri| uri.parse::<Uri>().ok())
     {
         Some(uri) => Some(uri),
-        None => {
-            let doc_path = match vault_root {
-                Some(root) if !input.path.is_absolute() => root.join(&input.path),
-                _ => input.path.to_path_buf(),
-            };
-            path_to_uri(&doc_path)
-        }
+        None => path_to_uri(&crate::state::absolute_path(&input.path, vault_root)),
     };
     let Some(uri) = uri else {
         // Nowhere to send it, but the text was worked out and is worth remembering.
@@ -1132,11 +1122,7 @@ mod tests {
             let uri = match open.and_then(|(_, open_doc)| open_doc.uri.parse::<Uri>().ok()) {
                 Some(uri) => uri,
                 None => {
-                    let doc_path = match state.vault_root() {
-                        Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-                        _ => doc.path.clone(),
-                    };
-                    let Some(uri) = path_to_uri(&doc_path) else {
+                    let Some(uri) = state.doc_uri(doc) else {
                         continue;
                     };
                     uri

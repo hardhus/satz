@@ -1,4 +1,4 @@
-use crate::convert::{byte_range_to_lsp, path_to_uri};
+use crate::convert::byte_range_to_lsp;
 use crate::state::SatzState;
 use satz_core::LinkKind;
 use tower_lsp_server::ls_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range};
@@ -30,11 +30,7 @@ pub fn goto_definition(
         && let Some(def) = doc.footnotes.find_def(label)
     {
         let range = byte_range_to_lsp(def.range, &doc.line_index);
-        let doc_path = match state.vault_root() {
-            Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-            _ => doc.path.clone(),
-        };
-        let url = path_to_uri(&doc_path)?;
+        let url = state.doc_uri(doc)?;
         return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
     }
 
@@ -62,11 +58,7 @@ pub fn goto_definition(
             doc: target_doc,
             anchor,
         } => {
-            let target_path = match state.vault_root() {
-                Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
-                _ => target_doc.path.clone(),
-            };
-            let target_uri = path_to_uri(&target_path)?;
+            let target_uri = state.doc_uri(target_doc)?;
             let target_range = if let Some(r) = anchor {
                 byte_range_to_lsp(r, &target_doc.line_index)
             } else {
@@ -81,11 +73,7 @@ pub fn goto_definition(
             )))
         }
         satz_core::LinkResolution::AnchorMissing { doc: target_doc } => {
-            let target_path = match state.vault_root() {
-                Some(root) if !target_doc.path.is_absolute() => root.join(&target_doc.path),
-                _ => target_doc.path.clone(),
-            };
-            let target_uri = path_to_uri(&target_path)?;
+            let target_uri = state.doc_uri(target_doc)?;
             Some(GotoDefinitionResponse::Scalar(Location::new(
                 target_uri,
                 Range {

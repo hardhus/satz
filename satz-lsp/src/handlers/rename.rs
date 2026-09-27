@@ -173,7 +173,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
         .ok_or_else(|| format!("cannot rename: note '{}' does not exist", link.target_doc))?;
     let clean_new_doc_name = validate_note_name(new_name)?;
 
-    let old_doc_path = absolute_path(state, target_doc);
+    let old_doc_path = state.doc_path(target_doc);
     let new_doc_path = old_doc_path.with_file_name(format!("{clean_new_doc_name}.md"));
     let new_rel = match state.vault_root() {
         Some(root) => new_doc_path.strip_prefix(root).unwrap_or(&new_doc_path),
@@ -197,7 +197,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
         let Some(src_doc) = state.index.get_doc(src_id) else {
             continue;
         };
-        let Some(src_url) = path_to_uri(&absolute_path(state, src_doc)) else {
+        let Some(src_url) = state.doc_uri(src_doc) else {
             continue;
         };
 
@@ -252,13 +252,6 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
     }))
 }
 
-fn absolute_path(state: &SatzState, doc: &Document) -> std::path::PathBuf {
-    match state.vault_root() {
-        Some(root) if !doc.path.is_absolute() => root.join(&doc.path),
-        _ => doc.path.clone(),
-    }
-}
-
 /// Edits that rename `heading` (defined in `target_doc`) and every link pointing at it.
 fn rename_heading(
     state: &SatzState,
@@ -271,7 +264,7 @@ fn rename_heading(
 
     // The definition: only the heading text changes.
     let text = heading_text_range(target_doc.line_index.source(), heading)?;
-    if let Some(url) = path_to_uri(&absolute_path(state, target_doc)) {
+    if let Some(url) = state.doc_uri(target_doc) {
         changes.entry(url).or_default().push(TextEdit {
             range: byte_range_to_lsp(text.range, &target_doc.line_index),
             new_text: if text.needs_space {
@@ -291,7 +284,7 @@ fn rename_heading(
         let Some(src_doc) = state.index.get_doc(src_id) else {
             continue;
         };
-        let Some(src_url) = path_to_uri(&absolute_path(state, src_doc)) else {
+        let Some(src_url) = state.doc_uri(src_doc) else {
             continue;
         };
 
