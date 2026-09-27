@@ -1,4 +1,7 @@
 use super::*;
+// Not one of `backend`'s own items (`super::*` no longer carries it now that `backend.rs` itself
+// has no direct use for it): a helper test computes diagnostics itself to compare against.
+use crate::handlers::diagnostics::compute_diagnostics;
 
 #[test]
 fn a_pull_client_is_always_asked_to_refetch_after_a_reparse() {
