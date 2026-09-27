@@ -245,8 +245,8 @@ impl Candidate<'_> {
     /// `rename`, which already rewrites every link (of any style) pointing at the renamed document.
     fn build(&self, range: Range, close_suffix: &str) -> CompletionItem {
         let d = self.doc;
-        let path_str = d.path.to_string_lossy().replace('\\', "/");
-        let insert_base = path_str.strip_suffix(".md").unwrap_or(&path_str);
+        // `d.id` is exactly `d.path`, spelled with `/`: the same string `DocId::from_path` builds.
+        let insert_base = d.id.as_str().strip_suffix(".md").unwrap_or(d.id.as_str());
         let data = Some(serde_json::json!({ "doc_id": d.id.as_str() }));
         match self.hit {
             Hit::Title => {
@@ -2083,11 +2083,12 @@ body"
             } else {
                 d.id.as_str().to_string()
             };
-            let path_str = d.path.to_string_lossy().replace('\\', "/");
-            let insert_base = path_str
-                .strip_suffix(".md")
-                .unwrap_or(&path_str)
-                .to_string();
+            // `d.id` is exactly `d.path`, spelled with `/`: the same string `DocId::from_path` builds.
+            let insert_base =
+                d.id.as_str()
+                    .strip_suffix(".md")
+                    .unwrap_or(d.id.as_str())
+                    .to_string();
             items.push(CompletionItem {
                 label: title_label.clone(),
                 kind: Some(CompletionItemKind::FILE),

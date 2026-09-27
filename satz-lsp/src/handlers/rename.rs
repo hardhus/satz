@@ -179,7 +179,7 @@ pub fn rename(params: RenameParams, state: &SatzState) -> Result<Option<Workspac
         Some(root) => new_doc_path.strip_prefix(root).unwrap_or(&new_doc_path),
         None => &new_doc_path,
     };
-    let new_id = satz_core::DocId::new(new_rel.to_string_lossy().replace('\\', "/"));
+    let new_id = satz_core::DocId::from_path(new_rel);
     if new_id != *target_id && state.index.get_doc(&new_id).is_some() {
         return Err(format!(
             "cannot rename: a note named '{clean_new_doc_name}' already exists there"

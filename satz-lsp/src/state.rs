@@ -534,11 +534,13 @@ impl SatzState {
     /// What `is_open_path` compares paths by: the path relative to the vault, with `/` for a
     /// separator, in the folded spelling (`fold_key`).
     pub fn path_key(&self, path: &Path) -> String {
-        satz_core::slug::fold_key(
-            &Self::get_rel_path(path, self.vault_root.as_deref())
-                .to_string_lossy()
-                .replace('\\', "/"),
-        )
+        satz_core::slug::fold_key(self.doc_id_for_path(path).as_str())
+    }
+
+    /// The id the index would know a note at `path` by: `path`, made relative to the vault root
+    /// (as `get_rel_path` does) and spelled the way every `DocId` is (`/`, never `\`).
+    pub fn doc_id_for_path(&self, path: &Path) -> satz_core::DocId {
+        satz_core::DocId::from_path(&Self::get_rel_path(path, self.vault_root.as_deref()))
     }
 
     /// The `path_key` of every open document, worked out once: for asking about many paths (or
@@ -581,8 +583,7 @@ impl SatzState {
     /// or not indexed) -- the lookup every handler starts with.
     pub fn doc_for_uri(&self, uri: &str) -> Option<(&OpenDocument, &satz_core::Document)> {
         let open_doc = self.open_docs.get(uri)?;
-        let rel_path = Self::get_rel_path(&open_doc.path, self.vault_root.as_deref());
-        let doc_id = satz_core::DocId::new(rel_path.to_string_lossy().replace('\\', "/"));
+        let doc_id = self.doc_id_for_path(&open_doc.path);
         Some((open_doc, self.index.get_doc(&doc_id)?))
     }
 
@@ -626,8 +627,7 @@ impl SatzState {
     /// Handles opening a new document.
     pub fn open_document(&mut self, uri: &str, content: &str, path: &Path, version: i32) {
         let rel_path = Self::get_rel_path(path, self.vault_root.as_deref());
-        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-        let doc_id = satz_core::DocId::new(&rel_path_str);
+        let doc_id = satz_core::DocId::from_path(&rel_path);
         tracing::debug!(%uri, ?doc_id, version, "open_document");
 
         let old_keys = self
@@ -807,7 +807,7 @@ impl SatzState {
         }
 
         let rel_path = Self::get_rel_path(&doc.path, self.vault_root.as_deref());
-        let doc_id = satz_core::DocId::new(rel_path.to_string_lossy().replace('\\', "/"));
+        let doc_id = satz_core::DocId::from_path(&rel_path);
         let old_signature = self
             .index
             .get_doc(&doc_id)

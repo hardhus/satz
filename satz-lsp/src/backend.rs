@@ -418,9 +418,7 @@ pub(crate) async fn publish_for(client: &Client, state: &Arc<RwLock<SatzState>>,
         let Some(open_doc) = state_guard.open_docs.get(uri) else {
             return;
         };
-        let rel_path = SatzState::get_rel_path(&open_doc.path, state_guard.vault_root());
-        let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-        let doc_id = satz_core::DocId::new(&rel_path_str);
+        let doc_id = state_guard.doc_id_for_path(&open_doc.path);
 
         let Some(doc) = state_guard.index.get_doc(&doc_id) else {
             return;

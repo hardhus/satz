@@ -455,7 +455,7 @@ fn prepare_folder(
     gitignore: satz_core::GitignoreMode,
 ) -> PreparedChange {
     let rel_path = SatzState::get_rel_path(path, Some(vault_root));
-    let rel = rel_path.to_string_lossy().replace('\\', "/");
+    let rel = satz_core::DocId::from_path(&rel_path).as_str().to_string();
     match satz_core::walk::walk_subtree_with(vault_root, path, gitignore) {
         Ok(docs) => PreparedChange::Subtree { prefix: rel, docs },
         Err(_) => PreparedChange::Skip,
@@ -465,11 +465,10 @@ fn prepare_folder(
 /// What is on disk for a path that is not a folder: a note, or nothing.
 fn prepare_file(path: &Path, vault_root: &Path) -> PreparedChange {
     let rel_path = SatzState::get_rel_path(path, Some(vault_root));
-    let rel = rel_path.to_string_lossy().replace('\\', "/");
 
     if satz_core::walk::is_markdown_path(path) {
         if !path.exists() {
-            return PreparedChange::RemoveDoc(satz_core::DocId::new(rel));
+            return PreparedChange::RemoveDoc(satz_core::DocId::from_path(&rel_path));
         }
         return match std::fs::read_to_string(path) {
             Ok(content) => PreparedChange::Doc(Box::new(satz_core::parse_document_owned(
@@ -480,7 +479,9 @@ fn prepare_file(path: &Path, vault_root: &Path) -> PreparedChange {
     }
     if !path.exists() {
         // It cannot be told any more whether this was a folder: drop whatever the index holds under it.
-        return PreparedChange::RemovePrefix(rel);
+        return PreparedChange::RemovePrefix(
+            satz_core::DocId::from_path(&rel_path).as_str().to_string(),
+        );
     }
     PreparedChange::Skip
 }
@@ -525,8 +526,8 @@ fn folders_with_news(state: &SatzState, folders: &[&Path], vault_root: &Path) ->
 /// The folded spelling of a folder's path relative to the vault, as `is_inside_folded` wants it.
 fn folded_prefix(rel: &Path) -> String {
     satz_core::fold_key(
-        rel.to_string_lossy()
-            .replace('\\', "/")
+        satz_core::DocId::from_path(rel)
+            .as_str()
             .trim_end_matches('/'),
     )
 }

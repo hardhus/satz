@@ -36,8 +36,7 @@ pub fn show_backlinks(
         .ok_or("satz.showBacklinks expects the note's URI as its first argument")?;
     let path = crate::convert::uri_to_path(uri)
         .ok_or_else(|| format!("satz.showBacklinks: '{uri}' is not a file URI"))?;
-    let rel_path = SatzState::get_rel_path(&path, state.vault_root());
-    let target = satz_core::DocId::new(rel_path.to_string_lossy().replace('\\', "/"));
+    let target = state.doc_id_for_path(&path);
     if state.index.get_doc(&target).is_none() {
         return Ok(Vec::new());
     }
