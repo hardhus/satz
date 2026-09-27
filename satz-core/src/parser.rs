@@ -229,7 +229,7 @@ fn parse_prepared(text: String, path: &Path) -> Document {
         .collect();
 
     let title = Document::resolve_title(&frontmatter, &structure.headings, path);
-    let id = DocId(path.to_string_lossy().replace('\\', "/"));
+    let id = DocId::from_path(path);
 
     Document {
         id,

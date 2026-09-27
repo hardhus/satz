@@ -19,6 +19,14 @@ impl DocId {
         Self(id.into())
     }
 
+    /// The id of the note at `path`: `path`, spelled with `/` whatever separator it was given
+    /// with. A relative, vault-relative path gives the id every other note's id is comparable
+    /// with; an absolute path gives a `DocId` that is well-formed but not a lookup key (nothing
+    /// vault-relative starts with a drive letter or a leading separator).
+    pub fn from_path(path: &Path) -> Self {
+        Self(path.to_string_lossy().replace('\\', "/"))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -173,5 +181,41 @@ mod tests {
         let d = doc("## Günün Özeti\n");
         assert_eq!(d.resolve_heading("günün özeti"), Some(0));
         assert_eq!(d.resolve_heading("günün-özeti"), Some(0));
+    }
+
+    // ---- `DocId::from_path`: `/` whatever the path was spelled with, `parse_document` agrees ----
+
+    #[test]
+    fn from_path_spells_the_id_with_forward_slashes() {
+        assert_eq!(super::DocId::from_path(Path::new("a.md")).as_str(), "a.md");
+        assert_eq!(
+            super::DocId::from_path(Path::new("sub/a.md")).as_str(),
+            "sub/a.md"
+        );
+        assert_eq!(
+            super::DocId::from_path(
+                &["sub", "deep", "a.md"]
+                    .iter()
+                    .collect::<std::path::PathBuf>()
+            )
+            .as_str(),
+            "sub/deep/a.md",
+            "joined with the platform's own separator, the id still reads with `/`"
+        );
+        assert_eq!(super::DocId::from_path(Path::new("")).as_str(), "");
+        // Decomposed text is carried as given -- folding for lookups is a separate step.
+        assert_eq!(
+            super::DocId::from_path(Path::new("caf\u{65}\u{301}.md")).as_str(),
+            "cafe\u{301}.md"
+        );
+    }
+
+    #[test]
+    fn a_parsed_documents_id_is_from_path_of_its_own_path() {
+        for path in ["a.md", "sub/a.md", "sub/deep/a.md", "İş/çalışma.md"] {
+            let d = parse_document("# T\n", Path::new(path));
+            assert_eq!(d.id, super::DocId::from_path(Path::new(path)), "{path}");
+            assert_eq!(d.id, super::DocId::from_path(&d.path), "{path}");
+        }
     }
 }
