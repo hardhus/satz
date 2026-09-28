@@ -1,4 +1,4 @@
-use crate::config::MiscConfig;
+use crate::config::{ClosedChoice, CodeFenceStyle, HrStyle, MiscConfig};
 use crate::model::ByteRange;
 
 /// Computes splice replacements for thematic breaks (`---`/`***`/`___`), fenced code block
@@ -34,17 +34,13 @@ pub fn replacements(
 }
 
 fn normalize_hr_style(configured: &str) -> &str {
-    match configured {
-        "---" | "***" | "___" => configured,
-        _ => "---",
-    }
+    HrStyle::parse(configured).unwrap_or_default().as_str()
 }
 
 fn normalize_fence_style(configured: &str) -> char {
-    match configured {
-        "```" => '`',
-        "~~~" => '~',
-        _ => '`',
+    match CodeFenceStyle::parse(configured).unwrap_or_default() {
+        CodeFenceStyle::Backtick => '`',
+        CodeFenceStyle::Tilde => '~',
     }
 }
 

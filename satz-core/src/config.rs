@@ -417,37 +417,37 @@ impl VaultConfig {
         fix(
             "formatter.misc.hr_style",
             &mut f.misc.hr_style,
-            &["---", "***", "___"],
+            HrStyle::ALL,
             &d.misc.hr_style,
         );
         fix(
             "formatter.misc.code_fence_style",
             &mut f.misc.code_fence_style,
-            &["```", "~~~"],
+            CodeFenceStyle::ALL,
             &d.misc.code_fence_style,
         );
         fix(
             "formatter.emphasis.italic_marker",
             &mut f.emphasis.italic_marker,
-            &["*", "_"],
+            ItalicMarker::ALL,
             &d.emphasis.italic_marker,
         );
         fix(
             "formatter.emphasis.bold_marker",
             &mut f.emphasis.bold_marker,
-            &["**", "__"],
+            BoldMarker::ALL,
             &d.emphasis.bold_marker,
         );
         fix(
             "formatter.lists.marker",
             &mut f.lists.marker,
-            &["-", "*", "+"],
+            ListMarker::ALL,
             &d.lists.marker,
         );
         fix(
             "formatter.wrap.link_width_mode",
             &mut f.wrap.link_width_mode,
-            &["raw", "display"],
+            LinkWidthMode::ALL,
             &d.wrap.link_width_mode,
         );
     }
@@ -467,31 +467,27 @@ impl VaultConfig {
         one_of("vault.gitignore", &self.vault.gitignore, GITIGNORE_CHOICES)?;
 
         let f = &self.formatter;
-        one_of(
-            "formatter.misc.hr_style",
-            &f.misc.hr_style,
-            &["---", "***", "___"],
-        )?;
+        one_of("formatter.misc.hr_style", &f.misc.hr_style, HrStyle::ALL)?;
         one_of(
             "formatter.misc.code_fence_style",
             &f.misc.code_fence_style,
-            &["```", "~~~"],
+            CodeFenceStyle::ALL,
         )?;
         one_of(
             "formatter.emphasis.italic_marker",
             &f.emphasis.italic_marker,
-            &["*", "_"],
+            ItalicMarker::ALL,
         )?;
         one_of(
             "formatter.emphasis.bold_marker",
             &f.emphasis.bold_marker,
-            &["**", "__"],
+            BoldMarker::ALL,
         )?;
-        one_of("formatter.lists.marker", &f.lists.marker, &["-", "*", "+"])?;
+        one_of("formatter.lists.marker", &f.lists.marker, ListMarker::ALL)?;
         one_of(
             "formatter.wrap.link_width_mode",
             &f.wrap.link_width_mode,
-            &["raw", "display"],
+            LinkWidthMode::ALL,
         )?;
         Ok(())
     }
@@ -577,6 +573,167 @@ fn prune_unknown(
     }
 }
 
+/// A config value with a small, fixed set of valid string spellings (the formatter's marker/style
+/// options). One `impl` per closed set, so the allowed values and what they mean live in exactly
+/// one place -- `validate`, `replace_invalid_values` and the formatter's own consumption of the
+/// setting all read from here, nowhere else. The field itself stays a plain `String` (see
+/// `FormatterConfig` and its nested structs): only `ALL`/`parse`/`as_str` are new.
+pub(crate) trait ClosedChoice: Copy + Sized + Default + 'static {
+    const ALL: &'static [&'static str];
+    fn parse(s: &str) -> Option<Self>;
+    fn as_str(self) -> &'static str;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HrStyle {
+    #[default]
+    Dashes,
+    Asterisks,
+    Underscores,
+}
+
+impl ClosedChoice for HrStyle {
+    const ALL: &'static [&'static str] = &["---", "***", "___"];
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "---" => Some(Self::Dashes),
+            "***" => Some(Self::Asterisks),
+            "___" => Some(Self::Underscores),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dashes => "---",
+            Self::Asterisks => "***",
+            Self::Underscores => "___",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CodeFenceStyle {
+    #[default]
+    Backtick,
+    Tilde,
+}
+
+impl ClosedChoice for CodeFenceStyle {
+    const ALL: &'static [&'static str] = &["```", "~~~"];
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "```" => Some(Self::Backtick),
+            "~~~" => Some(Self::Tilde),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Backtick => "```",
+            Self::Tilde => "~~~",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ItalicMarker {
+    #[default]
+    Asterisk,
+    Underscore,
+}
+
+impl ClosedChoice for ItalicMarker {
+    const ALL: &'static [&'static str] = &["*", "_"];
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "*" => Some(Self::Asterisk),
+            "_" => Some(Self::Underscore),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asterisk => "*",
+            Self::Underscore => "_",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BoldMarker {
+    #[default]
+    Asterisk,
+    Underscore,
+}
+
+impl ClosedChoice for BoldMarker {
+    const ALL: &'static [&'static str] = &["**", "__"];
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "**" => Some(Self::Asterisk),
+            "__" => Some(Self::Underscore),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asterisk => "**",
+            Self::Underscore => "__",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ListMarker {
+    #[default]
+    Dash,
+    Asterisk,
+    Plus,
+}
+
+impl ClosedChoice for ListMarker {
+    const ALL: &'static [&'static str] = &["-", "*", "+"];
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "-" => Some(Self::Dash),
+            "*" => Some(Self::Asterisk),
+            "+" => Some(Self::Plus),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dash => "-",
+            Self::Asterisk => "*",
+            Self::Plus => "+",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LinkWidthMode {
+    #[default]
+    Raw,
+    Display,
+}
+
+impl ClosedChoice for LinkWidthMode {
+    const ALL: &'static [&'static str] = &["raw", "display"];
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "raw" => Some(Self::Raw),
+            "display" => Some(Self::Display),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Display => "display",
+        }
+    }
+}
+
 /// A string setting whose value must be one of a fixed set. (The formatter would otherwise
 /// silently fall back to its default for a typo, so the user never learns the setting was ignored.)
 fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
@@ -593,6 +750,28 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// For every `ClosedChoice`: each string in `ALL` round-trips through `parse`/`as_str`, an
+    /// unrecognized string is rejected, and the type's own `Default` matches the documented
+    /// default value (the one `FormatterConfig::default()` uses).
+    fn assert_closed_choice<T: ClosedChoice + std::fmt::Debug + PartialEq>(default: &str) {
+        for &value in T::ALL {
+            let parsed = T::parse(value).unwrap_or_else(|| panic!("{value:?} should parse"));
+            assert_eq!(parsed.as_str(), value, "round-trip for {value:?}");
+        }
+        assert!(T::parse("bogus_xyz").is_none());
+        assert_eq!(T::default().as_str(), default);
+    }
+
+    #[test]
+    fn closed_choices_round_trip_and_default_matches_the_documented_default() {
+        assert_closed_choice::<HrStyle>("---");
+        assert_closed_choice::<CodeFenceStyle>("```");
+        assert_closed_choice::<ItalicMarker>("*");
+        assert_closed_choice::<BoldMarker>("**");
+        assert_closed_choice::<ListMarker>("-");
+        assert_closed_choice::<LinkWidthMode>("raw");
+    }
 
     #[test]
     fn test_default_config() {

@@ -1,4 +1,4 @@
-use crate::config::ListsConfig;
+use crate::config::{ClosedChoice, ListMarker, ListsConfig};
 use crate::model::ByteRange;
 use crate::parser::structure::{ListItemSpan, ListSpan, TaskMarkerSpan};
 
@@ -108,11 +108,10 @@ fn effective_markers(
 }
 
 fn normalize_marker_char(configured: &str) -> char {
-    match configured {
-        "-" => '-',
-        "*" => '*',
-        "+" => '+',
-        _ => '-',
+    match ListMarker::parse(configured).unwrap_or_default() {
+        ListMarker::Dash => '-',
+        ListMarker::Asterisk => '*',
+        ListMarker::Plus => '+',
     }
 }
 

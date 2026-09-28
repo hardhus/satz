@@ -1,6 +1,6 @@
 use pulldown_cmark::{Event, Options, Parser, Tag};
 
-use crate::config::FormatterConfig;
+use crate::config::{ClosedChoice, FormatterConfig, LinkWidthMode};
 use crate::model::ByteRange;
 use crate::parser::inline_scan;
 use crate::parser::structure::{self, StructureOutput};
@@ -42,8 +42,8 @@ pub fn wrap(source: &str, config: &FormatterConfig) -> String {
     code_spans_for_scan.sort_unstable_by_key(|s| s.start);
     let inline = inline_scan::scan_inline(source, &code_spans_for_scan);
 
-    let atomic_spans =
-        collect_atomic_spans(source, &structure, &inline, &config.wrap.link_width_mode);
+    let link_width_mode = LinkWidthMode::parse(&config.wrap.link_width_mode).unwrap_or_default();
+    let atomic_spans = collect_atomic_spans(source, &structure, &inline, link_width_mode);
 
     let mut replacements: Vec<(ByteRange, String)> = Vec::new();
     for para in &structure.paragraph_spans {
@@ -79,9 +79,9 @@ fn collect_atomic_spans(
     source: &str,
     structure: &StructureOutput,
     inline: &inline_scan::InlineScanOutput,
-    link_width_mode: &str,
+    link_width_mode: LinkWidthMode,
 ) -> Vec<(ByteRange, usize)> {
-    let display_mode = link_width_mode == "display";
+    let display_mode = link_width_mode == LinkWidthMode::Display;
     let mut spans: Vec<(ByteRange, usize)> = Vec::new();
 
     for link in &inline.wiki_links {

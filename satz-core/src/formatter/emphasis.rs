@@ -1,4 +1,4 @@
-use crate::config::EmphasisConfig;
+use crate::config::{BoldMarker, ClosedChoice, EmphasisConfig, ItalicMarker};
 use crate::model::ByteRange;
 use crate::parser::structure::{EmphasisKind, EmphasisSpan};
 
@@ -19,9 +19,14 @@ pub fn replacements(
 
     for span in spans {
         let marker = match span.kind {
-            EmphasisKind::Italic => normalize_marker(&config.italic_marker, 1, "*"),
-            EmphasisKind::Bold => normalize_marker(&config.bold_marker, 2, "**"),
-        };
+            EmphasisKind::Italic => ItalicMarker::parse(&config.italic_marker)
+                .unwrap_or_default()
+                .as_str(),
+            EmphasisKind::Bold => BoldMarker::parse(&config.bold_marker)
+                .unwrap_or_default()
+                .as_str(),
+        }
+        .to_string();
         let marker_len = marker.len();
 
         // `_` cannot open or close emphasis inside a word (`a*b*c` is emphasis, `a_b_c` is not),
@@ -46,21 +51,6 @@ pub fn replacements(
     }
 
     out
-}
-
-/// Validates a configured marker against the known-good options for its length; falls back to
-/// `default` for anything else (typo, wrong length, unsupported character).
-fn normalize_marker(configured: &str, expected_len: usize, default: &str) -> String {
-    let valid = match expected_len {
-        1 => matches!(configured, "*" | "_"),
-        2 => matches!(configured, "**" | "__"),
-        _ => false,
-    };
-    if valid {
-        configured.to_string()
-    } else {
-        default.to_string()
-    }
 }
 
 #[cfg(test)]
