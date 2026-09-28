@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::Args;
 use rayon::prelude::*;
-use satz_core::walk_vault_with;
+use satz_core::walk_vault_raw_with;
 
 #[derive(Args, Debug)]
 pub struct FmtArgs {
@@ -62,13 +62,13 @@ pub fn run_with_output(args: FmtArgs, out: &mut dyn Write) -> Result<Outcome> {
     }
 
     let t0 = Instant::now();
-    let docs = walk_vault_with(&vault_root, config.gitignore_mode())?;
+    let notes = walk_vault_raw_with(&vault_root, config.gitignore_mode())?;
     let check_only = args.check;
 
-    let mut results: Vec<FileResult> = docs
+    let mut results: Vec<FileResult> = notes
         .par_iter()
-        .map(|doc| {
-            let source = doc.line_index.source();
+        .map(|note| {
+            let source = note.source.as_str();
             let formatted = satz_core::formatter::format_document(source, &config.formatter);
             let changed = formatted != source;
 
@@ -76,7 +76,7 @@ pub fn run_with_output(args: FmtArgs, out: &mut dyn Write) -> Result<Outcome> {
             // no mtime churn.
             let mut write_error = None;
             if changed && !check_only {
-                let abs_path = vault_root.join(&doc.path);
+                let abs_path = vault_root.join(&note.path);
                 // The parsed text has no byte order mark; a file that had one keeps it.
                 let had_bom = fs::File::open(&abs_path)
                     .and_then(|mut f| {
@@ -96,7 +96,7 @@ pub fn run_with_output(args: FmtArgs, out: &mut dyn Write) -> Result<Outcome> {
             }
 
             FileResult {
-                rel_path: doc.path.clone(),
+                rel_path: note.path.clone(),
                 changed,
                 write_error,
             }
