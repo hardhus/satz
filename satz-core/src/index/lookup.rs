@@ -769,8 +769,12 @@ impl Index {
         // The clashes are reported as the sequential rebuild reported them: note by note, a file
         // name clash before the title and alias clashes of the same note.
         let conflicts = merge_conflicts(stem_conflicts, title_conflicts);
-        for message in &conflicts {
+        let (shown, summary) = conflict_log_lines(&conflicts);
+        for message in shown {
             tracing::warn!("{message}");
+        }
+        if let Some(summary) = summary {
+            tracing::warn!("{summary}");
         }
 
         // Pass 2: resolve links. Which note each note's links reach only reads the tables that pass
@@ -1007,6 +1011,27 @@ fn merge_conflicts(stems: Vec<(usize, String)>, titles: Vec<(usize, String)>) ->
     merged
 }
 
+/// Caps how many conflict messages are logged individually; beyond that, one summary line replaces
+/// the rest, so a vault with thousands of stem/title clashes (many `index.md`/`README.md`) does not
+/// flood stderr/the log file with one line each.
+const CONFLICT_LOG_LIMIT: usize = 5;
+
+/// What `rebuild_derived_with` logs for `conflicts`: the first `CONFLICT_LOG_LIMIT` messages
+/// unchanged, then one extra summary line for the rest (`None` when everything is shown).
+fn conflict_log_lines(conflicts: &[String]) -> (&[String], Option<String>) {
+    if conflicts.len() <= CONFLICT_LOG_LIMIT {
+        (conflicts, None)
+    } else {
+        let rest = conflicts.len() - CONFLICT_LOG_LIMIT;
+        (
+            &conflicts[..CONFLICT_LOG_LIMIT],
+            Some(format!(
+                "... and {rest} more stem/title conflicts (not shown)"
+            )),
+        )
+    }
+}
+
 /// From this many notes on, rebuilding the derived tables shares the work between cores. Below
 /// it the threads cost more than they save: on a 4-core (8 threads) laptop, sequential against
 /// shared, best of many rounds: 50 notes 0.79x (slower), 100 notes 0.96x, 200 notes 1.59x, 400 notes
@@ -1144,6 +1169,56 @@ mod tests {
         let mut index = reverse;
         index.remove_doc(&DocId::new("a/foo.md"));
         assert_eq!(index.resolve_link("foo"), Some(&DocId::new("b/foo.md")));
+    }
+
+    #[test]
+    fn conflict_log_lines_limit_is_five() {
+        // Pinned to a concrete number, not derived from the constant: a test built only out of
+        // `CONFLICT_LOG_LIMIT` itself would still pass if the constant changed underneath it.
+        let six: Vec<String> = (0..6).map(|i| format!("m{i}")).collect();
+        let (shown, summary) = conflict_log_lines(&six);
+        assert_eq!(shown.len(), 5);
+        assert_eq!(
+            summary,
+            Some("... and 1 more stem/title conflicts (not shown)".to_string())
+        );
+    }
+
+    #[test]
+    fn conflict_log_lines_shows_everything_up_to_the_limit() {
+        let messages: Vec<String> = (0..CONFLICT_LOG_LIMIT).map(|i| format!("m{i}")).collect();
+        let (shown, summary) = conflict_log_lines(&messages);
+        assert_eq!(shown, messages.as_slice());
+        assert_eq!(summary, None);
+    }
+
+    #[test]
+    fn conflict_log_lines_summarizes_past_the_limit() {
+        let messages: Vec<String> = (0..CONFLICT_LOG_LIMIT + 3)
+            .map(|i| format!("m{i}"))
+            .collect();
+        let (shown, summary) = conflict_log_lines(&messages);
+        assert_eq!(shown, &messages[..CONFLICT_LOG_LIMIT]);
+        assert_eq!(
+            summary,
+            Some("... and 3 more stem/title conflicts (not shown)".to_string())
+        );
+    }
+
+    #[test]
+    fn conflict_log_lines_at_the_exact_boundary_shows_everything() {
+        // One more than CONFLICT_LOG_LIMIT is the first case that summarizes.
+        let at_limit: Vec<String> = (0..CONFLICT_LOG_LIMIT).map(|i| format!("m{i}")).collect();
+        assert_eq!(conflict_log_lines(&at_limit).1, None);
+        let over_limit: Vec<String> = (0..CONFLICT_LOG_LIMIT + 1)
+            .map(|i| format!("m{i}"))
+            .collect();
+        let (shown, summary) = conflict_log_lines(&over_limit);
+        assert_eq!(shown.len(), CONFLICT_LOG_LIMIT);
+        assert_eq!(
+            summary,
+            Some("... and 1 more stem/title conflicts (not shown)".to_string())
+        );
     }
 
     #[test]
