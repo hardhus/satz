@@ -1619,7 +1619,7 @@ mod tests {
                         vault.notes.push((new_path, String::new()));
                     }
                     _ => {
-                        vault.index.remove_doc(&DocId::new(&path));
+                        vault.index.remove_doc(&DocId::new(path.as_str()));
                         vault.notes.retain(|(p, _)| *p != path);
                         if vault.notes.is_empty() {
                             break;

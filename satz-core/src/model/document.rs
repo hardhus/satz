@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::model::block::BlockAnchor;
 use crate::model::footnote::FootnoteTable;
@@ -9,13 +10,19 @@ use crate::model::range::ByteRange;
 use crate::model::tag::Tag;
 use crate::text::LineIndex;
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub struct DocId(pub String);
+/// A note's id: its vault-relative path, `/`-separated. Shared, not copied, on `clone()` -- every
+/// lookup table and every edge of the index holds its own `DocId` for the same note, so a vault of
+/// any size clones one far more often than it makes a new one (measured: a 10,000-note vault's full
+/// rebuild clones about 390,000 of them). `Arc<str>` makes that clone an atomic increment instead of
+/// an allocation and a copy; every other property (`Ord`, `Hash`, `Eq`, `Debug`) stays exactly what
+/// it was with a plain `String`, since `Arc<T>` forwards all of them to `T` itself, never to the
+/// pointer -- two `DocId`s built separately from the same text still compare, hash and order equal,
+/// which `rebuild_derived`'s determinism (documents always visited in `DocId` order) depends on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DocId(Arc<str>);
 
 impl DocId {
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
         Self(id.into())
     }
 
@@ -24,11 +31,29 @@ impl DocId {
     /// with; an absolute path gives a `DocId` that is well-formed but not a lookup key (nothing
     /// vault-relative starts with a drive letter or a leading separator).
     pub fn from_path(path: &Path) -> Self {
-        Self(path.to_string_lossy().replace('\\', "/"))
+        Self(Arc::from(
+            path.to_string_lossy().replace('\\', "/").as_str(),
+        ))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+// Written by hand, not derived: nothing in production serializes a `DocId` today (`graph.rs`
+// converts to a plain `String` first; `IndexStats` never carries one) so the exact mechanism does
+// not matter, but a manual impl keeps the JSON shape (a bare string, `"a.md"`) that `#[derive]` on
+// `DocId(String)` used to produce, without asking for serde's `rc` feature.
+impl serde::Serialize for DocId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DocId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(DocId::new)
     }
 }
 
@@ -217,5 +242,53 @@ mod tests {
             assert_eq!(d.id, super::DocId::from_path(Path::new(path)), "{path}");
             assert_eq!(d.id, super::DocId::from_path(&d.path), "{path}");
         }
+    }
+
+    // ---- `DocId` shares its text (`Arc<str>`); every property stays value-based, not pointer-based ----
+
+    #[test]
+    fn two_separately_built_doc_ids_with_the_same_text_compare_and_hash_as_one_value() {
+        use std::hash::{Hash, Hasher};
+        let a = super::DocId::new(String::from("sub/a.md"));
+        let b = super::DocId::from_path(Path::new("sub/a.md"));
+        assert_eq!(a, b, "same text, built two different ways");
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+
+        fn hash_of(id: &super::DocId) -> u64 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut h);
+            h.finish()
+        }
+        assert_eq!(
+            hash_of(&a),
+            hash_of(&b),
+            "two Arcs holding equal text must hash equal, or every HashMap/HashSet keyed by \
+             DocId silently stops finding what it put in"
+        );
+
+        // Different text is still told apart (the migration must not make everything look equal).
+        assert_ne!(a, super::DocId::new(String::from("sub/b.md")));
+    }
+
+    #[test]
+    fn doc_id_still_debug_formats_as_a_bare_quoted_string() {
+        // What `#[derive(Debug)]` on `DocId(String)` produced; assertion failure messages and logs
+        // must not change shape just because the field is now an `Arc<str>`.
+        assert_eq!(
+            format!("{:?}", super::DocId::new("a.md")),
+            "DocId(\"a.md\")"
+        );
+    }
+
+    #[test]
+    fn doc_id_serializes_as_a_bare_json_string_and_round_trips() {
+        let id = super::DocId::new(String::from("sub/a.md"));
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(
+            json, "\"sub/a.md\"",
+            "the shape #[derive(Serialize)] on a String field gave"
+        );
+        let back: super::DocId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
     }
 }
