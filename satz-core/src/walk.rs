@@ -102,6 +102,47 @@ pub fn walk_subtree_with(
     dir: &Path,
     gitignore: GitignoreMode,
 ) -> Result<Vec<Document>> {
+    let md_paths = discover_md_paths(vault_root, dir, gitignore)?;
+    let discovered = md_paths.len();
+
+    let read_started = std::time::Instant::now();
+    let read_all = || -> Vec<Document> {
+        md_paths
+            .par_iter()
+            .filter_map(|path| match std::fs::read_to_string(path) {
+                Ok(source) => {
+                    let rel_path = path.strip_prefix(vault_root).unwrap_or(path);
+                    Some(parse_document_owned(source, rel_path))
+                }
+                Err(e) => {
+                    tracing::warn!("failed to read markdown file {}: {}", path.display(), e);
+                    None
+                }
+            })
+            .collect()
+    };
+    let docs = match io_pool() {
+        Some(pool) => pool.install(read_all),
+        None => read_all(),
+    };
+    tracing::debug!(
+        notes = discovered,
+        read_and_parse = ?read_started.elapsed(),
+        "walk: found the notes, then read and parsed them"
+    );
+
+    Ok(docs)
+}
+
+/// The `.md`/`.markdown` files directly under `dir`, restricted to the same rules `walk_subtree`
+/// applies (ignored folders never entered, `.gitignore` per `gitignore`), in the fixed order every
+/// `walk_*` function returns documents in. Shared by `walk_subtree_with` and `walk_vault_raw_with`
+/// so the two can never disagree about which files count as the vault's notes.
+fn discover_md_paths(
+    vault_root: &Path,
+    dir: &Path,
+    gitignore: GitignoreMode,
+) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
         bail!("folder does not exist: {}", dir.display());
     }
@@ -124,7 +165,6 @@ pub fn walk_subtree_with(
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 
-    let discovery_started = std::time::Instant::now();
     let mut md_paths: Vec<PathBuf> = Vec::new();
 
     for result in walker {
@@ -152,17 +192,41 @@ pub fn walk_subtree_with(
             .replace('\\', "/")
     });
 
-    let discovered = md_paths.len();
-    let discovery_time = discovery_started.elapsed();
+    Ok(md_paths)
+}
 
-    let read_started = std::time::Instant::now();
-    let read_all = || -> Vec<Document> {
+/// A note's path (relative to `vault_root`, as `Document::path` is) and raw text, read but never
+/// parsed. For a caller like `fmt` that only needs the source text, not the links/tags/frontmatter
+/// a full `Document` derives from it.
+pub struct RawNote {
+    pub path: PathBuf,
+    pub source: String,
+}
+
+/// Like `walk_vault_with`, but only discovers and reads each note -- no `parse_document_owned`, no
+/// `Document`. Shares `walk_vault_with`'s exact file-discovery rules (`discover_md_paths`), so the
+/// two always agree on which files count as the vault's notes and in what order.
+pub fn walk_vault_raw_with(vault_root: &Path, gitignore: GitignoreMode) -> Result<Vec<RawNote>> {
+    if !vault_root.exists() {
+        bail!("vault root does not exist: {}", vault_root.display());
+    }
+    let md_paths = discover_md_paths(vault_root, vault_root, gitignore)?;
+
+    let read_all = || -> Vec<RawNote> {
         md_paths
             .par_iter()
             .filter_map(|path| match std::fs::read_to_string(path) {
-                Ok(source) => {
-                    let rel_path = path.strip_prefix(vault_root).unwrap_or(path);
-                    Some(parse_document_owned(source, rel_path))
+                Ok(mut source) => {
+                    // A byte order mark belongs to the file, not to the text: `parse_document_owned`
+                    // strips it the same way, so a raw and a parsed read of the same file agree.
+                    if source.starts_with('\u{feff}') {
+                        source.drain(..'\u{feff}'.len_utf8());
+                    }
+                    let rel_path = path.strip_prefix(vault_root).unwrap_or(path).to_path_buf();
+                    Some(RawNote {
+                        path: rel_path,
+                        source,
+                    })
                 }
                 Err(e) => {
                     tracing::warn!("failed to read markdown file {}: {}", path.display(), e);
@@ -171,18 +235,11 @@ pub fn walk_subtree_with(
             })
             .collect()
     };
-    let docs = match io_pool() {
+    let notes = match io_pool() {
         Some(pool) => pool.install(read_all),
         None => read_all(),
     };
-    tracing::debug!(
-        notes = discovered,
-        discovery = ?discovery_time,
-        read_and_parse = ?read_started.elapsed(),
-        "walk: found the notes, then read and parsed them"
-    );
-
-    Ok(docs)
+    Ok(notes)
 }
 
 #[cfg(test)]
@@ -624,5 +681,71 @@ mod tests {
         assert!(walk_vault(&tree.0).unwrap().is_empty());
         std::fs::write(tree.0.join("only.md"), "# Only\n").unwrap();
         assert_eq!(walk_vault(&tree.0).unwrap().len(), 1);
+    }
+
+    /// `walk_vault_raw_with` must never see a different file, or a different order, than
+    /// `walk_vault_with` -- `fmt` relies on this to format exactly the vault's notes, nothing
+    /// else. Exercises the same ignore/gitignore rules the rest of this module already covers.
+    #[test]
+    fn raw_walk_agrees_with_the_parsing_walk_on_which_files_and_what_order() {
+        let t = Tree::new("raw_equiv");
+        t.write("keep.md", "# keep\n");
+        t.write("sub/one.md", "# one\n");
+        t.write("sub/two.markdown", "# two\n");
+        t.write("node_modules/skip.md", "# skip\n");
+        t.write("secret.md", "# secret\n");
+        t.write(".gitignore", "secret.md\n");
+        t.write(".git/HEAD", "ref: refs/heads/main\n");
+
+        let parsed = walk_vault_with(&t.0, GitignoreMode::InRepo).unwrap();
+        let raw = walk_vault_raw_with(&t.0, GitignoreMode::InRepo).unwrap();
+
+        let parsed_paths: Vec<&Path> = parsed.iter().map(|d| d.path.as_path()).collect();
+        let raw_paths: Vec<&Path> = raw.iter().map(|n| n.path.as_path()).collect();
+        assert_eq!(raw_paths, parsed_paths);
+        assert_eq!(
+            raw_paths,
+            vec![
+                Path::new("keep.md"),
+                Path::new("sub/one.md"),
+                Path::new("sub/two.markdown"),
+            ]
+        );
+    }
+
+    /// The raw walk strips a leading byte order mark exactly as `parse_document_owned` does, so a
+    /// raw read and a parsed read of the same file agree on the text `fmt` compares against.
+    #[test]
+    fn raw_walk_strips_a_leading_bom_like_parsing_does() {
+        let t = Tree::new("raw_bom");
+        let with_bom = "\u{feff}# T\n\ntext\n";
+        std::fs::write(t.0.join("n.md"), with_bom).unwrap();
+
+        let parsed = walk_vault(&t.0).unwrap();
+        let raw = walk_vault_raw_with(&t.0, GitignoreMode::default()).unwrap();
+
+        assert_eq!(raw.len(), 1);
+        assert!(
+            !raw[0].source.starts_with('\u{feff}'),
+            "BOM must be stripped"
+        );
+        assert_eq!(raw[0].source, parsed[0].line_index.source());
+    }
+
+    /// Parity with `many_notes_are_read_in_a_fixed_order_with_their_content_intact`: an unreadable
+    /// (non-UTF-8) file is skipped, not an error for the whole walk, same as the parsing walk.
+    #[test]
+    fn raw_walk_skips_an_unreadable_file_like_the_parsing_walk_does() {
+        let t = Tree::new("raw_badutf8");
+        t.write("good.md", "# good\n");
+        std::fs::write(t.0.join("bad.md"), [0xff, 0xfe, 0x00, 0xc3, 0x28]).unwrap();
+        t.write("other.md", "# other\n");
+
+        let raw = walk_vault_raw_with(&t.0, GitignoreMode::default()).unwrap();
+        let names: Vec<String> = raw
+            .iter()
+            .map(|n| n.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(names, vec!["good.md", "other.md"]);
     }
 }
