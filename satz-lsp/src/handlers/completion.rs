@@ -774,7 +774,7 @@ pub fn completion_resolve(mut item: CompletionItem, state: &SatzState) -> Comple
     if let Some(Value::Object(map)) = &item.data
         && let Some(Value::String(doc_id_str)) = map.get("doc_id")
     {
-        let doc_id = satz_core::DocId::new(doc_id_str);
+        let doc_id = satz_core::DocId::new(doc_id_str.as_str());
         if let Some(target_doc) = state.index.get_doc(&doc_id) {
             let mut value = format!("# {}\n\n", target_doc.title);
 

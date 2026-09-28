@@ -69,7 +69,7 @@ fn make_state(n: usize, dirty_per_100: usize, open: usize) -> SatzState {
         let rel = format!("dir{}/n{at}.md", at % 40);
         let text = state
             .index
-            .get_doc(&satz_core::DocId::new(&rel))
+            .get_doc(&satz_core::DocId::new(rel.as_str()))
             .map(|d| d.line_index.source().to_string())
             .unwrap();
         state.open_document(
